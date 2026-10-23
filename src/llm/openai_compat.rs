@@ -66,6 +66,7 @@ pub struct OpenAiCompatClient {
     pub max_tokens: u32,
     pub temperature: f32,
     pub limits: LlmLimits,
+    bearer_token: Option<String>,
 }
 
 impl std::fmt::Debug for OpenAiCompatClient {
@@ -77,6 +78,7 @@ impl std::fmt::Debug for OpenAiCompatClient {
             .field("max_tokens", &self.max_tokens)
             .field("temperature", &self.temperature)
             .field("limits", &self.limits)
+            .field("credential_configured", &self.bearer_token.is_some())
             .finish()
     }
 }
@@ -89,12 +91,27 @@ impl OpenAiCompatClient {
             max_tokens: 4_096,
             temperature: DEFAULT_TEMPERATURE,
             limits: LlmLimits::default(),
+            bearer_token: None,
         }
     }
 
     pub fn with_limits(mut self, limits: LlmLimits) -> Self {
         self.limits = limits;
         self
+    }
+
+    /// Attach a bearer credential resolved from an explicit configuration
+    /// reference. The token is never logged or included in `Debug` output.
+    pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.bearer_token = Some(token.into());
+        self
+    }
+
+    fn authorized(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.bearer_token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        }
     }
 
     fn endpoint(&self) -> Result<String> {
@@ -577,8 +594,8 @@ impl LlmBackend for OpenAiCompatClient {
         let body = self.build_body(&request, true)?;
         let endpoint = self.endpoint()?;
         let client = self.http_client()?;
-        let response = client
-            .post(endpoint)
+        let response = self
+            .authorized(client.post(endpoint))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .body(body)
@@ -603,8 +620,8 @@ impl LlmBackend for OpenAiCompatClient {
         let body = self.build_body(&request, false)?;
         let endpoint = self.endpoint()?;
         let client = self.http_client()?;
-        let response = client
-            .post(endpoint)
+        let response = self
+            .authorized(client.post(endpoint))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::ACCEPT, "application/json")
             .body(body)

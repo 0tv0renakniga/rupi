@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use local_agent_harness::approval::ApprovalPolicy;
-use local_agent_harness::config::{Config, McpRuntimeConfig};
+use local_agent_harness::config::{Config, EndpointConfig, McpRuntimeConfig};
 use local_agent_harness::error::AgentError;
 use local_agent_harness::jev::{JevClient, Route};
 use local_agent_harness::llm::LlmBackend;
@@ -78,12 +78,17 @@ fn mock_spec() -> ProcessSpec {
     }
 }
 
+fn local_endpoint() -> EndpointConfig {
+    EndpointConfig::default()
+}
+
 fn config_with(llm_base: &str, jev_base: &str) -> Config {
     Config {
         root: PathBuf::from("."),
         llm_base: llm_base.to_owned(),
         model: "local-model".into(),
         jev_base: jev_base.to_owned(),
+        endpoint: local_endpoint(),
         min_route_conf: 0.85,
         budget: TaskBudget::default(),
         approval: ApprovalPolicy::default(),
@@ -106,8 +111,14 @@ fn default_build_rejects_non_loopback_and_tls_endpoints() {
 
 #[cfg(feature = "remote")]
 #[test]
-fn remote_build_allows_explicit_non_loopback_endpoint_without_contacting_it() {
-    let config = config_with("https://api.example.com", "http://127.0.0.1:9090");
+fn remote_build_allows_explicitly_approved_origin_without_contacting_it() {
+    let mut config = config_with("https://api.example.com", "http://127.0.0.1:9090");
+    config.endpoint = EndpointConfig {
+        profile: local_agent_harness::config::EndpointProfile::ApprovedRemote,
+        allowed_origins: ["https://api.example.com".to_owned()].into(),
+        credential_env: Some("HARNESS_TEST_CREDENTIAL".into()),
+        model_explicit: true,
+    };
     assert!(config.validate().is_ok());
     assert_eq!(
         local_agent_harness::config::log_safe_endpoint(&config.llm_base),

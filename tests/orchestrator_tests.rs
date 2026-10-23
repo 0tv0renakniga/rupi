@@ -1491,6 +1491,13 @@ async fn approval_timeout_is_bounded_and_never_executes() {
             message,
         } if message.contains("approval expired")
     )));
+    assert!(has_event(&fx.events.events(), |event| matches!(
+        event,
+        AgentEvent::ApprovalResolved {
+            approved: false,
+            ..
+        }
+    )));
 }
 
 #[tokio::test]

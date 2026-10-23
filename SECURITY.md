@@ -10,12 +10,13 @@ fallback.
 
 The only endpoints the harness may use are explicitly configured:
 
-1. A local `llama.cpp` / `llama-server` endpoint, normally loopback HTTP such as
-   `http://127.0.0.1:8080`.
-2. A local Jev System 1 endpoint, normally loopback HTTP such as
+1. A local `llama.cpp` / `llama-server` endpoint under the default `local`
+   profile, normally loopback HTTP such as `http://127.0.0.1:8080`.
+2. A local Jev System 1 endpoint, always loopback HTTP such as
    `http://127.0.0.1:9090` (the configured default).
-3. An approved production work API, only when the `remote` Cargo feature is
-   enabled and the endpoint is explicitly supplied in configuration.
+3. An approved production work API under the explicit `approved_remote` profile,
+   only when the `remote` Cargo feature is enabled and all remote settings are
+   deliberately supplied in configuration.
 
 Bounded task context, prompts, model output, and tool-derived data can be sent
 to these configured endpoints. Jev receives only compact derived values
@@ -24,28 +25,38 @@ treated as instructions to expand this endpoint set.
 
 ### Endpoint rules
 
-- Default builds accept only plaintext HTTP endpoints whose host is loopback
-  (`localhost`, `127.0.0.0/8`, or `::1`).
-- Non-loopback hosts and TLS-backed (`https://`) endpoints require the
-  `remote` Cargo feature.
-- Enabling `remote` does not configure, contact, or upload data to any service.
-- Every remote endpoint must be explicitly supplied by configuration. There is
-  no default remote URL and no endpoint discovery.
+- `HARNESS_ENDPOINT_PROFILE=local` is the default. It accepts only plaintext
+  HTTP LLM endpoints whose host is loopback (`localhost`, `127.0.0.0/8`, or
+  `::1`) and rejects remote-only allowlist/credential settings.
+- `HARNESS_ENDPOINT_PROFILE=approved_remote` requires the `remote` Cargo
+  feature, `HARNESS_MODEL`, a non-empty exact-origin
+  `HARNESS_LLM_ALLOWED_ORIGINS` list, and `HARNESS_LLM_CREDENTIAL_ENV`.
+- Approved-remote LLM bases must be bare `https://` origins with no path, query,
+  fragment, user information, or wildcard. The base origin must exactly match
+  one allowlisted origin.
+- The credential-reference variable holds the token; its value is read at
+  startup, sent only as a bearer header, and never stored in configuration,
+  audit records, logs, or `Debug` output.
+- Jev is always a local service: non-loopback or TLS Jev endpoints are rejected
+  in every profile, including `remote`.
+- Enabling `remote` does not select a profile, configure, contact, or upload data
+  to any service. There is no default remote URL and no endpoint discovery.
 - URLs containing credentials are rejected. Logs retain only the scheme, host,
   and explicit port; paths, query strings, fragments, and user information are
   never logged.
-- If an approved endpoint is unavailable, the harness must never fall back to a
-  remote URL, a different host, or a proxy-derived route. Model/work API
-  failures surface explicitly; Jev failures use the adapter's documented safe
-  fallbacks (`Escalate`, `Uncertain`, or `None`).
+- The two profiles are mutually exclusive and there is no automatic fallback.
+  Model/work API failures surface explicitly; Jev failures use the adapter's
+  documented safe fallbacks (`Escalate`, `Uncertain`, or `None`).
 
 ## System 2 LLM client
 
-The OpenAI-compatible client is an explicitly configured approved endpoint. In
-the default build it is restricted to plaintext HTTP on a loopback host;
-non-loopback and TLS endpoints still require the explicit `remote` feature.
-The adapter accepts no per-request URL, host, scheme, path, redirect target,
-authentication setting, or proxy configuration from callers.
+The OpenAI-compatible client is an explicitly configured endpoint. The default
+`local` profile restricts it to plaintext HTTP on a loopback host. The
+`approved_remote` profile permits only an allowlisted HTTPS origin with an
+explicit model and credential reference. The adapter accepts no per-request URL,
+host, scheme, path, redirect target, credential, or proxy configuration from
+callers; an optional bearer credential comes only from the configured
+environment-variable reference.
 
 - Requests use only the fixed path `/v1/chat/completions`, appended to the
   validated configured base. Base URLs with a query string or fragment are
@@ -61,8 +72,12 @@ authentication setting, or proxy configuration from callers.
 - Streaming accepts only the documented SSE framing and requires the
   `[DONE]` terminal marker. Malformed data frames, invalid UTF-8, and premature
   EOF are protocol errors.
-- Request and response bodies are not logged. Debug output for the adapter
-  exposes only a scheme/host/port-safe endpoint.
+- Request and response bodies and the bearer credential are not logged. Debug
+  output for the adapter exposes only a scheme/host/port-safe endpoint and
+  whether a credential is configured.
+- Remote settings do not create a second protocol implementation: streaming,
+  parsing, bounds, redaction, and tool-call handling remain in the single
+  OpenAI-compatible adapter.
 - Tool calls returned by the model are untrusted proposals. This adapter does
   not execute them, validate their arguments semantically, or grant
   permissions. Policy, MCP authorization, and budgets remain the harness's
@@ -190,11 +205,16 @@ authorization surface.
 ## MCP process boundary
 
 MCP child binaries and any external sandbox wrapper are an untrusted process
-and supply-chain boundary. Without a wrapper, the harness starts the configured
-server directly, without a shell, using an absolute executable path. With
+and supply-chain boundary. Enabled servers require `external-wrapper` or
+`bubblewrap` by default; startup rejects `none` unless
+`HARNESS_MCP_ALLOW_UNSANDBOXED=true` is set explicitly for development or
+testing. In that unsandboxed mode the harness starts the configured server
+directly, without a shell, using an absolute executable path. With
 `external-wrapper`, the harness starts the configured absolute wrapper directly
 with fixed arguments, then the wrapper starts the server; the wrapper is part of
-the trusted deployment boundary and must be vetted accordingly.
+the trusted deployment boundary and must be vetted accordingly. With
+`bubblewrap`, the harness starts the configured absolute bubblewrap executable
+with a fixed, harness-built argument list and the server as its child.
 
 The harness calls `env_clear()` and supplies only the explicit, minimal
 variables in `ProcessSpec::env`: a harness-controlled `HOME`, an explicit
@@ -204,8 +224,13 @@ therefore not inherited, including `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
 passes to the server; its behavior must be reviewed and enforced externally.
 
 This environment sanitization does **not** prove that a third-party MCP binary
-will never perform networking. Strict deployments must enforce the network
-boundary outside the Rust harness.
+will never perform networking. In `none` and `external-wrapper` modes, strict
+deployments must enforce the network boundary outside the Rust harness.
+`bubblewrap` mode adds a Linux network namespace (`--unshare-net`) plus PID, IPC,
+and UTS namespaces, clears the sandboxed environment, mounts selected system
+paths read-only, and exposes only the controlled `HOME` and workspace (read-only
+for `read_only`, writable for `workspace_mutation`). It is a defense-in-depth
+control, not a substitute for a reviewed server and host policy.
 
 ### Runtime MCP configuration and lifecycle
 
@@ -249,24 +274,39 @@ are not logged.
 `external-wrapper` is a static administrator/deployment control: a fixed,
 absolute wrapper executable and fixed prefix arguments precede the fixed MCP
 executable. The harness does not interpret a wrapper-specific security policy.
-`none` means no OS network sandbox at all; process environment hygiene does not
-stop a child from opening sockets.
+`bubblewrap` is a harness-managed Linux sandbox with a new network namespace and
+a fixed mount/environment policy. A configured bubblewrap executable is validated
+at startup; a missing or non-file executable fails configuration before any
+server starts. `none` means no OS network sandbox at all; process environment
+hygiene does not stop a child from opening sockets, so enabled `none` servers
+require the explicit `HARNESS_MCP_ALLOW_UNSANDBOXED=true` opt-in.
 
 The TUI and the `--headless` startup check use this same lifecycle. `--headless`
 validates configuration, starts and validates the enabled servers, prints the
 profile/server summary and warnings, shuts them down, and exits without opening
 the TUI or running a task.
 
-End-to-end lifecycle tests still use fake tool executors and fake model/Jev
+Most end-to-end lifecycle tests use fake tool executors and fake model/Jev
 adapters for orchestration. They prove the orchestration, policy, verification,
-and persistence wiring, not that a real MCP server is safe. Runtime MCP tests use
-the test-only mock binary and temporary directories; they do not require a real
-third-party server, network access, a shell, or a user repository.
+and persistence wiring. One boundary E2E test runs fixed MCP servers inside
+harness-managed bubblewrap, performs a real workspace mutation through the mock
+test server, verifies the resulting file, and checks redacted audit and Wiki
+output. Runtime MCP tests also attempt an outbound loopback connection from inside and
+outside the network namespace and inspect the sandbox route table, network
+interfaces, DNS resolution, and resolver configuration. Inside bubblewrap they
+require the loopback connection and DNS resolution to fail, no default route,
+and only the `lo` interface; the control process outside proves the same
+listener is reachable. These tests use a test-only binary and temporary
+directories; they still do not certify a third-party MCP server or a real model.
 
 Recommended next implementation milestone:
 
 ```text
-Implement an approved work-API LLM backend adapter behind the existing LlmBackend trait, with explicit endpoint configuration, bounded data handling, and no fallback from local backends.
+Validate the real execution boundary with fixed filesystem, read-only Git, and
+argv-only shell MCP servers; enforce no-network containment; add adversarial
+path/symlink/secret/metacharacter/timeout/network tests; and demonstrate an
+authorized mutation through deterministic verification, redacted audit, and Wiki
+compilation.
 ```
 
 ## Offline and vendored deployment
@@ -322,7 +362,9 @@ remove, or declare verification passed.
 - Allow only the specific loopback ports needed by the local model and routing
   services. Do not allow general loopback access to unrelated services.
 - Run MCP servers in a network namespace, container, or bubblewrap sandbox with
-  networking disabled.
+  networking disabled. For the built-in Linux option, set the slot's
+  `_SANDBOX_MODE=bubblewrap` and point `_SANDBOX_EXECUTABLE` at a vetted
+  bubblewrap binary.
 - Mount the repository read-only where possible and give mutation-capable
   servers only their required paths.
 - Do not inject proxy variables into the harness or MCP children.

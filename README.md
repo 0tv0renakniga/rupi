@@ -9,13 +9,17 @@ cargo run
 ```
 
 The binary validates configuration before entering the terminal UI. Endpoint
-defaults and safety rules are documented in `SECURITY.md`. The current build
-requires local HTTP endpoints on loopback unless the explicit `remote` Cargo
-feature is enabled.
+defaults and safety rules are documented in `SECURITY.md`. The default
+`HARNESS_ENDPOINT_PROFILE=local` accepts only plaintext HTTP on loopback. The
+explicit `approved_remote` profile requires the `remote` Cargo feature, an exact
+HTTPS origin allowlist, an explicit model name, and a credential-reference
+environment variable; Jev remains loopback-only.
 
-Useful environment variables include `HARNESS_ROOT`, `HARNESS_LLM_BASE`,
-`HARNESS_MODEL`, `HARNESS_JEV_BASE`, `HARNESS_MCP_PROFILE`, and the
-`HARNESS_APPROVAL_*` policy variables documented below.
+Useful environment variables include `HARNESS_ROOT`, `HARNESS_ENDPOINT_PROFILE`,
+`HARNESS_LLM_BASE`, `HARNESS_MODEL`, `HARNESS_LLM_ALLOWED_ORIGINS`,
+`HARNESS_LLM_CREDENTIAL_ENV`, `HARNESS_JEV_BASE`, `HARNESS_MCP_PROFILE`,
+`HARNESS_MCP_ALLOW_UNSANDBOXED`, and the `HARNESS_APPROVAL_*` policy variables
+documented below.
 
 To validate static MCP configuration, start the enabled servers, verify their
 advertised tools, shut them down, and exit without opening the TUI or starting a
@@ -51,13 +55,19 @@ working directories, and sandbox wrappers never come from model output.
 | `_STARTUP_TIMEOUT_SECS` | Bound for spawn plus initialize and `tools/list`. | `30` |
 | `_REQUEST_TIMEOUT_SECS` | Bound for each later request. | `120` |
 | `_STDERR_BYTES` | Bounded captured stderr for startup diagnostics. | `16384` |
-| `_SANDBOX_MODE` | `none` or `external-wrapper`. | `none` |
-| `_SANDBOX_EXECUTABLE` | Absolute wrapper executable for `external-wrapper`. | unset |
-| `_SANDBOX_ARGS` | JSON array fixed wrapper arguments before the server executable and its arguments. | `[]` |
+| `_SANDBOX_MODE` | `none`, `external-wrapper`, or `bubblewrap`. Enabled servers require a non-`none` mode unless `HARNESS_MCP_ALLOW_UNSANDBOXED=true` is explicitly set. | `none` |
+| `_SANDBOX_EXECUTABLE` | Absolute wrapper or bubblewrap executable. | unset |
+| `_SANDBOX_ARGS` | JSON array fixed wrapper arguments before the server executable and its arguments. Used only by `external-wrapper`. | `[]` |
 
 `HARNESS_MCP_PATH` optionally supplies the child `PATH`; otherwise a minimal
 platform default is used. Children never inherit the harness environment. They
 receive only an explicit `PATH` and a harness-controlled `HOME`.
+
+Sandboxing is fail-closed for enabled servers. Startup rejects `none` unless
+`HARNESS_MCP_ALLOW_UNSANDBOXED=true` is set explicitly; that setting is intended
+only for development and testing. A configured bubblewrap executable must be an
+absolute regular file and is validated at startup. The default `none` profile
+starts no servers, so it does not require the opt-in.
 
 Arguments are bounded to 64 entries of at most 4096 bytes each; strings that
 contain NUL are rejected. Configuration and startup are all-or-nothing before
@@ -69,10 +79,20 @@ rejected; a profile-disabled fixed capability remains unreachable.
 
 `external-wrapper` runs a fixed administrator-configured wrapper executable with
 fixed prefix arguments, then the server executable and its fixed arguments. The
-harness does not implement a generic model-controlled command pipeline. In
-`none` mode the harness performs process hygiene only: it does **not** provide a
-network sandbox. Even with a wrapper, network isolation depends on that wrapper
-and the surrounding OS policy. See `SECURITY.md`.
+harness does not implement a generic model-controlled command pipeline.
+
+`bubblewrap` runs the fixed server under a harness-managed bubblewrap sandbox on
+Linux. The sandbox uses a new network namespace, clears the wrapper environment,
+mounts selected system directories read-only, mounts the harness-controlled
+`HOME` writable, mounts the workspace read-only for `read_only` and writable for
+`workspace_mutation`, and binds the fixed server executable read-only when it is
+outside the system mounts. Bubblewrap itself must be installed and configured
+by the deployment; the harness fails startup if the configured executable is
+missing. In `none` mode the harness performs process hygiene only: it does
+**not** provide a network sandbox, and enabled servers are rejected unless the
+explicit development opt-in is present. Even with an external wrapper, network
+isolation depends on that wrapper and the surrounding OS policy. See
+`SECURITY.md`.
 
 ## Offline and vendored builds
 

@@ -305,7 +305,7 @@ impl ApprovalGate for InteractiveApprovalGate {
 }
 
 fn bound(text: &str, cap: usize) -> String {
-    let redacted = redact(text).unwrap_or_else(|_| text.to_owned());
+    let redacted = redact(text).unwrap_or_else(|_| "[redaction unavailable]".to_owned());
     let single_line = redacted.replace(['\r', '\n', '\t'], " ");
     truncate_utf8(single_line.trim(), cap)
 }

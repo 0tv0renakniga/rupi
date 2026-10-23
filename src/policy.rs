@@ -380,6 +380,36 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn rejects_existing_symlinks_that_escape_the_repository() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!("rupi-policy-symlink-{}", std::process::id()));
+        let root = base.join("repo");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "outside").unwrap();
+        symlink(outside.join("secret.txt"), root.join("linked-file")).unwrap();
+        symlink(&outside, root.join("linked-dir")).unwrap();
+        std::fs::write(root.join("inside.txt"), "inside").unwrap();
+        symlink(root.join("inside.txt"), root.join("linked-inside")).unwrap();
+
+        let policy = Policy::default_for_root(&root);
+        assert!(matches!(
+            policy.authorize_path("linked-file"),
+            Err(PolicyViolation::PathTraversal(_))
+        ));
+        assert!(matches!(
+            policy.authorize_path("linked-dir/secret.txt"),
+            Err(PolicyViolation::PathTraversal(_))
+        ));
+        assert!(policy.authorize_path("linked-inside").is_ok());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn does_not_use_substring_matching_for_secret_names() {
         let policy = policy();

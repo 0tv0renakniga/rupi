@@ -1,3 +1,4 @@
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -63,6 +64,7 @@ fn workspace_config(root: &Path, pids: &[(&str, &Path)]) -> McpRuntimeConfig {
         )),
         shell: Some(mock_server(root, "run", &["--pid-file", pid("shell")])),
         path: None,
+        allow_unsandboxed: true,
     }
 }
 
@@ -241,6 +243,7 @@ async fn read_only_profile_denies_mutation_and_disabled_capabilities() {
         git: Some(mock_server(&root, "status,diff", &[])),
         shell: None,
         path: None,
+        allow_unsandboxed: true,
     };
     let runtime = runtime(&root, &config).await.expect("runtime starts");
     let dispatcher = runtime.dispatcher();
@@ -307,6 +310,7 @@ async fn child_environment_is_sanitized_and_not_inherited() {
         git: Some(mock_server(&root, "status,diff", &[])),
         shell: None,
         path: None,
+        allow_unsandboxed: true,
     };
 
     let runtime = runtime(&root, &config).await.expect("runtime starts");
@@ -356,6 +360,7 @@ async fn startup_timeout_is_bounded_and_kills_the_child() {
         git: Some(git),
         shell: None,
         path: None,
+        allow_unsandboxed: true,
     };
 
     let error = runtime(&root, &config)
@@ -388,6 +393,7 @@ async fn capability_mismatch_fails_closed_and_kills_every_started_child() {
         )),
         shell: None,
         path: None,
+        allow_unsandboxed: true,
     };
 
     let error = runtime(&root, &config)
@@ -422,6 +428,7 @@ async fn startup_diagnostics_are_bounded_and_redacted() {
         git: Some(git),
         shell: None,
         path: None,
+        allow_unsandboxed: true,
     };
 
     let error = runtime(&root, &config)
@@ -455,4 +462,113 @@ fn headless_startup_checks_mcp_without_model_or_jev_services() {
         stdout.contains("mcp startup ok: profile=none servers=0"),
         "stdout: {stdout}"
     );
+}
+
+fn bwrap_available() -> Option<PathBuf> {
+    ["/usr/bin/bwrap", "/bin/bwrap"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+}
+
+fn network_config(root: &Path, sandbox: McpSandboxConfig, addr: &str) -> McpRuntimeConfig {
+    let probe = root.join("network-probe.txt");
+    McpRuntimeConfig {
+        profile: McpProfile::WorkspaceMutation,
+        filesystem: Some(mock_server(
+            root,
+            "read_file,write_file,apply_patch",
+            &[
+                "--network-probe-addr",
+                addr,
+                "--network-probe-result-file",
+                probe.to_str().unwrap(),
+            ],
+        )),
+        git: Some(mock_server(root, "status,diff", &[])),
+        shell: Some(mock_server(root, "run", &[])),
+        path: None,
+        allow_unsandboxed: true,
+    }
+    .with_filesystem_sandbox(sandbox)
+}
+
+trait SandboxFilesystem {
+    fn with_filesystem_sandbox(self, sandbox: McpSandboxConfig) -> Self;
+}
+
+impl SandboxFilesystem for McpRuntimeConfig {
+    fn with_filesystem_sandbox(mut self, sandbox: McpSandboxConfig) -> Self {
+        if let Some(server) = &mut self.filesystem {
+            server.sandbox = sandbox;
+        }
+        self
+    }
+}
+
+#[tokio::test]
+async fn control_process_reaches_host_loopback_listener() {
+    let root = test_root("network-control");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+    let addr = listener.local_addr().unwrap().to_string();
+    let config = network_config(&root, McpSandboxConfig::None, &addr);
+    let runtime = runtime(&root, &config).await.expect("runtime starts");
+    let report: Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("network-probe.txt")).expect("probe result"),
+    )
+    .expect("probe JSON");
+    assert_eq!(report["tcp_loopback"], true);
+    drop(runtime.dispatcher());
+    runtime.shutdown(Duration::from_secs(2)).await.unwrap();
+    drop(listener);
+}
+
+#[tokio::test]
+async fn bubblewrap_blocks_outbound_network_connections() {
+    let Some(bwrap) = bwrap_available() else {
+        eprintln!("skipping bubblewrap test: bwrap not installed");
+        return;
+    };
+    let root = test_root("network-bwrap");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+    let addr = listener.local_addr().unwrap().to_string();
+    let config = network_config(
+        &root,
+        McpSandboxConfig::Bubblewrap { executable: bwrap },
+        &addr,
+    );
+    let runtime = runtime(&root, &config).await.expect("runtime starts");
+    assert!(
+        runtime
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("bubblewrap network namespaces"))
+    );
+    let report: Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("network-probe.txt")).expect("probe result"),
+    )
+    .expect("probe JSON");
+    assert_eq!(report["tcp_loopback"], false);
+    assert_eq!(report["dns_resolved"], false);
+    assert_eq!(report["resolv_conf_present"], false);
+    let routes = report["routes"].as_str().expect("route table");
+    assert!(
+        !routes.lines().skip(1).any(|line| !line.trim().is_empty()),
+        "sandbox has a route: {routes}"
+    );
+    let devices = report["devices"].as_str().expect("device table");
+    let interfaces = devices
+        .lines()
+        .skip(2)
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, _)| name.trim())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        interfaces,
+        ["lo"],
+        "unexpected network interfaces: {devices}"
+    );
+    drop(runtime.dispatcher());
+    runtime.shutdown(Duration::from_secs(2)).await.unwrap();
+    drop(listener);
 }

@@ -10,14 +10,19 @@ use local_agent_harness::agent::verify::{VerificationCommand, VerifyReport, Veri
 use local_agent_harness::approval::{
     ApprovalDecision, ApprovalFuture, ApprovalGate, ApprovalPolicy, ApprovalRequest,
 };
-use local_agent_harness::audit::{AuditKind, AuditRecord, AuditSink};
+use local_agent_harness::audit::{AuditKind, AuditLog, AuditRecord, AuditSink};
+use local_agent_harness::config::{
+    McpProfile, McpRuntimeConfig, McpSandboxConfig, McpServerConfig,
+};
 use local_agent_harness::error::{AgentError, Result};
 use local_agent_harness::events::AgentEvent;
 use local_agent_harness::jev::{Route, Verdict};
 use local_agent_harness::llm::{
     AssistantTurn, ChatRequest, FnCall, LlmBackend, LlmStreamEvent, ToolCall,
 };
-use local_agent_harness::mcp::{AgentTool, ToolOutcome};
+use local_agent_harness::mcp::client::DEFAULT_MCP_PROTOCOL_VERSION;
+use local_agent_harness::mcp::process::DEFAULT_STDERR_CAPACITY_BYTES;
+use local_agent_harness::mcp::{AgentTool, McpRuntime, ToolOutcome};
 use local_agent_harness::orchestrator::{
     Clock, EventSink, JevAdvisor, LocalWikiStore, Orchestrator, OrchestratorLimits,
     OrchestratorOutcome, TaskContext, TaskRequest, ToolExecutor, VerificationEngine, WikiStore,
@@ -872,4 +877,171 @@ async fn wiki_compile_failure_after_verified_work_prevents_completion() {
             .iter()
             .any(|blocker| blocker.contains("Wiki compilation failed"))
     );
+}
+
+const MCP_SERVER: &str = env!("CARGO_BIN_EXE_mock_mcp_server");
+const MCP_TOOL_SECRET: &str = "MCP_E2E_SECRET";
+
+struct ContentVerifier {
+    relative_path: String,
+    expected: String,
+}
+
+#[async_trait]
+impl VerificationEngine for ContentVerifier {
+    async fn detect(&self, root: &Path) -> Result<Vec<VerificationCommand>> {
+        Ok(vec![VerificationCommand {
+            program: "content-check".into(),
+            args: vec![self.relative_path.clone()],
+            cwd: root.to_path_buf(),
+            timeout: Duration::from_secs(5),
+        }])
+    }
+
+    async fn run(
+        &self,
+        root: &Path,
+        _commands: &[VerificationCommand],
+        _output_cap: usize,
+    ) -> Result<VerifyReport> {
+        let content = std::fs::read_to_string(root.join(&self.relative_path))?;
+        let passed = content.contains(&self.expected);
+        Ok(VerifyReport {
+            passed,
+            steps: vec![VerifyStep {
+                command: format!("content-check {}", self.relative_path),
+                exit_code: i32::from(!passed),
+                duration: Duration::from_millis(1),
+                timed_out: false,
+            }],
+            tail: if passed {
+                String::new()
+            } else {
+                "expected content missing".into()
+            },
+        })
+    }
+}
+
+fn contained_server(root: &Path, tools: &str, extra: &[&str], bwrap: &Path) -> McpServerConfig {
+    let mut args = vec!["--tools".to_owned(), tools.to_owned()];
+    args.extend(extra.iter().map(|arg| (*arg).to_owned()));
+    McpServerConfig {
+        enabled: true,
+        executable: PathBuf::from(MCP_SERVER),
+        args,
+        working_directory: root.to_path_buf(),
+        protocol_version: DEFAULT_MCP_PROTOCOL_VERSION.into(),
+        startup_timeout: Duration::from_secs(10),
+        request_timeout: Duration::from_secs(10),
+        stderr_capacity_bytes: DEFAULT_STDERR_CAPACITY_BYTES,
+        sandbox: McpSandboxConfig::Bubblewrap {
+            executable: bwrap.to_path_buf(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn contained_real_mcp_mutation_is_verified_audited_and_wiki_compiled() {
+    let bwrap = ["/usr/bin/bwrap", "/bin/bwrap"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file());
+    let Some(bwrap) = bwrap else {
+        eprintln!("skipping real-MCP boundary E2E: bwrap not installed");
+        return;
+    };
+
+    let repo = TempRepo::new("real-mcp-boundary");
+    let config = McpRuntimeConfig {
+        profile: McpProfile::WorkspaceMutation,
+        filesystem: Some(contained_server(
+            repo.path(),
+            "read_file,write_file,apply_patch",
+            &["--real-filesystem"],
+            &bwrap,
+        )),
+        git: Some(contained_server(repo.path(), "status,diff", &[], &bwrap)),
+        shell: Some(contained_server(repo.path(), "run", &[], &bwrap)),
+        path: None,
+        allow_unsandboxed: false,
+    };
+    let runtime = McpRuntime::start(
+        &config,
+        repo.path(),
+        Policy::default_for_root(repo.path()),
+        8_000,
+    )
+    .await
+    .expect("start contained MCP runtime");
+    assert!(
+        runtime
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("bubblewrap network namespaces"))
+    );
+
+    let llm = Arc::new(FakeLlm::new(vec![
+        plan_turn(),
+        tool_turn(
+            "write_file",
+            r#"{"path":"src/lib.rs","content":"pub fn value() -> u8 { 42 }\n"}"#,
+        ),
+        turn("DONE"),
+    ]));
+    let events = Arc::new(CollectEvents::default());
+    let audit = Arc::new(AuditLog::new(repo.path().join("audit.jsonl")));
+    let tools: Arc<dyn ToolExecutor> = runtime.dispatcher();
+    let orchestrator = Orchestrator::new(
+        llm.clone(),
+        Arc::new(PassingJev),
+        tools,
+        Arc::new(ContentVerifier {
+            relative_path: "src/lib.rs".into(),
+            expected: "42".into(),
+        }),
+        Arc::new(LocalWikiStore::default()),
+    )
+    .with_audit(audit.clone())
+    .with_clock(Arc::new(FakeClock::default()))
+    .with_event_sink(events.clone())
+    .with_approval_policy(ApprovalPolicy::default())
+    .with_approval_gate(Arc::new(AllowApprovals));
+
+    let outcome = orchestrator
+        .run(
+            TaskRequest::new(OBJECTIVE, repo.path()).with_budget(TaskBudget::default()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("run real-MCP task");
+
+    assert_eq!(outcome.state(), LoopState::Completed);
+    assert!(outcome.verified());
+    assert!(outcome.context.mutated);
+    assert!(
+        std::fs::read_to_string(repo.path().join("src/lib.rs"))
+            .expect("read mutated file")
+            .contains("42")
+    );
+    assert_wiki_green(repo.path()).await;
+
+    let audit_text = std::fs::read_to_string(repo.path().join("audit.jsonl")).expect("audit log");
+    assert!(audit_text.contains("task_started"));
+    assert!(audit_text.contains("tool_finished"));
+    assert!(audit_text.contains("task_finished"));
+    for surface in [
+        audit_text,
+        format!("{:?}", events.events()),
+        serde_json::to_string(&outcome.context.session_trace).expect("trace"),
+    ] {
+        assert!(!surface.contains(MCP_TOOL_SECRET));
+        assert!(!surface.contains(HIDDEN_REASONING));
+    }
+
+    drop(orchestrator);
+    runtime
+        .shutdown(Duration::from_secs(2))
+        .await
+        .expect("shutdown runtime");
 }

@@ -145,6 +145,7 @@ fn process_spec(
     kind: McpServerKind,
     server: &McpServerConfig,
 ) -> Result<ProcessSpec> {
+    let env = child_environment(config, kind)?;
     let (program, args) = match &server.sandbox {
         McpSandboxConfig::None => (server.executable.clone(), server.args.clone()),
         McpSandboxConfig::ExternalWrapper {
@@ -161,13 +162,130 @@ fn process_spec(
             args.extend(server.args.iter().cloned());
             (executable.clone(), args)
         }
+        McpSandboxConfig::Bubblewrap { executable } => {
+            let mut args = bubblewrap_args(config, server, &env)?;
+            args.push("--".into());
+            args.push(path_utf8(&server.executable, "MCP server executable")?);
+            args.extend(server.args.iter().cloned());
+            (executable.clone(), args)
+        }
     };
 
     Ok(ProcessSpec {
         program,
         args,
         cwd: Some(server.working_directory.clone()),
-        env: child_environment(config, kind)?,
+        env,
+    })
+}
+
+fn bubblewrap_args(
+    config: &McpRuntimeConfig,
+    server: &McpServerConfig,
+    env: &BTreeMap<String, String>,
+) -> Result<Vec<String>> {
+    if !cfg!(target_os = "linux") {
+        return Err(AgentError::Config(
+            "bubblewrap sandbox mode is supported only on Linux".into(),
+        ));
+    }
+
+    let home = env
+        .get("HOME")
+        .ok_or_else(|| AgentError::Mcp("bubblewrap mode requires a controlled HOME".into()))?;
+    let path = env
+        .get("PATH")
+        .ok_or_else(|| AgentError::Mcp("bubblewrap mode requires a controlled PATH".into()))?;
+    let cwd = std::fs::canonicalize(&server.working_directory).map_err(|error| {
+        AgentError::Config(format!(
+            "MCP working directory cannot be canonicalized for bubblewrap: {}: {error}",
+            server.working_directory.display()
+        ))
+    })?;
+    let home = std::fs::canonicalize(home)
+        .map_err(|error| AgentError::Config(format!("controlled MCP HOME is invalid: {error}")))?;
+    let cwd_text = path_utf8(&cwd, "MCP working directory")?;
+    let home_text = path_utf8(&home, "controlled MCP HOME")?;
+
+    let mut args = vec![
+        "--die-with-parent".into(),
+        "--new-session".into(),
+        "--unshare-net".into(),
+        "--unshare-pid".into(),
+        "--unshare-ipc".into(),
+        "--unshare-uts".into(),
+        "--clearenv".into(),
+        "--proc".into(),
+        "/proc".into(),
+        "--dev".into(),
+        "/dev".into(),
+        "--tmpfs".into(),
+        "/tmp".into(),
+    ];
+
+    for system_path in ["/usr", "/bin", "/sbin", "/lib", "/lib64"] {
+        let source = Path::new(system_path);
+        if source.exists() {
+            args.push("--ro-bind".into());
+            args.push(system_path.into());
+            args.push(system_path.into());
+        }
+    }
+
+    let server_program = std::fs::canonicalize(&server.executable).map_err(|error| {
+        AgentError::Config(format!(
+            "MCP server executable cannot be canonicalized for bubblewrap: {}: {error}",
+            server.executable.display()
+        ))
+    })?;
+    let under_system_path = ["/usr", "/bin", "/sbin", "/lib", "/lib64"]
+        .iter()
+        .any(|prefix| server_program.starts_with(prefix));
+    if !under_system_path {
+        let program = path_utf8(&server_program, "MCP server executable")?;
+        args.push("--ro-bind".into());
+        args.push(program.clone());
+        args.push(program);
+    }
+
+    args.push("--dir".into());
+    args.push(home_text.clone());
+    args.push("--bind".into());
+    args.push(home_text.clone());
+    args.push(home_text.clone());
+
+    if !["/usr", "/bin", "/sbin", "/lib", "/lib64"]
+        .iter()
+        .any(|prefix| cwd.starts_with(prefix))
+    {
+        args.push("--dir".into());
+        args.push(cwd_text.clone());
+    }
+    args.push(if config.profile == McpProfile::WorkspaceMutation {
+        "--bind".into()
+    } else {
+        "--ro-bind".into()
+    });
+    args.push(cwd_text.clone());
+    args.push(cwd_text.clone());
+
+    args.extend([
+        "--chdir".into(),
+        cwd_text,
+        "--setenv".into(),
+        "HOME".into(),
+        home_text,
+        "--setenv".into(),
+        "PATH".into(),
+        path.clone(),
+    ]);
+
+    Ok(args)
+}
+
+fn path_utf8(path: &Path, label: &str) -> Result<String> {
+    path.to_str().map(str::to_owned).ok_or_else(|| {
+        AgentError::Config(format!("{label} must be valid UTF-8 for bubblewrap mode"))
     })
 }
 
@@ -260,20 +378,39 @@ fn startup_warnings(
         return warnings;
     }
 
-    let sandboxed = config
-        .enabled_servers()
+    let enabled = config.enabled_servers();
+    let unsandboxed = enabled
         .iter()
-        .all(|(_, server)| !matches!(server.sandbox, McpSandboxConfig::None));
-    if !sandboxed {
+        .filter(|(_, server)| matches!(server.sandbox, McpSandboxConfig::None))
+        .count();
+    let bubblewrap = enabled
+        .iter()
+        .filter(|(_, server)| matches!(server.sandbox, McpSandboxConfig::Bubblewrap { .. }))
+        .count();
+    let external = enabled
+        .iter()
+        .filter(|(_, server)| matches!(server.sandbox, McpSandboxConfig::ExternalWrapper { .. }))
+        .count();
+    if unsandboxed > 0 {
         warnings.push(format!(
-            "MCP profile `{}` starts {} server(s) without an OS network sandbox; network isolation is not provided by the harness.",
+            "MCP profile `{}` starts {} of {} server(s) without an OS network sandbox; network isolation is not provided for those servers.",
             config.profile.as_str(),
+            unsandboxed,
             started.len()
         ));
-    } else {
+    }
+    if bubblewrap > 0 {
         warnings.push(format!(
-            "MCP profile `{}` delegates isolation to its configured external sandbox wrapper; the harness itself does not provide network isolation.",
-            config.profile.as_str()
+            "MCP profile `{}` runs {} server(s) inside harness-managed bubblewrap network namespaces.",
+            config.profile.as_str(),
+            bubblewrap
+        ));
+    }
+    if external > 0 {
+        warnings.push(format!(
+            "MCP profile `{}` delegates isolation for {} server(s) to an external sandbox wrapper; the harness cannot verify that wrapper's network policy.",
+            config.profile.as_str(),
+            external
         ));
     }
 
@@ -300,6 +437,9 @@ fn sandbox_label(sandbox: &McpSandboxConfig) -> String {
         McpSandboxConfig::None => "none (no network isolation)".into(),
         McpSandboxConfig::ExternalWrapper { executable, .. } => {
             format!("external-wrapper:{}", safe_basename(executable))
+        }
+        McpSandboxConfig::Bubblewrap { executable } => {
+            format!("bubblewrap:{}", safe_basename(executable))
         }
     }
 }

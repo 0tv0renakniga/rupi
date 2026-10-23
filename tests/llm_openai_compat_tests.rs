@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -16,6 +17,7 @@ use tokio::task::JoinHandle;
 struct TestRequest {
     method: String,
     path: String,
+    headers: BTreeMap<String, String>,
     body: String,
 }
 
@@ -188,10 +190,13 @@ async fn handle_connection(
     let method = request_parts.next().unwrap_or_default().to_owned();
     let path = request_parts.next().unwrap_or_default().to_owned();
 
-    let content_length = lines
-        .filter_map(|line| line.split_once(':'))
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+    let mut headers = BTreeMap::new();
+    for (name, value) in lines.filter_map(|line| line.split_once(':')) {
+        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned());
+    }
+    let content_length = headers
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
 
     let body_start = header_end + 4;
@@ -206,7 +211,12 @@ async fn handle_connection(
 
     let body_end = (body_start + content_length).min(buffer.len());
     let body = String::from_utf8_lossy(&buffer[body_start..body_end]).into_owned();
-    let request = TestRequest { method, path, body };
+    let request = TestRequest {
+        method,
+        path,
+        headers,
+        body,
+    };
     requests.lock().expect("request lock").push(request.clone());
 
     let response = responder(&request);
@@ -947,4 +957,49 @@ async fn real_llama_server_smoke_test() {
         !turn.text.trim().is_empty(),
         "local llama-server returned no text"
     );
+}
+
+#[tokio::test]
+async fn bearer_token_is_sent_to_both_completion_endpoints_and_not_debugged() {
+    let server = TestServer::start(|request| {
+        if request.path.ends_with("/chat/completions") {
+            if request.body.contains("\"stream\":true") {
+                TestResponse::sse(format!(
+                    "{}{}",
+                    data(r#"{"choices":[{"delta":{"content":"ok"}}]}"#),
+                    done()
+                ))
+            } else {
+                TestResponse::json(r#"{"choices":[{"message":{"content":"ok"}}]}"#)
+            }
+        } else {
+            TestResponse::status(404, "Not Found", "unexpected path")
+        }
+    })
+    .await;
+    let client = server.client().with_bearer_token("test-secret-token");
+
+    let streamed = client
+        .stream_chat(user_request("stream"), None)
+        .await
+        .expect("streamed completion");
+    assert_eq!(streamed.text, "ok");
+    let completed = client
+        .complete_text("system", "user")
+        .await
+        .expect("completion");
+    assert_eq!(completed, "ok");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some("Bearer test-secret-token")
+        );
+    }
+
+    let debug = format!("{client:?}");
+    assert!(debug.contains("credential_configured: true"));
+    assert!(!debug.contains("test-secret-token"));
 }

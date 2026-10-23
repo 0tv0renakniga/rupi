@@ -687,7 +687,7 @@ fn mode_for_status(status: TaskStatus) -> InputMode {
 
 /// Redact and flatten a display string, then UTF-8-safely bound it.
 pub fn bounded_display_text(input: &str, cap: usize) -> String {
-    let redacted = redact(input).unwrap_or_else(|_| input.to_owned());
+    let redacted = redact(input).unwrap_or_else(|_| "[redaction unavailable]".to_owned());
     let single_line = redacted.replace("\r\n", " ").replace(['\r', '\n'], " ");
     truncate_utf8(single_line.trim(), cap, "...[truncated]")
 }

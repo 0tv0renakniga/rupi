@@ -96,11 +96,7 @@ async fn prepare(config: &Config) -> Result<PreparedApp> {
         config.budget.max_verify_retries,
         config.budget.max_wall_time.as_secs()
     );
-    app.endpoint_mode = if cfg!(feature = "remote") {
-        "remote-enabled".to_owned()
-    } else {
-        "air-gapped".to_owned()
-    };
+    app.endpoint_mode = config.endpoint.profile.as_str().to_owned();
     app.model = config.model.clone();
 
     let policy = Policy::default_for_root(config.root.clone());
@@ -117,7 +113,7 @@ async fn prepare(config: &Config) -> Result<PreparedApp> {
     // Startup happens before terminal setup so failures remain printable on a
     // normal terminal and no task can run with partial tool capabilities.
     let approvals = InteractiveApprovalGate::new();
-    let orchestrator = build_orchestrator(config, runtime.dispatcher(), approvals.clone());
+    let orchestrator = build_orchestrator(config, runtime.dispatcher(), approvals.clone())?;
 
     Ok(PreparedApp {
         app,
@@ -131,11 +127,12 @@ fn build_orchestrator(
     config: &Config,
     tools: Arc<ToolDispatcher>,
     approvals: InteractiveApprovalGate,
-) -> Orchestrator {
-    let llm = Arc::new(OpenAiCompatClient::new(
-        config.llm_base.clone(),
-        config.model.clone(),
-    ));
+) -> Result<Orchestrator> {
+    let mut llm = OpenAiCompatClient::new(config.llm_base.clone(), config.model.clone());
+    if let Some(credential) = config.llm_credential()? {
+        llm = llm.with_bearer_token(credential);
+    }
+    let llm = Arc::new(llm);
     let jev = Arc::new(JevClient::new(config.jev_base.clone()));
     let limits = OrchestratorLimits {
         min_choice_confidence: config.min_route_conf,
@@ -143,7 +140,7 @@ fn build_orchestrator(
         ..OrchestratorLimits::default()
     };
 
-    Orchestrator::new(
+    Ok(Orchestrator::new(
         llm,
         jev,
         tools,
@@ -152,7 +149,7 @@ fn build_orchestrator(
     )
     .with_limits(limits)
     .with_approval_policy(config.approval.clone())
-    .with_approval_gate(Arc::new(approvals))
+    .with_approval_gate(Arc::new(approvals)))
 }
 
 async fn event_loop(
@@ -280,7 +277,7 @@ fn restore_terminal() {
 mod tests {
     use super::*;
     use crate::approval::ApprovalPolicy;
-    use crate::config::{McpProfile, McpRuntimeConfig};
+    use crate::config::{EndpointConfig, McpProfile, McpRuntimeConfig};
     use crate::state_machine::TaskBudget;
     use std::path::PathBuf;
 
@@ -290,6 +287,7 @@ mod tests {
             llm_base: "http://127.0.0.1:8080".into(),
             model: "local-model".into(),
             jev_base: "http://127.0.0.1:9090".into(),
+            endpoint: EndpointConfig::default(),
             min_route_conf: 0.85,
             budget: TaskBudget::default(),
             approval: ApprovalPolicy::default(),

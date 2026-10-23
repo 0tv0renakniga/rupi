@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -15,9 +16,12 @@ use crate::state_machine::TaskBudget;
 /// This milestone uses a deliberately small environment-variable source:
 ///
 /// - `HARNESS_ROOT` (default: current directory)
+/// - `HARNESS_ENDPOINT_PROFILE` (default: `local`)
 /// - `HARNESS_LLM_BASE` (default: `http://127.0.0.1:8080`)
-/// - `HARNESS_MODEL` (default: `local-model`)
-/// - `HARNESS_JEV_BASE` (default: `http://127.0.0.1:9090`)
+/// - `HARNESS_MODEL` (default: `local-model`; required for approved-remote)
+/// - `HARNESS_LLM_ALLOWED_ORIGINS` (approved-remote only: comma-separated HTTPS origins)
+/// - `HARNESS_LLM_CREDENTIAL_ENV` (approved-remote only: environment variable name)
+/// - `HARNESS_JEV_BASE` (default: `http://127.0.0.1:9090`; always loopback)
 /// - `HARNESS_MIN_ROUTE_CONF` (default: `0.85`)
 /// - `HARNESS_MAX_ACT_TURNS` (default: `40`)
 /// - `HARNESS_MAX_TOOL_CALLS` (default: `120`)
@@ -30,20 +34,101 @@ use crate::state_machine::TaskBudget;
 /// - `HARNESS_APPROVAL_RISKY_PROGRAMS` (default: `git,cargo,npm,pip,python3`)
 /// - `HARNESS_APPROVAL_TIMEOUT_SECS` (default: `120`)
 ///
-/// In the default air-gapped build, both endpoint URLs must use plaintext HTTP
-/// on a loopback host. The `remote` Cargo feature permits HTTPS and
-/// non-loopback hosts. Enabling that feature does not configure, contact, or
-/// upload data to any endpoint; callers must still supply an explicit URL.
+/// Endpoint profiles are mutually exclusive:
+///
+/// - `local` requires plaintext HTTP on a loopback host and never reads a
+///   credential reference.
+/// - `approved_remote` requires the `remote` Cargo feature, an explicit HTTPS
+///   base whose origin is in a fixed allowlist, an explicitly configured model
+///   name, and an environment-variable name that holds the credential. The
+///   harness never stores or logs the credential value.
+///
+/// Jev remains a local System 1 service and must always use loopback HTTP.
+/// Enabling the `remote` Cargo feature does not by itself select the remote
+/// profile, configure an endpoint, contact a service, or upload data.
 ///
 /// Static MCP server configuration is read from the fixed `HARNESS_MCP_*`
 /// variables documented in `README.md`. No server name, executable, argument,
 /// working directory, or sandbox comes from model output.
+/// Maximum number of exact origins accepted for the approved-remote profile.
+pub const MAX_ALLOWED_ORIGINS: usize = 16;
+/// Maximum accepted model-name length.
+pub const MAX_MODEL_NAME_BYTES: usize = 256;
+/// Maximum accepted credential-reference environment-variable name length.
+pub const MAX_CREDENTIAL_REF_BYTES: usize = 128;
+
+/// Mutually exclusive endpoint profiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EndpointProfile {
+    /// Loopback-only local llama-server. No credential reference is allowed.
+    #[default]
+    Local,
+    /// Explicitly approved OpenAI-compatible work endpoint.
+    ApprovedRemote,
+}
+
+impl EndpointProfile {
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "local" => Ok(Self::Local),
+            "approved_remote" | "approved-remote" | "work" => Ok(Self::ApprovedRemote),
+            other => Err(AgentError::Config(format!(
+                "HARNESS_ENDPOINT_PROFILE must be `local` or `approved_remote`; got `{other}`"
+            ))),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::ApprovedRemote => "approved_remote",
+        }
+    }
+}
+
+/// Endpoint-profile metadata. Remote settings are rejected in the local
+/// profile so the two configurations cannot be mixed accidentally.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EndpointConfig {
+    pub profile: EndpointProfile,
+    /// Exact approved HTTPS origins, for example `https://work.example.com`.
+    pub allowed_origins: BTreeSet<String>,
+    /// Name of the environment variable that holds the credential.
+    pub credential_env: Option<String>,
+    /// Whether `HARNESS_MODEL` was explicitly supplied.
+    pub model_explicit: bool,
+}
+
+impl std::fmt::Debug for EndpointConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EndpointConfig")
+            .field("profile", &self.profile)
+            .field("allowed_origins", &self.allowed_origins)
+            .field("credential_configured", &self.credential_env.is_some())
+            .field("model_explicit", &self.model_explicit)
+            .finish()
+    }
+}
+
+impl Default for EndpointConfig {
+    fn default() -> Self {
+        Self {
+            profile: EndpointProfile::Local,
+            allowed_origins: BTreeSet::new(),
+            credential_env: None,
+            model_explicit: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub root: PathBuf,
     pub llm_base: String,
     pub model: String,
     pub jev_base: String,
+    pub endpoint: EndpointConfig,
     pub min_route_conf: f32,
     pub budget: TaskBudget,
     pub approval: ApprovalPolicy,
@@ -66,6 +151,13 @@ impl Config {
         };
 
         let mcp = McpRuntimeConfig::from_env(&root)?;
+        let endpoint = EndpointConfig {
+            profile: EndpointProfile::parse(&env_or("HARNESS_ENDPOINT_PROFILE", "local"))?,
+            allowed_origins: parse_origin_list("HARNESS_LLM_ALLOWED_ORIGINS")?,
+            credential_env: optional_env_name("HARNESS_LLM_CREDENTIAL_ENV")?,
+            model_explicit: std::env::var("HARNESS_MODEL")
+                .is_ok_and(|value| !value.trim().is_empty()),
+        };
         let approval = ApprovalPolicy {
             require_for_mutations: parse_env("HARNESS_APPROVAL_MUTATIONS", true)?,
             require_for_risky_commands: parse_env("HARNESS_APPROVAL_RISKY_COMMANDS", false)?,
@@ -84,11 +176,30 @@ impl Config {
             llm_base: env_or("HARNESS_LLM_BASE", "http://127.0.0.1:8080"),
             model: env_or("HARNESS_MODEL", "local-model"),
             jev_base: env_or("HARNESS_JEV_BASE", "http://127.0.0.1:9090"),
+            endpoint,
             min_route_conf: parse_env("HARNESS_MIN_ROUTE_CONF", 0.85f32)?,
             budget,
             approval,
             mcp,
         })
+    }
+
+    /// Resolve the configured credential reference without exposing its value
+    /// in configuration, logs, or `Debug` output.
+    pub fn llm_credential(&self) -> Result<Option<String>> {
+        let Some(name) = &self.endpoint.credential_env else {
+            return Ok(None);
+        };
+        let value = std::env::var(name).map_err(|_| {
+            AgentError::Config("the configured credential reference is not set".into())
+        })?;
+        if value.trim().is_empty() || value.contains(['\0', '\r', '\n']) {
+            return Err(AgentError::Config(
+                "the configured credential reference is empty or contains control characters"
+                    .into(),
+            ));
+        }
+        Ok(Some(value))
     }
 
     /// Reject unsafe endpoint configuration and nonsensical budgets.
@@ -108,8 +219,8 @@ impl Config {
         }
 
         validate_budget(&self.budget)?;
-        validate_endpoint("llm_base", &self.llm_base)?;
-        validate_endpoint("jev_base", &self.jev_base)?;
+        validate_endpoint_profile(&self.endpoint, &self.llm_base, &self.model)?;
+        validate_local_endpoint("jev_base", &self.jev_base)?;
         self.approval.validate()?;
         self.mcp.validate()?;
         Ok(())
@@ -195,6 +306,8 @@ pub enum McpSandboxConfig {
         executable: PathBuf,
         args_prefix: Vec<String>,
     },
+    /// Harness-managed bubblewrap containment with a new network namespace.
+    Bubblewrap { executable: PathBuf },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,6 +331,10 @@ pub struct McpRuntimeConfig {
     pub shell: Option<McpServerConfig>,
     /// Explicit child PATH. When absent, a minimal platform default is used.
     pub path: Option<String>,
+    /// Development/testing escape hatch for servers with no sandbox.
+    ///
+    /// Production profiles require a sandbox unless this is explicitly set.
+    pub allow_unsandboxed: bool,
 }
 
 impl McpRuntimeConfig {
@@ -237,6 +354,7 @@ impl McpRuntimeConfig {
             git: parse_mcp_server(McpServerKind::Git, root)?,
             shell: parse_mcp_server(McpServerKind::Shell, root)?,
             path,
+            allow_unsandboxed: parse_env("HARNESS_MCP_ALLOW_UNSANDBOXED", false)?,
         })
     }
 
@@ -288,6 +406,13 @@ impl McpRuntimeConfig {
 
         for (kind, server) in enabled {
             server.validate(kind)?;
+            if !self.allow_unsandboxed && matches!(server.sandbox, McpSandboxConfig::None) {
+                return Err(AgentError::Config(format!(
+                    "MCP profile `{}` requires a sandbox for `{}`; set HARNESS_MCP_ALLOW_UNSANDBOXED=true only for explicit development/testing use",
+                    self.profile.as_str(),
+                    kind.name()
+                )));
+            }
         }
         Ok(())
     }
@@ -360,13 +485,18 @@ impl McpServerConfig {
             )));
         }
 
-        if let McpSandboxConfig::ExternalWrapper {
-            executable,
-            args_prefix,
-        } = &self.sandbox
-        {
-            validate_executable(&format!("{prefix}_SANDBOX_EXECUTABLE"), executable)?;
-            validate_args(&format!("{prefix}_SANDBOX_ARGS"), args_prefix)?;
+        match &self.sandbox {
+            McpSandboxConfig::None => {}
+            McpSandboxConfig::ExternalWrapper {
+                executable,
+                args_prefix,
+            } => {
+                validate_executable(&format!("{prefix}_SANDBOX_EXECUTABLE"), executable)?;
+                validate_args(&format!("{prefix}_SANDBOX_ARGS"), args_prefix)?;
+            }
+            McpSandboxConfig::Bubblewrap { executable } => {
+                validate_executable(&format!("{prefix}_SANDBOX_EXECUTABLE"), executable)?;
+            }
         }
         Ok(())
     }
@@ -447,9 +577,19 @@ fn parse_mcp_server(
                 args_prefix,
             }
         }
+        "bubblewrap" => {
+            let executable = std::env::var(format!("{prefix}_SANDBOX_EXECUTABLE"))
+                .map(PathBuf::from)
+                .map_err(|_| {
+                    AgentError::Config(format!(
+                        "{prefix}_SANDBOX_EXECUTABLE is required for bubblewrap sandbox mode"
+                    ))
+                })?;
+            McpSandboxConfig::Bubblewrap { executable }
+        }
         other => {
             return Err(AgentError::Config(format!(
-                "{prefix}_SANDBOX_MODE must be `none` or `external-wrapper`; got `{other}`"
+                "{prefix}_SANDBOX_MODE must be `none`, `external-wrapper`, or `bubblewrap`; got `{other}`"
             )));
         }
     };
@@ -639,6 +779,211 @@ pub fn log_safe_endpoint(raw: &str) -> String {
     safe
 }
 
+fn validate_endpoint_profile(endpoint: &EndpointConfig, llm_base: &str, model: &str) -> Result<()> {
+    if model.trim().is_empty() {
+        return Err(AgentError::Config("model name must not be empty".into()));
+    }
+    if model.len() > MAX_MODEL_NAME_BYTES {
+        return Err(AgentError::Config(format!(
+            "model name exceeds {MAX_MODEL_NAME_BYTES} bytes"
+        )));
+    }
+    if model.contains(['\0', '\r', '\n']) {
+        return Err(AgentError::Config(
+            "model name must not contain control characters".into(),
+        ));
+    }
+
+    match endpoint.profile {
+        EndpointProfile::Local => {
+            if !endpoint.allowed_origins.is_empty() || endpoint.credential_env.is_some() {
+                return Err(AgentError::Config(
+                    "endpoint profile `local` must not configure remote origins or credentials"
+                        .into(),
+                ));
+            }
+            validate_local_endpoint("llm_base", llm_base)
+        }
+        EndpointProfile::ApprovedRemote => {
+            if !cfg!(feature = "remote") {
+                return Err(AgentError::Config(
+                    "endpoint profile `approved_remote` requires the `remote` Cargo feature".into(),
+                ));
+            }
+            if !endpoint.model_explicit {
+                return Err(AgentError::Config(
+                    "endpoint profile `approved_remote` requires an explicit HARNESS_MODEL".into(),
+                ));
+            }
+            if endpoint.allowed_origins.is_empty() {
+                return Err(AgentError::Config(
+                    "endpoint profile `approved_remote` requires HARNESS_LLM_ALLOWED_ORIGINS"
+                        .into(),
+                ));
+            }
+            if endpoint.allowed_origins.len() > MAX_ALLOWED_ORIGINS {
+                return Err(AgentError::Config(format!(
+                    "HARNESS_LLM_ALLOWED_ORIGINS contains more than {MAX_ALLOWED_ORIGINS} origins"
+                )));
+            }
+            for origin in &endpoint.allowed_origins {
+                let allowed = Url::parse(origin).map_err(|error| {
+                    AgentError::Config(format!(
+                        "HARNESS_LLM_ALLOWED_ORIGINS contains an invalid origin: {error}"
+                    ))
+                })?;
+                if allowed.scheme() != "https"
+                    || !allowed.username().is_empty()
+                    || allowed.password().is_some()
+                    || allowed.query().is_some()
+                    || allowed.fragment().is_some()
+                    || (allowed.path() != "/" && !allowed.path().is_empty())
+                    || https_origin(&allowed)? != *origin
+                {
+                    return Err(AgentError::Config(format!(
+                        "HARNESS_LLM_ALLOWED_ORIGINS entry `{origin}` must be a bare https origin"
+                    )));
+                }
+            }
+            let Some(credential_env) = endpoint.credential_env.as_deref() else {
+                return Err(AgentError::Config(
+                    "endpoint profile `approved_remote` requires HARNESS_LLM_CREDENTIAL_ENV".into(),
+                ));
+            };
+            validate_credential_reference(credential_env)?;
+
+            let base = Url::parse(llm_base).map_err(|error| {
+                AgentError::Config(format!("llm_base is not a valid URL: {error}"))
+            })?;
+            if base.scheme() != "https" {
+                return Err(AgentError::Config(
+                    "approved-remote llm_base must use https://".into(),
+                ));
+            }
+            if !base.username().is_empty() || base.password().is_some() {
+                return Err(AgentError::Config(
+                    "approved-remote llm_base must not embed credentials".into(),
+                ));
+            }
+            if base.query().is_some() || base.fragment().is_some() {
+                return Err(AgentError::Config(
+                    "approved-remote llm_base must not contain a query or fragment".into(),
+                ));
+            }
+            if base.path() != "/" && !base.path().is_empty() {
+                return Err(AgentError::Config(
+                    "approved-remote llm_base must be an origin without a path".into(),
+                ));
+            }
+            let origin = https_origin(&base)?;
+            if !endpoint.allowed_origins.contains(&origin) {
+                return Err(AgentError::Config(format!(
+                    "approved-remote llm_base origin `{origin}` is not in HARNESS_LLM_ALLOWED_ORIGINS"
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_credential_reference(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > MAX_CREDENTIAL_REF_BYTES
+        || !name.bytes().enumerate().all(|(index, byte)| {
+            byte == b'_' || byte.is_ascii_alphabetic() || (index > 0 && byte.is_ascii_digit())
+        })
+    {
+        return Err(AgentError::Config(format!(
+            "HARNESS_LLM_CREDENTIAL_ENV must be an environment-variable name of at most {MAX_CREDENTIAL_REF_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_origin_list(name: &str) -> Result<BTreeSet<String>> {
+    let Ok(raw) = std::env::var(name) else {
+        return Ok(BTreeSet::new());
+    };
+    let mut origins = BTreeSet::new();
+    for value in raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if value.contains('*') {
+            return Err(AgentError::Config(format!(
+                "{name} must contain exact origins, not wildcards"
+            )));
+        }
+        let url = Url::parse(value).map_err(|error| {
+            AgentError::Config(format!("{name} contains an invalid origin: {error}"))
+        })?;
+        if url.scheme() != "https"
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || (url.path() != "/" && !url.path().is_empty())
+        {
+            return Err(AgentError::Config(format!(
+                "{name} entries must be bare https origins"
+            )));
+        }
+        origins.insert(https_origin(&url)?);
+    }
+    if origins.len() > MAX_ALLOWED_ORIGINS {
+        return Err(AgentError::Config(format!(
+            "{name} contains more than {MAX_ALLOWED_ORIGINS} origins"
+        )));
+    }
+    Ok(origins)
+}
+
+fn optional_env_name(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => {
+            let value = value.trim().to_owned();
+            validate_credential_reference(&value)?;
+            Ok(Some(value))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+fn validate_local_endpoint(label: &str, raw: &str) -> Result<()> {
+    let url = Url::parse(raw)
+        .map_err(|error| AgentError::Config(format!("{label} is not a valid URL: {error}")))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(AgentError::Config(format!(
+            "{label} must not embed credentials"
+        )));
+    }
+    if url.scheme() != "http" {
+        return Err(AgentError::Config(format!(
+            "{label} must use http:// in the local profile"
+        )));
+    }
+    if !is_loopback_url(&url) {
+        return Err(AgentError::Config(format!(
+            "{label} must target a loopback host in the local profile (got {})",
+            log_safe_endpoint(raw)
+        )));
+    }
+    Ok(())
+}
+
+fn https_origin(url: &Url) -> Result<String> {
+    let origin = url.origin();
+    if origin.is_tuple() {
+        Ok(origin.ascii_serialization())
+    } else {
+        Err(AgentError::Config(
+            "endpoint must be an exact https origin".into(),
+        ))
+    }
+}
+
 pub(crate) fn validate_endpoint(label: &str, raw: &str) -> Result<()> {
     let url = Url::parse(raw)
         .map_err(|error| AgentError::Config(format!("{label} is not a valid URL: {error}")))?;
@@ -696,6 +1041,7 @@ mod tests {
             llm_base: llm_base.to_owned(),
             model: "local-model".into(),
             jev_base: jev_base.to_owned(),
+            endpoint: EndpointConfig::default(),
             min_route_conf: 0.85,
             budget: TaskBudget::default(),
             approval: ApprovalPolicy::default(),
@@ -722,6 +1068,113 @@ mod tests {
                 "{endpoint} should be accepted as loopback"
             );
         }
+    }
+
+    #[test]
+    fn endpoint_profile_parsing_is_explicit() {
+        assert_eq!(
+            EndpointProfile::parse("local").unwrap(),
+            EndpointProfile::Local
+        );
+        assert_eq!(
+            EndpointProfile::parse("approved_remote").unwrap(),
+            EndpointProfile::ApprovedRemote
+        );
+        assert_eq!(
+            EndpointProfile::parse("approved-remote").unwrap(),
+            EndpointProfile::ApprovedRemote
+        );
+        assert!(EndpointProfile::parse("remote").is_err());
+        assert!(EndpointProfile::parse("auto").is_err());
+    }
+
+    #[test]
+    fn local_profile_rejects_remote_only_metadata() {
+        let mut config = config_with("http://127.0.0.1:8080", "http://127.0.0.1:9090");
+        config.endpoint.allowed_origins = ["https://api.example.com".to_owned()].into();
+        assert!(config.validate().is_err());
+
+        let mut config = config_with("http://127.0.0.1:8080", "http://127.0.0.1:9090");
+        config.endpoint.credential_env = Some("WORK_TOKEN".into());
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn local_profile_rejects_tls_and_non_loopback_even_with_feature_code() {
+        for endpoint in ["https://127.0.0.1:8080", "http://192.168.1.5:8080"] {
+            let config = config_with(endpoint, "http://127.0.0.1:9090");
+            assert!(config.validate().is_err(), "{endpoint}");
+        }
+    }
+
+    #[test]
+    fn jev_stays_local_in_every_profile() {
+        let mut config = config_with("http://127.0.0.1:8080", "http://127.0.0.1:9090");
+        config.endpoint.profile = EndpointProfile::ApprovedRemote;
+        config.endpoint.allowed_origins = ["https://api.example.com".to_owned()].into();
+        config.endpoint.credential_env = Some("WORK_TOKEN".into());
+        config.endpoint.model_explicit = true;
+        config.llm_base = "https://api.example.com".into();
+        config.jev_base = "http://192.168.1.5:9090".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[cfg(not(feature = "remote"))]
+    #[test]
+    fn approved_remote_requires_the_remote_feature() {
+        let mut config = config_with("https://api.example.com", "http://127.0.0.1:9090");
+        config.endpoint = EndpointConfig {
+            profile: EndpointProfile::ApprovedRemote,
+            allowed_origins: ["https://api.example.com".to_owned()].into(),
+            credential_env: Some("WORK_TOKEN".into()),
+            model_explicit: true,
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn approved_remote_requires_exact_origin_model_and_credential_reference() {
+        let mut config = config_with("https://api.example.com", "http://127.0.0.1:9090");
+        config.endpoint = EndpointConfig {
+            profile: EndpointProfile::ApprovedRemote,
+            allowed_origins: ["https://api.example.com".to_owned()].into(),
+            credential_env: Some("WORK_TOKEN".into()),
+            model_explicit: true,
+        };
+        assert!(config.validate().is_ok());
+
+        let mut non_allowlisted = config.clone();
+        non_allowlisted.llm_base = "https://other.example.com".into();
+        assert!(non_allowlisted.validate().is_err());
+
+        let mut insecure = config.clone();
+        insecure.llm_base = "http://api.example.com".into();
+        assert!(insecure.validate().is_err());
+
+        let mut pathed = config.clone();
+        pathed.llm_base = "https://api.example.com/v1".into();
+        assert!(pathed.validate().is_err());
+
+        let mut no_model = config.clone();
+        no_model.endpoint.model_explicit = false;
+        assert!(no_model.validate().is_err());
+
+        let mut no_credential = config.clone();
+        no_credential.endpoint.credential_env = None;
+        assert!(no_credential.validate().is_err());
+
+        let mut wildcard = config.clone();
+        wildcard.endpoint.allowed_origins = ["https://*.example.com".to_owned()].into();
+        assert!(wildcard.validate().is_err());
+
+        let mut no_origins = config.clone();
+        no_origins.endpoint.allowed_origins.clear();
+        assert!(no_origins.validate().is_err());
+
+        let mut bad_credential = config;
+        bad_credential.endpoint.credential_env = Some("WORK TOKEN".into());
+        assert!(bad_credential.validate().is_err());
     }
 
     #[cfg(not(feature = "remote"))]
@@ -794,6 +1247,30 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_debug_hides_the_credential_reference() {
+        let endpoint = EndpointConfig {
+            profile: EndpointProfile::ApprovedRemote,
+            allowed_origins: ["https://api.example.com".to_owned()].into(),
+            credential_env: Some("WORK_TOKEN_REFERENCE".into()),
+            model_explicit: true,
+        };
+        let debug = format!("{endpoint:?}");
+        assert!(debug.contains("credential_configured: true"));
+        assert!(!debug.contains("WORK_TOKEN_REFERENCE"));
+    }
+
+    #[test]
+    fn missing_credential_error_does_not_echo_the_reference() {
+        let reference = "HARNESS_MISSING_CREDENTIAL_REFERENCE_DO_NOT_SET";
+        let mut config = config_with("http://127.0.0.1:8080", "http://127.0.0.1:9090");
+        config.endpoint.credential_env = Some(reference.into());
+        let error = config
+            .llm_credential()
+            .expect_err("missing credential must fail");
+        assert!(!error.to_string().contains(reference));
+    }
+
+    #[test]
     fn endpoint_logging_redacts_credentials_paths_and_queries() {
         assert_eq!(
             log_safe_endpoint("https://user:password@api.example.com:8443/v1?token=secret#frag"),
@@ -813,7 +1290,13 @@ mod tests {
     #[cfg(feature = "remote")]
     #[test]
     fn remote_feature_allows_non_loopback_endpoints() {
-        let config = config_with("https://api.example.com", "http://127.0.0.1:9090");
+        let mut config = config_with("https://api.example.com", "http://127.0.0.1:9090");
+        config.endpoint = EndpointConfig {
+            profile: EndpointProfile::ApprovedRemote,
+            allowed_origins: ["https://api.example.com".to_owned()].into(),
+            credential_env: Some("HARNESS_TEST_CREDENTIAL".into()),
+            model_explicit: true,
+        };
         assert!(config.validate().is_ok());
     }
 
@@ -842,6 +1325,7 @@ mod tests {
             git: Some(server(test_executable())),
             shell: Some(server(test_executable())),
             path: None,
+            allow_unsandboxed: true,
         }
     }
 
@@ -860,6 +1344,49 @@ mod tests {
         assert!(config.validate().is_err());
 
         assert!(mcp_config(McpProfile::WorkspaceMutation).validate().is_ok());
+    }
+
+    #[test]
+    fn production_profiles_require_an_explicit_unsandboxed_opt_in() {
+        let mut config = mcp_config(McpProfile::ReadOnly);
+        config.allow_unsandboxed = false;
+        let error = config.validate().expect_err("unsandboxed must fail closed");
+        assert!(error.to_string().contains("HARNESS_MCP_ALLOW_UNSANDBOXED"));
+
+        let mut sandboxed = mcp_config(McpProfile::ReadOnly);
+        sandboxed.allow_unsandboxed = false;
+        for server in [
+            sandboxed.filesystem.as_mut(),
+            sandboxed.git.as_mut(),
+            sandboxed.shell.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            server.sandbox = McpSandboxConfig::Bubblewrap {
+                executable: test_executable(),
+            };
+        }
+        assert!(sandboxed.validate().is_ok());
+    }
+
+    #[test]
+    fn bubblewrap_must_exist_at_startup_validation() {
+        let mut config = mcp_config(McpProfile::ReadOnly);
+        config.allow_unsandboxed = false;
+        for server in [
+            config.filesystem.as_mut(),
+            config.git.as_mut(),
+            config.shell.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            server.sandbox = McpSandboxConfig::Bubblewrap {
+                executable: PathBuf::from("/definitely/missing/bwrap"),
+            };
+        }
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -914,6 +1441,15 @@ mod tests {
         value.sandbox = McpSandboxConfig::ExternalWrapper {
             executable: test_executable(),
             args_prefix: vec!["--net=none".into()],
+        };
+        assert!(value.validate(McpServerKind::Filesystem).is_ok());
+
+        value.sandbox = McpSandboxConfig::Bubblewrap {
+            executable: PathBuf::from("relative-bwrap"),
+        };
+        assert!(value.validate(McpServerKind::Filesystem).is_err());
+        value.sandbox = McpSandboxConfig::Bubblewrap {
+            executable: test_executable(),
         };
         assert!(value.validate(McpServerKind::Filesystem).is_ok());
 

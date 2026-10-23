@@ -6,6 +6,8 @@
 //! exit, notification, protocol-error, and server-request scenarios.
 
 use std::io::{self, BufRead, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -15,6 +17,7 @@ fn main() -> io::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     write_pid_file(&args)?;
     write_env_file(&args)?;
+    write_network_probe(&args)?;
     write_startup_stderr(&args)?;
 
     let stdin = io::stdin();
@@ -58,6 +61,42 @@ fn write_env_file(args: &[String]) -> io::Result<()> {
         values.insert(name.to_owned(), value);
     }
     std::fs::write(path, Value::Object(values).to_string())
+}
+
+fn write_network_probe(args: &[String]) -> io::Result<()> {
+    let Some(raw_addr) = arg_value(args, "--network-probe-addr") else {
+        return Ok(());
+    };
+    let Some(path) = arg_value(args, "--network-probe-result-file") else {
+        return Ok(());
+    };
+    let addr: SocketAddr = raw_addr.parse().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid --network-probe-addr: {error}"),
+        )
+    })?;
+    let connected = TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok();
+    let (dns_tx, dns_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let resolved = ("example.com", 80)
+            .to_socket_addrs()
+            .is_ok_and(|mut addresses| addresses.next().is_some());
+        let _ = dns_tx.send(resolved);
+    });
+    let dns_resolved = dns_rx
+        .recv_timeout(Duration::from_millis(500))
+        .unwrap_or(false);
+    let routes = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
+    let devices = std::fs::read_to_string("/proc/net/dev").unwrap_or_default();
+    let report = json!({
+        "tcp_loopback": connected,
+        "dns_resolved": dns_resolved,
+        "resolv_conf_present": std::path::Path::new("/etc/resolv.conf").exists(),
+        "routes": routes,
+        "devices": devices,
+    });
+    std::fs::write(path, report.to_string())
 }
 
 fn write_startup_stderr(args: &[String]) -> io::Result<()> {
@@ -383,9 +422,79 @@ fn handle_tool_call<R: BufRead, W: Write>(
                 return send_tool_result(output, &id, &text, true);
             }
 
+            if std::env::args().any(|arg| arg == "--real-filesystem")
+                && matches!(name, "read_file" | "write_file" | "apply_patch")
+            {
+                return handle_real_filesystem(output, &id, name, &arguments);
+            }
+
             send_tool_result(output, &id, &route_tool_text(name, &arguments), false)
         }
         _ => send_tool_result(output, &id, &format!("unknown mock tool `{name}`"), true),
+    }
+}
+
+fn handle_real_filesystem<W: Write>(
+    output: &mut W,
+    id: &Value,
+    name: &str,
+    arguments: &Value,
+) -> io::Result<()> {
+    let Some(raw_path) = arguments.get("path").and_then(Value::as_str) else {
+        return send_tool_result(output, id, "missing path", true);
+    };
+    let Ok(root) = std::env::current_dir() else {
+        return send_tool_result(output, id, "missing workspace", true);
+    };
+    let mut relative = std::path::PathBuf::new();
+    for component in std::path::Path::new(raw_path).components() {
+        match component {
+            std::path::Component::Normal(part) => relative.push(part),
+            std::path::Component::CurDir => {}
+            _ => return send_tool_result(output, id, "path rejected", true),
+        }
+    }
+    if relative.as_os_str().is_empty() {
+        return send_tool_result(output, id, "empty path", true);
+    }
+    let path = root.join(relative);
+
+    match name {
+        "read_file" => match std::fs::read_to_string(&path) {
+            Ok(content) => send_tool_result(output, id, &content, false),
+            Err(error) => send_tool_result(output, id, &format!("read failed: {error}"), true),
+        },
+        "write_file" => {
+            let content = arguments
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let result = path
+                .parent()
+                .map(std::fs::create_dir_all)
+                .transpose()
+                .and_then(|_| std::fs::write(&path, content));
+            match result {
+                Ok(()) => send_tool_result(
+                    output,
+                    id,
+                    &format!("wrote {raw_path} token=MCP_E2E_SECRET"),
+                    false,
+                ),
+                Err(error) => send_tool_result(output, id, &format!("write failed: {error}"), true),
+            }
+        }
+        "apply_patch" => {
+            let patch = arguments
+                .get("unified_diff")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match std::fs::write(&path, patch) {
+                Ok(()) => send_tool_result(output, id, &format!("patched {raw_path}"), false),
+                Err(error) => send_tool_result(output, id, &format!("patch failed: {error}"), true),
+            }
+        }
+        _ => send_tool_result(output, id, "unsupported real filesystem tool", true),
     }
 }
 
