@@ -1,8 +1,12 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::config::{
     McpProfile, McpRuntimeConfig, McpSandboxConfig, McpServerConfig, McpServerKind,
@@ -26,7 +30,21 @@ pub struct McpRuntime {
     dispatcher: Arc<ToolDispatcher>,
     profile: McpProfile,
     started_servers: Vec<McpServerKind>,
+    provenance: Vec<McpProvenance>,
     warnings: Vec<String>,
+}
+
+/// Local-only executable provenance for one started MCP server.
+///
+/// This is recorded in audit metadata and is never placed in prompts, model
+/// events, or tool output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpProvenance {
+    pub server: String,
+    pub executable: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    pub sha256: String,
 }
 
 impl McpRuntime {
@@ -45,6 +63,7 @@ impl McpRuntime {
             .map(|(kind, _)| kind)
             .collect::<Vec<_>>();
         let configured_allowed = allowed_capabilities(config.profile, &configured);
+        let mut provenance = prepare_provenance(config)?;
         let mut pool = McpPool::new();
         let mut started_servers = Vec::new();
 
@@ -91,6 +110,9 @@ impl McpRuntime {
                 return Err(AgentError::Mcp(message));
             }
 
+            if let Some(record) = provenance.get_mut(&kind) {
+                record.version = client.server_version().map(str::to_owned);
+            }
             pool.insert(kind.name(), client);
             started_servers.push(kind);
             tracing::info!(server = kind.name(), "MCP server ready");
@@ -108,6 +130,7 @@ impl McpRuntime {
             dispatcher,
             profile: config.profile,
             started_servers,
+            provenance: provenance.into_values().collect(),
             warnings,
         })
     }
@@ -128,6 +151,10 @@ impl McpRuntime {
         &self.warnings
     }
 
+    pub fn provenance(&self) -> &[McpProvenance] {
+        &self.provenance
+    }
+
     /// Terminate and reap every owned MCP server within `timeout` per server.
     pub async fn shutdown(self, timeout: Duration) -> Result<()> {
         let dispatcher = Arc::try_unwrap(self.dispatcher).map_err(|_| {
@@ -140,34 +167,109 @@ impl McpRuntime {
     }
 }
 
+fn prepare_provenance(config: &McpRuntimeConfig) -> Result<BTreeMap<McpServerKind, McpProvenance>> {
+    let mut records = BTreeMap::new();
+    for (kind, server) in config.enabled_servers() {
+        let executable = canonical_executable(&server.executable, "MCP server executable")?;
+        let sha256 = sha256_file(&executable)?;
+        if let Some(allowlist) = &config.digest_allowlist {
+            let expected = allowlist.get(&kind).ok_or_else(|| {
+                AgentError::Config(format!(
+                    "HARNESS_MCP_APPROVED_DIGESTS has no digest for enabled server `{}`",
+                    kind.name()
+                ))
+            })?;
+            if expected != &sha256 {
+                return Err(AgentError::Config(format!(
+                    "MCP server `{}` executable digest is not approved by HARNESS_MCP_APPROVED_DIGESTS",
+                    kind.name()
+                )));
+            }
+        }
+        records.insert(
+            kind,
+            McpProvenance {
+                server: kind.name().into(),
+                executable: path_utf8(&executable, "MCP server executable")?,
+                version: None,
+                sha256,
+            },
+        );
+    }
+    Ok(records)
+}
+
+fn canonical_executable(path: &Path, label: &str) -> Result<PathBuf> {
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        AgentError::Config(format!(
+            "{label} cannot be resolved to an absolute path ({}): {error}",
+            path.display()
+        ))
+    })?;
+    if !canonical.is_absolute() || !canonical.is_file() {
+        return Err(AgentError::Config(format!(
+            "{label} must resolve to an absolute regular file: {}",
+            canonical.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path).map_err(|error| {
+        AgentError::Config(format!(
+            "failed to open MCP executable for digest calculation ({}): {error}",
+            path.display()
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            AgentError::Config(format!(
+                "failed to read MCP executable for digest calculation ({}): {error}",
+                path.display()
+            ))
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 fn process_spec(
     config: &McpRuntimeConfig,
     kind: McpServerKind,
     server: &McpServerConfig,
 ) -> Result<ProcessSpec> {
     let env = child_environment(config, kind)?;
+    let server_executable = canonical_executable(&server.executable, "MCP server executable")?;
     let (program, args) = match &server.sandbox {
-        McpSandboxConfig::None => (server.executable.clone(), server.args.clone()),
+        McpSandboxConfig::None => (server_executable, server.args.clone()),
         McpSandboxConfig::ExternalWrapper {
             executable,
             args_prefix,
         } => {
-            let server_program = server.executable.to_str().ok_or_else(|| {
-                AgentError::Config(
-                    "MCP server executable must be valid UTF-8 for external-wrapper mode".into(),
-                )
-            })?;
+            let wrapper = canonical_executable(executable, "external-wrapper executable")?;
+            let server_program = path_utf8(&server_executable, "MCP server executable")?;
             let mut args = args_prefix.clone();
-            args.push(server_program.to_owned());
+            args.push(server_program);
             args.extend(server.args.iter().cloned());
-            (executable.clone(), args)
+            (wrapper, args)
         }
         McpSandboxConfig::Bubblewrap { executable } => {
+            let wrapper = canonical_executable(executable, "bubblewrap executable")?;
             let mut args = bubblewrap_args(config, server, &env)?;
             args.push("--".into());
-            args.push(path_utf8(&server.executable, "MCP server executable")?);
+            args.push(path_utf8(&server_executable, "MCP server executable")?);
             args.extend(server.args.iter().cloned());
-            (executable.clone(), args)
+            (wrapper, args)
         }
     };
 
@@ -285,7 +387,7 @@ fn bubblewrap_args(
 
 fn path_utf8(path: &Path, label: &str) -> Result<String> {
     path.to_str().map(str::to_owned).ok_or_else(|| {
-        AgentError::Config(format!("{label} must be valid UTF-8 for bubblewrap mode"))
+        AgentError::Config(format!("{label} must be valid UTF-8 for process startup"))
     })
 }
 

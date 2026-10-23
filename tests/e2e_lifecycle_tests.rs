@@ -22,7 +22,7 @@ use local_agent_harness::llm::{
 };
 use local_agent_harness::mcp::client::DEFAULT_MCP_PROTOCOL_VERSION;
 use local_agent_harness::mcp::process::DEFAULT_STDERR_CAPACITY_BYTES;
-use local_agent_harness::mcp::{AgentTool, McpRuntime, ToolOutcome};
+use local_agent_harness::mcp::{AgentTool, McpProvenance, McpRuntime, ToolOutcome};
 use local_agent_harness::orchestrator::{
     Clock, EventSink, JevAdvisor, LocalWikiStore, Orchestrator, OrchestratorLimits,
     OrchestratorOutcome, TaskContext, TaskRequest, ToolExecutor, VerificationEngine, WikiStore,
@@ -415,6 +415,11 @@ impl E2E {
         }
     }
 
+    fn with_mcp_provenance(mut self, provenance: Vec<McpProvenance>) -> Self {
+        self.orchestrator = self.orchestrator.with_mcp_provenance(provenance);
+        self
+    }
+
     async fn run(
         &self,
         budget: TaskBudget,
@@ -608,6 +613,58 @@ async fn verified_mutation_reaches_completed_with_real_wiki_output() {
         event,
         AgentEvent::WikiCompiled { .. }
     )));
+}
+
+#[tokio::test]
+async fn mcp_provenance_is_local_audit_metadata_not_model_context() {
+    let repo = TempRepo::new("provenance-audit");
+    let tools = RepoExecutor::new(repo.path());
+    let verifier = FakeVerifier::new(vec![verification_command(repo.path())], vec![pass_report()]);
+    let provenance = McpProvenance {
+        server: "filesystem".into(),
+        executable: "/opt/approved/filesystem-mcp".into(),
+        version: Some("9.9.9-provenance".into()),
+        sha256: "ab".repeat(32),
+    };
+    let fx = E2E::new(
+        vec![
+            plan_turn(),
+            tool_turn(
+                "write_file",
+                r#"{"path":"src/lib.rs","content":"pub fn value() -> u8 { 42 }"}"#,
+            ),
+            turn("DONE"),
+        ],
+        repo.path(),
+        tools,
+        verifier,
+        Arc::new(LocalWikiStore::default()),
+    )
+    .with_mcp_provenance(vec![provenance.clone()]);
+
+    let outcome = fx
+        .run(TaskBudget::default(), CancellationToken::new())
+        .await
+        .expect("run task");
+    let task_started = fx
+        .audit()
+        .into_iter()
+        .find(|record| record.kind == AuditKind::TaskStarted)
+        .expect("task-started audit record");
+    let metadata = serde_json::to_string(&task_started.metadata).expect("metadata JSON");
+    assert!(metadata.contains(&provenance.executable));
+    assert!(metadata.contains(&provenance.sha256));
+    assert!(metadata.contains(provenance.version.as_deref().unwrap()));
+
+    for surface in [
+        conversation_text(&outcome.context),
+        format!("{:?}", fx.events()),
+        serde_json::to_string(&outcome.context.session_trace).expect("trace"),
+    ] {
+        assert!(!surface.contains(&provenance.executable));
+        assert!(!surface.contains(&provenance.sha256));
+        assert!(!surface.contains(provenance.version.as_deref().unwrap()));
+    }
 }
 
 #[tokio::test]
@@ -948,7 +1005,12 @@ async fn contained_real_mcp_mutation_is_verified_audited_and_wiki_compiled() {
         .map(PathBuf::from)
         .find(|path| path.is_file());
     let Some(bwrap) = bwrap else {
-        eprintln!("skipping real-MCP boundary E2E: bwrap not installed");
+        if std::env::var_os("HARNESS_REQUIRE_BWRAP").is_some() {
+            panic!("HARNESS_REQUIRE_BWRAP is set but bubblewrap is not installed");
+        }
+        eprintln!(
+            "SKIPPED: real-MCP boundary E2E not executed because bwrap is unavailable; set HARNESS_REQUIRE_BWRAP=1 to fail instead"
+        );
         return;
     };
 
@@ -965,6 +1027,7 @@ async fn contained_real_mcp_mutation_is_verified_audited_and_wiki_compiled() {
         shell: Some(contained_server(repo.path(), "run", &[], &bwrap)),
         path: None,
         allow_unsandboxed: false,
+        digest_allowlist: None,
     };
     let runtime = McpRuntime::start(
         &config,
@@ -1006,7 +1069,8 @@ async fn contained_real_mcp_mutation_is_verified_audited_and_wiki_compiled() {
     .with_clock(Arc::new(FakeClock::default()))
     .with_event_sink(events.clone())
     .with_approval_policy(ApprovalPolicy::default())
-    .with_approval_gate(Arc::new(AllowApprovals));
+    .with_approval_gate(Arc::new(AllowApprovals))
+    .with_mcp_provenance(runtime.provenance().to_vec());
 
     let outcome = orchestrator
         .run(
@@ -1031,12 +1095,29 @@ async fn contained_real_mcp_mutation_is_verified_audited_and_wiki_compiled() {
     assert!(audit_text.contains("tool_finished"));
     assert!(audit_text.contains("task_finished"));
     for surface in [
-        audit_text,
+        audit_text.clone(),
         format!("{:?}", events.events()),
         serde_json::to_string(&outcome.context.session_trace).expect("trace"),
+        format!("{:?}", outcome.context.conversation),
     ] {
         assert!(!surface.contains(MCP_TOOL_SECRET));
         assert!(!surface.contains(HIDDEN_REASONING));
+    }
+
+    let provenance = runtime.provenance();
+    assert!(!provenance.is_empty(), "MCP provenance was not recorded");
+    for record in provenance {
+        assert!(audit_text.contains(&record.executable), "{record:?}");
+        assert!(audit_text.contains(&record.sha256), "{record:?}");
+        assert_eq!(record.version.as_deref(), Some("0.0.0"));
+        for surface in [
+            format!("{:?}", events.events()),
+            serde_json::to_string(&outcome.context.session_trace).expect("trace"),
+            format!("{:?}", outcome.context.conversation),
+        ] {
+            assert!(!surface.contains(&record.executable));
+            assert!(!surface.contains(&record.sha256));
+        }
     }
 
     drop(orchestrator);

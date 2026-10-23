@@ -6,17 +6,16 @@
 
 ## Implementation Status
 
-Milestones 1–12 and the endpoint-profile/sandbox extension are implemented.
-Final acceptance is pending review of the Git baseline, focused diffs, and
-containment/credential evidence. The `pre-endpoint-sandbox` baseline tag is a
-reconstructed editor-snapshot tree, not original historical Git state. The implementation includes the bounded MCP
-runtime, fixed capability manifest, policy and symlink checks, deterministic
-verification, redacted audit/Wiki persistence, streaming LLM client with
-request/response bounds, event-driven TUI, interactive approvals, cancellation,
-validated local/approved-remote endpoints, and fail-closed MCP sandboxing. The
-current implementation test baseline is 241 passing tests in the default build
-and 240 with `--features remote`, with one intentionally ignored test in both
-builds.
+Milestones 1–12 and the endpoint-profile/sandbox extension are accepted at
+`m12-endpoint-sandbox-review`. The `pre-endpoint-sandbox` baseline tag is a
+reconstructed editor-snapshot tree, not original historical Git state. The
+accepted baseline includes the bounded MCP runtime, fixed capability manifest,
+policy and symlink checks, deterministic verification, redacted audit/Wiki
+persistence, streaming LLM client with request/response bounds, event-driven
+TUI, interactive approvals, cancellation, validated local/approved-remote
+endpoints, and fail-closed MCP sandboxing. The current implementation test
+baseline is 247 passing tests in the default build and 246 with
+`--features remote`, with one intentionally ignored test in both builds.
 
 Work-API specialization is intentionally deferred. The approved-remote profile
 reuses the existing OpenAI-compatible backend and differs only in validated
@@ -24,16 +23,19 @@ endpoint/origin configuration, explicit model selection, and a
 credential-reference bearer token. A separate work-API adapter should be added
 only if the deployed contract demonstrably diverges.
 
-The execution boundary is now exercised end to end: fixed filesystem, read-only
-Git, and argv-only shell MCP servers; OS-level no-network containment with route,
-interface, and DNS evidence; adversarial path/symlink/secret/metacharacter and
-timeout/cancellation tests; and an authorized mutation through deterministic
-verification, redacted audit, and Wiki compilation. The next milestone is
-operational hardening and reproducibility: documented sandbox prerequisites, a
-production-safe configuration example, an MCP provenance/integrity policy, and
-repeatable adversarial containment checks in CI. Dynamic MCP discovery, Git
-mutation, package installation, shell command strings, and generic network
-access remain deferred.
+The accepted execution boundary is exercised end to end: fixed filesystem,
+read-only Git, and argv-only shell MCP servers; OS-level no-network containment
+with route, interface, and DNS evidence; adversarial path/symlink/secret/
+metacharacter and timeout/cancellation tests; and an authorized mutation through
+deterministic verification, redacted audit, and Wiki compilation.
+
+The operational-hardening milestone is in progress: MCP executable provenance,
+canonical absolute paths, optional deny-by-default SHA-256 allowlisting, local
+audit metadata, documented local-first production profiles, and a CI lane that
+requires positive Bubblewrap containment instead of allowing skips. Dynamic MCP
+discovery, arbitrary MCP dispatch, Git mutation, package installation, shell
+command strings, generic network access, and separate work-API adapter
+specialization remain deferred.
 
 ---
 

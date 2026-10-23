@@ -11,5 +11,5 @@ pub use capability::{
 };
 pub use client::{DEFAULT_MCP_PROTOCOL_VERSION, McpClient, McpClientOptions, McpToolInfo};
 pub use process::{McpProcess, ProcessSpec};
-pub use runtime::McpRuntime;
+pub use runtime::{McpProvenance, McpRuntime};
 pub use tools::{AgentTool, ToolContent, ToolOutcome, ToolOutcomeKind};

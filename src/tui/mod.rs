@@ -113,7 +113,12 @@ async fn prepare(config: &Config) -> Result<PreparedApp> {
     // Startup happens before terminal setup so failures remain printable on a
     // normal terminal and no task can run with partial tool capabilities.
     let approvals = InteractiveApprovalGate::new();
-    let orchestrator = build_orchestrator(config, runtime.dispatcher(), approvals.clone())?;
+    let orchestrator = build_orchestrator(
+        config,
+        runtime.dispatcher(),
+        runtime.provenance().to_vec(),
+        approvals.clone(),
+    )?;
 
     Ok(PreparedApp {
         app,
@@ -126,6 +131,7 @@ async fn prepare(config: &Config) -> Result<PreparedApp> {
 fn build_orchestrator(
     config: &Config,
     tools: Arc<ToolDispatcher>,
+    mcp_provenance: Vec<crate::mcp::McpProvenance>,
     approvals: InteractiveApprovalGate,
 ) -> Result<Orchestrator> {
     let mut llm = OpenAiCompatClient::new(config.llm_base.clone(), config.model.clone());
@@ -149,7 +155,8 @@ fn build_orchestrator(
     )
     .with_limits(limits)
     .with_approval_policy(config.approval.clone())
-    .with_approval_gate(Arc::new(approvals)))
+    .with_approval_gate(Arc::new(approvals))
+    .with_mcp_provenance(mcp_provenance))
 }
 
 async fn event_loop(

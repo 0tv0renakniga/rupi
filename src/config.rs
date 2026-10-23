@@ -1,9 +1,10 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use reqwest::Url;
+use serde_json::Value;
 
 use crate::approval::{ApprovalPolicy, DEFAULT_APPROVAL_TIMEOUT};
 use crate::error::{AgentError, Result};
@@ -271,7 +272,7 @@ impl McpProfile {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum McpServerKind {
     Filesystem,
     Git,
@@ -335,6 +336,11 @@ pub struct McpRuntimeConfig {
     ///
     /// Production profiles require a sandbox unless this is explicitly set.
     pub allow_unsandboxed: bool,
+    /// Optional deny-by-default executable digest allowlist.
+    ///
+    /// `None` disables pinning. `Some(map)` requires every enabled server to
+    /// match its listed SHA-256 digest; missing entries fail startup.
+    pub digest_allowlist: Option<BTreeMap<McpServerKind, String>>,
 }
 
 impl McpRuntimeConfig {
@@ -355,6 +361,7 @@ impl McpRuntimeConfig {
             shell: parse_mcp_server(McpServerKind::Shell, root)?,
             path,
             allow_unsandboxed: parse_env("HARNESS_MCP_ALLOW_UNSANDBOXED", false)?,
+            digest_allowlist: parse_digest_allowlist()?,
         })
     }
 
@@ -410,6 +417,14 @@ impl McpRuntimeConfig {
                 return Err(AgentError::Config(format!(
                     "MCP profile `{}` requires a sandbox for `{}`; set HARNESS_MCP_ALLOW_UNSANDBOXED=true only for explicit development/testing use",
                     self.profile.as_str(),
+                    kind.name()
+                )));
+            }
+            if let Some(allowlist) = &self.digest_allowlist
+                && !allowlist.contains_key(&kind)
+            {
+                return Err(AgentError::Config(format!(
+                    "HARNESS_MCP_APPROVED_DIGESTS is deny-by-default and has no digest for enabled server `{}`",
                     kind.name()
                 )));
             }
@@ -939,6 +954,56 @@ fn parse_origin_list(name: &str) -> Result<BTreeSet<String>> {
     Ok(origins)
 }
 
+fn parse_digest_allowlist() -> Result<Option<BTreeMap<McpServerKind, String>>> {
+    match std::env::var("HARNESS_MCP_APPROVED_DIGESTS") {
+        Ok(raw) => parse_digest_allowlist_value(&raw).map(Some),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(AgentError::Config(
+            "HARNESS_MCP_APPROVED_DIGESTS must be valid UTF-8 JSON".into(),
+        )),
+    }
+}
+
+fn parse_digest_allowlist_value(raw: &str) -> Result<BTreeMap<McpServerKind, String>> {
+    let value: Value = serde_json::from_str(raw).map_err(|error| {
+        AgentError::Config(format!(
+            "HARNESS_MCP_APPROVED_DIGESTS must be a JSON object: {error}"
+        ))
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        AgentError::Config("HARNESS_MCP_APPROVED_DIGESTS must be a JSON object".into())
+    })?;
+    let mut allowlist = BTreeMap::new();
+    for (name, digest) in object {
+        let kind = match name.as_str() {
+            "filesystem" => McpServerKind::Filesystem,
+            "git" => McpServerKind::Git,
+            "shell" => McpServerKind::Shell,
+            other => {
+                return Err(AgentError::Config(format!(
+                    "HARNESS_MCP_APPROVED_DIGESTS contains unknown server `{other}`"
+                )));
+            }
+        };
+        let digest = digest.as_str().ok_or_else(|| {
+            AgentError::Config(format!(
+                "HARNESS_MCP_APPROVED_DIGESTS entry for `{name}` must be a hex string"
+            ))
+        })?;
+        let digest = digest
+            .strip_prefix("sha256:")
+            .unwrap_or(digest)
+            .to_ascii_lowercase();
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(AgentError::Config(format!(
+                "HARNESS_MCP_APPROVED_DIGESTS entry for `{name}` must be a 64-character SHA-256 hex digest"
+            )));
+        }
+        allowlist.insert(kind, digest);
+    }
+    Ok(allowlist)
+}
+
 fn optional_env_name(name: &str) -> Result<Option<String>> {
     match std::env::var(name) {
         Ok(value) if value.trim().is_empty() => Ok(None),
@@ -1247,6 +1312,42 @@ mod tests {
     }
 
     #[test]
+    fn digest_allowlist_is_strict_and_deny_by_default() {
+        let digest = "a".repeat(64);
+        let parsed = parse_digest_allowlist_value(&format!(
+            r#"{{"filesystem":"{digest}","git":"sha256:{digest}"}}"#
+        ))
+        .expect("valid allowlist");
+        assert_eq!(parsed[&McpServerKind::Filesystem], digest);
+        assert_eq!(parsed[&McpServerKind::Git], digest);
+
+        assert!(
+            parse_digest_allowlist_value(r#"{"unknown":"a"}"#).is_err(),
+            "unknown server names must be rejected"
+        );
+        assert!(
+            parse_digest_allowlist_value(r#"{"filesystem":"short"}"#).is_err(),
+            "malformed digests must be rejected"
+        );
+        assert!(
+            parse_digest_allowlist_value(r#"{"filesystem":1}"#).is_err(),
+            "non-string digests must be rejected"
+        );
+        assert!(
+            parse_digest_allowlist_value("[]").is_err(),
+            "non-object allowlists must be rejected"
+        );
+    }
+
+    #[test]
+    fn digest_allowlist_requires_an_entry_for_each_enabled_server() {
+        let mut config = mcp_config(McpProfile::ReadOnly);
+        config.digest_allowlist = Some(BTreeMap::new());
+        let error = config.validate().expect_err("empty allowlist must deny");
+        assert!(error.to_string().contains("deny-by-default"), "{error}");
+    }
+
+    #[test]
     fn endpoint_debug_hides_the_credential_reference() {
         let endpoint = EndpointConfig {
             profile: EndpointProfile::ApprovedRemote,
@@ -1326,6 +1427,7 @@ mod tests {
             shell: Some(server(test_executable())),
             path: None,
             allow_unsandboxed: true,
+            digest_allowlist: None,
         }
     }
 

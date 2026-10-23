@@ -2,13 +2,22 @@
 
 Local, air-gapped agent harness for one repository task at a time.
 
+## Status
+
+The Milestone 12 endpoint-and-sandbox baseline is accepted at
+`m12-endpoint-sandbox-review`. Operational hardening is in progress:
+MCP binary provenance/pinning, production deployment profiles, and a required
+Bubblewrap CI lane. Dynamic MCP discovery, Git mutation, package installation,
+generic network access, and separate work-API adapter specialization remain
+deferred.
+
 ## Repository history
 
 This repository was initialized during acceptance hardening. The
 `pre-endpoint-sandbox` baseline tag is a reconstructed snapshot from the
 OpenCode editor snapshot tree `185fe01dccd6817796ce262a4ef85c85fd6b884e`, not
 original historical Git state. The `m12-endpoint-sandbox-review` tag marks the
-hardened review commit.
+accepted endpoint-and-sandbox baseline commit.
 
 ## Run
 
@@ -26,8 +35,8 @@ environment variable; Jev remains loopback-only.
 Useful environment variables include `HARNESS_ROOT`, `HARNESS_ENDPOINT_PROFILE`,
 `HARNESS_LLM_BASE`, `HARNESS_MODEL`, `HARNESS_LLM_ALLOWED_ORIGINS`,
 `HARNESS_LLM_CREDENTIAL_ENV`, `HARNESS_JEV_BASE`, `HARNESS_MCP_PROFILE`,
-`HARNESS_MCP_ALLOW_UNSANDBOXED`, and the `HARNESS_APPROVAL_*` policy variables
-documented below.
+`HARNESS_MCP_ALLOW_UNSANDBOXED`, `HARNESS_MCP_APPROVED_DIGESTS`, and the
+`HARNESS_APPROVAL_*` policy variables documented below.
 
 To validate static MCP configuration, start the enabled servers, verify their
 advertised tools, shut them down, and exit without opening the TUI or starting a
@@ -71,6 +80,26 @@ working directories, and sandbox wrappers never come from model output.
 platform default is used. Children never inherit the harness environment. They
 receive only an explicit `PATH` and a harness-controlled `HOME`.
 
+Configured MCP executables must be absolute paths; that configured path is the
+administrator-approved location. The harness canonicalizes each one before
+startup, so a symlink is recorded as its resolved target, and records the
+resolved path and SHA-256 digest in local audit metadata. It also records the
+server version reported by MCP `serverInfo` when available. These values are local audit evidence only; they are not added
+to prompts, model events, or tool output.
+
+`HARNESS_MCP_APPROVED_DIGESTS` optionally enables a deny-by-default executable
+allowlist. It is a JSON object mapping enabled slots to 64-character SHA-256
+digests, for example:
+
+```sh
+HARNESS_MCP_APPROVED_DIGESTS='{"filesystem":"<64-hex>","git":"<64-hex>","shell":"<64-hex>"}'
+```
+
+When the variable is present, every enabled server must have an entry and match
+it exactly; missing or mismatched entries fail startup before any server is
+spawned. Omit the variable to disable digest pinning, or set it to `{}` to deny
+all enabled servers.
+
 Sandboxing is fail-closed for enabled servers. Startup rejects `none` unless
 `HARNESS_MCP_ALLOW_UNSANDBOXED=true` is set explicitly; that setting is intended
 only for development and testing. A configured bubblewrap executable must be an
@@ -102,6 +131,57 @@ explicit development opt-in is present. Even with an external wrapper, network
 isolation depends on that wrapper and the surrounding OS policy. See
 `SECURITY.md`.
 
+## Production deployment profile
+
+The minimal local-first production profile keeps the model, Jev, and MCP
+boundary local and fail-closed:
+
+```sh
+# Local endpoints only.
+HARNESS_ENDPOINT_PROFILE=local
+HARNESS_LLM_BASE=http://127.0.0.1:8080
+HARNESS_JEV_BASE=http://127.0.0.1:9090
+
+# Fixed MCP slots with mandatory Bubblewrap containment.
+HARNESS_MCP_PROFILE=workspace_mutation
+HARNESS_MCP_FS_EXECUTABLE=/opt/harness/bin/filesystem-mcp
+HARNESS_MCP_FS_SANDBOX_MODE=bubblewrap
+HARNESS_MCP_FS_SANDBOX_EXECUTABLE=/usr/bin/bwrap
+HARNESS_MCP_GIT_EXECUTABLE=/opt/harness/bin/git-mcp
+HARNESS_MCP_GIT_SANDBOX_MODE=bubblewrap
+HARNESS_MCP_GIT_SANDBOX_EXECUTABLE=/usr/bin/bwrap
+HARNESS_MCP_SHELL_EXECUTABLE=/opt/harness/bin/shell-mcp
+HARNESS_MCP_SHELL_SANDBOX_MODE=bubblewrap
+HARNESS_MCP_SHELL_SANDBOX_EXECUTABLE=/usr/bin/bwrap
+
+# Pin the exact reviewed binaries.
+HARNESS_MCP_APPROVED_DIGESTS='{"filesystem":"<64-hex>","git":"<64-hex>","shell":"<64-hex>"}'
+```
+
+Do not set `HARNESS_MCP_ALLOW_UNSANDBOXED=true` in production. It is a visibly
+unsafe development/testing exception, defaults to false, and is rejected for
+enabled servers unless explicitly present. Use `read_only` instead of
+`workspace_mutation` when mutation is not required.
+
+Remote/work-profile activation is a separate administrative decision. Build
+with `--features remote`, set `HARNESS_ENDPOINT_PROFILE=approved_remote`, provide
+the exact HTTPS `HARNESS_LLM_ALLOWED_ORIGINS`, an explicit `HARNESS_MODEL`, and
+`HARNESS_LLM_CREDENTIAL_ENV`; Jev remains loopback-only. The default build,
+local profile, and local-first deployment do not activate remote access.
+
+## CI
+
+`.github/workflows/ci.yml` has two lanes:
+
+- The normal lane runs formatting, checks, Clippy, default/remote tests, and
+  prints a sandbox-availability report. If Bubblewrap is absent, positive
+  sandbox tests print an explicit `SKIPPED` message.
+- The `sandbox` lane installs Bubblewrap, verifies `bwrap --version`, and runs
+  the positive containment and real-MCP E2E tests with
+  `HARNESS_REQUIRE_BWRAP=1`, so a missing Bubblewrap installation fails the lane
+  instead of silently skipping. The unconditional missing-Bubblewrap
+  fail-closed test also runs.
+
 ## Offline and vendored builds
 
 Prepare dependencies on a controlled, connected machine, then move the
@@ -114,7 +194,8 @@ cargo test --offline
 ```
 
 Review and commit `Cargo.lock` and the intentional `.cargo/config.toml` source
-replacement. Keep model files and MCP binaries pinned and checksum-verified.
+replacement. Keep model files and MCP binaries pinned and checksum-verified;
+use `HARNESS_MCP_APPROVED_DIGESTS` to enforce MCP executable digests at startup.
 Offline Cargo only isolates dependency resolution; it does not restrict runtime
 network access by the harness, model/Jev endpoints, verification commands, or
 MCP child processes. See `SECURITY.md` for the runtime boundary and strict

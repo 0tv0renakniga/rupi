@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,6 +12,7 @@ use local_agent_harness::mcp::process::DEFAULT_STDERR_CAPACITY_BYTES;
 use local_agent_harness::mcp::{AgentTool, McpRuntime, ToolOutcomeKind};
 use local_agent_harness::policy::Policy;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 const MOCK_SERVER: &str = env!("CARGO_BIN_EXE_mock_mcp_server");
 const HARNESS_BIN: &str = env!("CARGO_BIN_EXE_local-agent-harness");
@@ -65,6 +67,7 @@ fn workspace_config(root: &Path, pids: &[(&str, &Path)]) -> McpRuntimeConfig {
         shell: Some(mock_server(root, "run", &["--pid-file", pid("shell")])),
         path: None,
         allow_unsandboxed: true,
+        digest_allowlist: None,
     }
 }
 
@@ -244,6 +247,7 @@ async fn read_only_profile_denies_mutation_and_disabled_capabilities() {
         shell: None,
         path: None,
         allow_unsandboxed: true,
+        digest_allowlist: None,
     };
     let runtime = runtime(&root, &config).await.expect("runtime starts");
     let dispatcher = runtime.dispatcher();
@@ -311,6 +315,7 @@ async fn child_environment_is_sanitized_and_not_inherited() {
         shell: None,
         path: None,
         allow_unsandboxed: true,
+        digest_allowlist: None,
     };
 
     let runtime = runtime(&root, &config).await.expect("runtime starts");
@@ -361,6 +366,7 @@ async fn startup_timeout_is_bounded_and_kills_the_child() {
         shell: None,
         path: None,
         allow_unsandboxed: true,
+        digest_allowlist: None,
     };
 
     let error = runtime(&root, &config)
@@ -394,6 +400,7 @@ async fn capability_mismatch_fails_closed_and_kills_every_started_child() {
         shell: None,
         path: None,
         allow_unsandboxed: true,
+        digest_allowlist: None,
     };
 
     let error = runtime(&root, &config)
@@ -429,6 +436,7 @@ async fn startup_diagnostics_are_bounded_and_redacted() {
         shell: None,
         path: None,
         allow_unsandboxed: true,
+        digest_allowlist: None,
     };
 
     let error = runtime(&root, &config)
@@ -464,11 +472,165 @@ fn headless_startup_checks_mcp_without_model_or_jev_services() {
     );
 }
 
-fn bwrap_available() -> Option<PathBuf> {
+fn sha256_file(path: &Path) -> String {
+    let bytes = std::fs::read(path).expect("read executable");
+    Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[tokio::test]
+async fn records_canonical_provenance_and_enforces_digest_allowlist() {
+    let root = test_root("provenance");
+    let config = workspace_config(
+        &root,
+        &[
+            ("filesystem", &root.join("fs.pid")),
+            ("git", &root.join("git.pid")),
+            ("shell", &root.join("shell.pid")),
+        ],
+    );
+    let started = runtime(&root, &config).await.expect("runtime starts");
+    let provenance = started.provenance();
+    assert_eq!(provenance.len(), 3);
+    let canonical = std::fs::canonicalize(MOCK_SERVER).expect("canonical mock server");
+    let digest = sha256_file(&canonical);
+    for record in provenance {
+        assert_eq!(PathBuf::from(&record.executable), canonical);
+        assert_eq!(record.version.as_deref(), Some("0.0.0"));
+        assert_eq!(record.sha256, digest);
+    }
+    drop(started.dispatcher());
+    started.shutdown(Duration::from_secs(2)).await.unwrap();
+
+    let approved_root = test_root("provenance-approved");
+    let approved = McpRuntimeConfig {
+        digest_allowlist: Some(BTreeMap::from([
+            (McpServerKind::Filesystem, digest.clone()),
+            (McpServerKind::Git, digest.clone()),
+            (McpServerKind::Shell, digest.clone()),
+        ])),
+        ..workspace_config(
+            &approved_root,
+            &[
+                ("filesystem", &approved_root.join("fs.pid")),
+                ("git", &approved_root.join("git.pid")),
+                ("shell", &approved_root.join("shell.pid")),
+            ],
+        )
+    };
+    let started = runtime(&approved_root, &approved)
+        .await
+        .expect("matching allowlist starts");
+    drop(started.dispatcher());
+    started.shutdown(Duration::from_secs(2)).await.unwrap();
+
+    let denied_root = test_root("provenance-denied");
+    let denied = McpRuntimeConfig {
+        digest_allowlist: Some(BTreeMap::from([
+            (McpServerKind::Filesystem, "0".repeat(64)),
+            (McpServerKind::Git, digest.clone()),
+            (McpServerKind::Shell, digest),
+        ])),
+        ..workspace_config(
+            &denied_root,
+            &[
+                ("filesystem", &denied_root.join("fs.pid")),
+                ("git", &denied_root.join("git.pid")),
+                ("shell", &denied_root.join("shell.pid")),
+            ],
+        )
+    };
+    let error = runtime(&denied_root, &denied)
+        .await
+        .err()
+        .expect("unapproved digest must fail startup");
+    assert!(error.to_string().contains("not approved"), "{error}");
+    assert!(!denied_root.join("fs.pid").exists(), "a server was started");
+
+    let missing_root = test_root("provenance-missing");
+    let missing = McpRuntimeConfig {
+        digest_allowlist: Some(BTreeMap::from([(
+            McpServerKind::Git,
+            sha256_file(&canonical),
+        )])),
+        ..workspace_config(
+            &missing_root,
+            &[
+                ("filesystem", &missing_root.join("fs.pid")),
+                ("git", &missing_root.join("git.pid")),
+                ("shell", &missing_root.join("shell.pid")),
+            ],
+        )
+    };
+    let error = runtime(&missing_root, &missing)
+        .await
+        .err()
+        .expect("missing allowlist entry must fail startup");
+    assert!(error.to_string().contains("deny-by-default"), "{error}");
+}
+
+fn find_bwrap() -> Option<PathBuf> {
     ["/usr/bin/bwrap", "/bin/bwrap"]
         .into_iter()
         .map(PathBuf::from)
         .find(|path| path.is_file())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_mcp_executable_resolves_to_canonical_provenance_path() {
+    let root = test_root("provenance-symlink");
+    let link = root.join("filesystem-mcp-link");
+    std::os::unix::fs::symlink(MOCK_SERVER, &link).expect("create symlink");
+    let mut config = workspace_config(
+        &root,
+        &[
+            ("filesystem", &root.join("fs.pid")),
+            ("git", &root.join("git.pid")),
+            ("shell", &root.join("shell.pid")),
+        ],
+    );
+    config.filesystem.as_mut().unwrap().executable = link;
+    let started = runtime(&root, &config).await.expect("runtime starts");
+    let record = started
+        .provenance()
+        .iter()
+        .find(|record| record.server == "filesystem")
+        .expect("filesystem provenance");
+    assert_eq!(
+        PathBuf::from(&record.executable),
+        std::fs::canonicalize(MOCK_SERVER).unwrap()
+    );
+    drop(started.dispatcher());
+    started.shutdown(Duration::from_secs(2)).await.unwrap();
+}
+
+fn bwrap_available() -> Option<PathBuf> {
+    let found = find_bwrap();
+    if found.is_none() {
+        if std::env::var_os("HARNESS_REQUIRE_BWRAP").is_some() {
+            panic!("HARNESS_REQUIRE_BWRAP is set but bubblewrap is not installed");
+        }
+        eprintln!(
+            "SKIPPED: positive Bubblewrap isolation test not executed because bwrap is unavailable; set HARNESS_REQUIRE_BWRAP=1 to fail instead"
+        );
+    }
+    found
+}
+
+#[test]
+fn sandbox_availability_report() {
+    match find_bwrap() {
+        Some(path) => println!(
+            "Bubblewrap available for positive sandbox tests: {}",
+            path.display()
+        ),
+        None => println!(
+            "SANDBOX TESTS SKIPPED: bwrap is unavailable; positive isolation was not proven"
+        ),
+    }
 }
 
 fn network_config(root: &Path, sandbox: McpSandboxConfig, addr: &str) -> McpRuntimeConfig {
@@ -489,6 +651,7 @@ fn network_config(root: &Path, sandbox: McpSandboxConfig, addr: &str) -> McpRunt
         shell: Some(mock_server(root, "run", &[])),
         path: None,
         allow_unsandboxed: true,
+        digest_allowlist: None,
     }
     .with_filesystem_sandbox(sandbox)
 }
@@ -559,7 +722,6 @@ async fn control_process_reaches_host_loopback_listener() {
 #[tokio::test]
 async fn bubblewrap_blocks_outbound_network_connections() {
     let Some(bwrap) = bwrap_available() else {
-        eprintln!("skipping bubblewrap test: bwrap not installed");
         return;
     };
     let root = test_root("network-bwrap");

@@ -209,7 +209,13 @@ and supply-chain boundary. Enabled servers require `external-wrapper` or
 `bubblewrap` by default; startup rejects `none` unless
 `HARNESS_MCP_ALLOW_UNSANDBOXED=true` is set explicitly for development or
 testing. In that unsandboxed mode the harness starts the configured server
-directly, without a shell, using an absolute executable path. With
+directly, without a shell, using an absolute executable path. That configured
+absolute path is the administrator-approved location; the harness canonicalizes
+it (recording a symlink's target), records the resolved absolute path,
+SHA-256 digest, and MCP `serverInfo.version` when available in local audit
+metadata, and optionally enforces a deny-by-default digest allowlist via
+`HARNESS_MCP_APPROVED_DIGESTS`. Provenance metadata is never sent to the model,
+model events, or tool output. With
 `external-wrapper`, the harness starts the configured absolute wrapper directly
 with fixed arguments, then the wrapper starts the server; the wrapper is part of
 the trusted deployment boundary and must be vetted accordingly. With
@@ -281,6 +287,14 @@ server starts. `none` means no OS network sandbox at all; process environment
 hygiene does not stop a child from opening sockets, so enabled `none` servers
 require the explicit `HARNESS_MCP_ALLOW_UNSANDBOXED=true` opt-in.
 
+`HARNESS_MCP_APPROVED_DIGESTS` is optional. When present it is a JSON object
+mapping each enabled slot to a 64-character SHA-256 digest. The policy is
+deny-by-default: an enabled server without an entry, or with a digest that does
+not match the canonical executable, fails startup before any server is spawned.
+An empty object denies every enabled server. The audit metadata records the
+resolved executable path, digest, and reported version for local review; it is
+not part of prompt context or model-facing events.
+
 The TUI and the `--headless` startup check use this same lifecycle. `--headless`
 validates configuration, starts and validates the enabled servers, prints the
 profile/server summary and warnings, shuts them down, and exits without opening
@@ -298,15 +312,18 @@ require the loopback connection and DNS resolution to fail, no default route,
 and only the `lo` interface; the control process outside proves the same
 listener is reachable. These tests use a test-only binary and temporary
 directories; they still do not certify a third-party MCP server or a real model.
+The CI `sandbox` lane installs Bubblewrap and sets `HARNESS_REQUIRE_BWRAP=1`, so
+the positive containment and real-MCP tests fail rather than skip when the
+sandbox is unavailable. The default lane prints an explicit sandbox-availability
+report, and the unconditional missing-Bubblewrap fail-closed test always runs.
 
-Recommended next implementation milestone:
+Current operational-hardening scope:
 
 ```text
-Validate the real execution boundary with fixed filesystem, read-only Git, and
-argv-only shell MCP servers; enforce no-network containment; add adversarial
-path/symlink/secret/metacharacter/timeout/network tests; and demonstrate an
-authorized mutation through deterministic verification, redacted audit, and Wiki
-compilation.
+Pin MCP executables by canonical absolute path and optional SHA-256 allowlist;
+record path/version/digest in local audit metadata; document a local-first
+production profile; and require positive Bubblewrap containment tests in CI
+while retaining unconditional fail-closed tests for hosts without Bubblewrap.
 ```
 
 ## Offline and vendored deployment
@@ -365,6 +382,13 @@ remove, or declare verification passed.
   networking disabled. For the built-in Linux option, set the slot's
   `_SANDBOX_MODE=bubblewrap` and point `_SANDBOX_EXECUTABLE` at a vetted
   bubblewrap binary.
+- Keep MCP binaries at fixed absolute paths, pin their SHA-256 digests with
+  `HARNESS_MCP_APPROVED_DIGESTS`, and review the recorded path/version/digest
+  audit metadata after upgrades.
+- Use the local-first production profile in `README.md`: local LLM/Jev
+  endpoints, sandboxed MCP slots, no remote profile, and no
+  `HARNESS_MCP_ALLOW_UNSANDBOXED`. Activate remote/work access only as a
+  separate administrative decision.
 - Mount the repository read-only where possible and give mutation-capable
   servers only their required paths.
 - Do not inject proxy variables into the harness or MCP children.

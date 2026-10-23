@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --check
+      - name: Check default
+        run: cargo check --all-targets
+      - name: Check remote
+        run: cargo check --all-targets --features remote
+      - name: Clippy default
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy remote
+        run: cargo clippy --all-targets --features remote -- -D warnings
+      - name: Test default
+        run: cargo test
+      - name: Test remote
+        run: cargo test --features remote
+      - name: Report sandbox availability
+        run: cargo test --test mcp_runtime_tests sandbox_availability_report -- --exact --nocapture
+
+  sandbox:
+    name: Required Bubblewrap containment
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          bwrap --version
+      - name: Positive containment test
+        env:
+          HARNESS_REQUIRE_BWRAP: "1"
+        run: cargo test --test mcp_runtime_tests bubblewrap_blocks_outbound_network_connections -- --exact --nocapture
+      - name: Positive real-MCP E2E
+        env:
+          HARNESS_REQUIRE_BWRAP: "1"
+        run: cargo test --test e2e_lifecycle_tests contained_real_mcp_mutation_is_verified_audited_and_wiki_compiled -- --exact --nocapture
+      - name: Unconditional fail-closed test
+        run: cargo test --test mcp_runtime_tests missing_bubblewrap_fails_closed_regardless_of_host_installation -- --exact --nocapture

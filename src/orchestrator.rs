@@ -20,7 +20,9 @@ use crate::events::AgentEvent;
 use crate::jev::{JevClient, Route, Verdict};
 use crate::llm::prompts::{PLAN_CONTRACT, UNTRUSTED_CONTENT_INVARIANT};
 use crate::llm::{AssistantTurn, ChatMessage, ChatRequest, LlmBackend, LlmStreamEvent, ToolCall};
-use crate::mcp::{AgentTool, CapabilityManifest, ToolDispatcher, ToolOutcome, ToolOutcomeKind};
+use crate::mcp::{
+    AgentTool, CapabilityManifest, McpProvenance, ToolDispatcher, ToolOutcome, ToolOutcomeKind,
+};
 use crate::state_machine::{BudgetUsage, LoopState, TaskBudget, transition_allowed};
 use crate::wiki::compile::{
     ActionSummary, CompileReport, SessionTrace, VerificationSummary, WikiCompiler,
@@ -347,6 +349,7 @@ pub struct Orchestrator {
     approval_policy: ApprovalPolicy,
     approvals: Arc<dyn ApprovalGate>,
     limits: OrchestratorLimits,
+    mcp_provenance: Vec<McpProvenance>,
     task_lock: tokio::sync::Mutex<()>,
 }
 
@@ -370,6 +373,7 @@ impl Orchestrator {
             approval_policy: ApprovalPolicy::default(),
             approvals: Arc::new(DenyApprovalGate),
             limits: OrchestratorLimits::default(),
+            mcp_provenance: Vec::new(),
             task_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -401,6 +405,14 @@ impl Orchestrator {
 
     pub fn with_limits(mut self, limits: OrchestratorLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Attach local-only MCP executable provenance for the next task audit.
+    ///
+    /// This metadata is never added to prompts, model events, or tool output.
+    pub fn with_mcp_provenance(mut self, provenance: Vec<McpProvenance>) -> Self {
+        self.mcp_provenance = provenance;
         self
     }
 
@@ -512,16 +524,15 @@ impl Orchestrator {
             final_summary: None,
         };
 
-        self.audit(
-            &ctx,
-            AuditKind::TaskStarted,
-            "task started",
-            json!({
-                "objective": trace_summary,
-                "root": self.summary(&request.repo_root.display().to_string(), 512),
-            }),
-        )
-        .await?;
+        let mut metadata = json!({
+            "objective": trace_summary,
+            "root": self.summary(&request.repo_root.display().to_string(), 512),
+        });
+        if !self.mcp_provenance.is_empty() {
+            metadata["mcp_servers"] = serde_json::to_value(&self.mcp_provenance)?;
+        }
+        self.audit(&ctx, AuditKind::TaskStarted, "task started", metadata)
+            .await?;
 
         Ok(ctx)
     }

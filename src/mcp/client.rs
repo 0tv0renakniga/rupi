@@ -72,6 +72,7 @@ pub struct McpClient {
     pub name: String,
     protocol_version: String,
     tools: Vec<McpToolInfo>,
+    server_version: Option<String>,
     stdin: Arc<Mutex<ChildStdin>>,
     pending: PendingMap,
     next_id: AtomicU64,
@@ -109,6 +110,7 @@ impl McpClient {
             name,
             protocol_version: options.protocol_version,
             tools: Vec::new(),
+            server_version: None,
             stdin,
             pending,
             next_id: AtomicU64::new(1),
@@ -141,6 +143,10 @@ impl McpClient {
 
     pub fn protocol_version(&self) -> &str {
         &self.protocol_version
+    }
+
+    pub fn server_version(&self) -> Option<&str> {
+        self.server_version.as_deref()
     }
 
     pub fn stderr_snapshot(&self) -> String {
@@ -247,7 +253,7 @@ impl McpClient {
         }
     }
 
-    async fn initialize(&self) -> Result<()> {
+    async fn initialize(&mut self) -> Result<()> {
         let params = json!({
             "protocolVersion": self.protocol_version,
             "capabilities": {},
@@ -287,12 +293,15 @@ impl McpClient {
                 "initialize result `capabilities` must be an object".into(),
             ));
         }
-        if let Some(server_info) = object.get("serverInfo")
-            && !server_info.is_object()
-        {
-            return Err(AgentError::Mcp(
-                "initialize result `serverInfo` must be an object".into(),
-            ));
+        if let Some(server_info) = object.get("serverInfo") {
+            let server_info = server_info.as_object().ok_or_else(|| {
+                AgentError::Mcp("initialize result `serverInfo` must be an object".into())
+            })?;
+            self.server_version = server_info
+                .get("version")
+                .and_then(Value::as_str)
+                .map(|value| validate_server_info("version", value))
+                .transpose()?;
         }
         Ok(())
     }
@@ -401,6 +410,19 @@ impl Drop for PendingGuard {
             });
         }
     }
+}
+
+fn validate_server_info(field: &str, value: &str) -> Result<String> {
+    const MAX_SERVER_INFO_BYTES: usize = 256;
+    if value.is_empty()
+        || value.len() > MAX_SERVER_INFO_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(AgentError::Mcp(format!(
+            "initialize result `serverInfo.{field}` must be 1-{MAX_SERVER_INFO_BYTES} bytes without control characters"
+        )));
+    }
+    Ok(value.to_owned())
 }
 
 async fn read_loop(
