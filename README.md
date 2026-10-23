@@ -2,6 +2,14 @@
 
 Local, air-gapped agent harness for one repository task at a time.
 
+## Repository history
+
+This repository was initialized during acceptance hardening. The
+`pre-endpoint-sandbox` baseline tag is a reconstructed snapshot from the
+OpenCode editor snapshot tree `185fe01dccd6817796ce262a4ef85c85fd6b884e`, not
+original historical Git state. The `m12-endpoint-sandbox-review` tag marks the
+hardened review commit.
+
 ## Run
 
 ```sh

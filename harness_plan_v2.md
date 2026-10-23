@@ -8,13 +8,14 @@
 
 Milestones 1–12 and the endpoint-profile/sandbox extension are implemented.
 Final acceptance is pending review of the Git baseline, focused diffs, and
-containment/credential evidence. The implementation includes the bounded MCP
+containment/credential evidence. The `pre-endpoint-sandbox` baseline tag is a
+reconstructed editor-snapshot tree, not original historical Git state. The implementation includes the bounded MCP
 runtime, fixed capability manifest, policy and symlink checks, deterministic
 verification, redacted audit/Wiki persistence, streaming LLM client with
 request/response bounds, event-driven TUI, interactive approvals, cancellation,
 validated local/approved-remote endpoints, and fail-closed MCP sandboxing. The
-current implementation test baseline is 240 passing tests in the default build
-and 239 with `--features remote`, with one intentionally ignored test in both
+current implementation test baseline is 241 passing tests in the default build
+and 240 with `--features remote`, with one intentionally ignored test in both
 builds.
 
 Work-API specialization is intentionally deferred. The approved-remote profile

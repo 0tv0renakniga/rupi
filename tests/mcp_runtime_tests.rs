@@ -507,6 +507,39 @@ impl SandboxFilesystem for McpRuntimeConfig {
 }
 
 #[tokio::test]
+async fn missing_bubblewrap_fails_closed_regardless_of_host_installation() {
+    let root = test_root("network-bwrap-missing");
+    let missing = PathBuf::from("/definitely/missing/bwrap");
+    let mut config = workspace_config(
+        &root,
+        &[
+            ("filesystem", &root.join("fs.pid")),
+            ("git", &root.join("git.pid")),
+            ("shell", &root.join("shell.pid")),
+        ],
+    );
+    config.allow_unsandboxed = false;
+    for server in [
+        config.filesystem.as_mut(),
+        config.git.as_mut(),
+        config.shell.as_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        server.sandbox = McpSandboxConfig::Bubblewrap {
+            executable: missing.clone(),
+        };
+    }
+    let error = runtime(&root, &config)
+        .await
+        .err()
+        .expect("missing bubblewrap must fail startup");
+    assert!(error.to_string().contains("_SANDBOX_EXECUTABLE"), "{error}");
+    assert!(!root.join("fs.pid").exists(), "a server was started");
+}
+
+#[tokio::test]
 async fn control_process_reaches_host_loopback_listener() {
     let root = test_root("network-control");
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
