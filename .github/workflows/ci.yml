@@ -51,6 +51,10 @@ jobs:
         env:
           HARNESS_REQUIRE_BWRAP: "1"
         run: cargo test --test e2e_lifecycle_tests contained_real_mcp_mutation_is_verified_audited_and_wiki_compiled -- --exact --nocapture
+      - name: Positive read-only filesystem MCP E2E
+        env:
+          HARNESS_REQUIRE_BWRAP: "1"
+        run: cargo test --test filesystem_mcp_tests read_only_filesystem_mcp_runs_under_bubblewrap -- --exact --nocapture
       - name: Unconditional fail-closed test
         run: cargo test --test mcp_runtime_tests missing_bubblewrap_fails_closed_regardless_of_host_installation -- --exact --nocapture
       - name: Production-safe demonstration

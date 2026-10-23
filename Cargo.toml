@@ -2,6 +2,7 @@
 name = "local-agent-harness"
 version = "0.1.0"
 edition = "2024"
+default-run = "local-agent-harness"
 
 [dependencies]
 async-trait = "0.1"

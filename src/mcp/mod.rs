@@ -1,5 +1,6 @@
 pub mod capability;
 pub mod client;
+pub mod fs_server;
 pub mod process;
 pub mod protocol;
 pub mod runtime;
