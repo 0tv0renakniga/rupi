@@ -17,6 +17,8 @@ pub const PROTOCOL_VERSION: &str = "2025-06-18";
 pub const SERVER_NAME: &str = "filesystem-mcp";
 /// Maximum bytes returned by one `read_file` call.
 pub const MAX_READ_BYTES: usize = 64 * 1024;
+/// Maximum bytes in one inbound JSON-RPC request line, excluding the newline.
+pub const MAX_REQUEST_LINE_BYTES: usize = 1024 * 1024;
 
 const JSONRPC_VERSION: &str = "2.0";
 const PARSE_ERROR: i64 = -32700;
@@ -204,25 +206,92 @@ pub fn serve<R: BufRead, W: Write>(
     mut input: R,
     output: &mut W,
 ) -> io::Result<()> {
-    let mut line = String::new();
     loop {
-        line.clear();
-        if input.read_line(&mut line)? == 0 {
-            return Ok(());
-        }
-        if line.trim().is_empty() {
+        let line = match read_bounded_line(&mut input, MAX_REQUEST_LINE_BYTES)? {
+            BoundedLine::Eof => return Ok(()),
+            BoundedLine::Line(line) => line,
+            BoundedLine::TooLarge => {
+                send_error(
+                    output,
+                    Value::Null,
+                    INVALID_REQUEST,
+                    format!("Request line exceeds the {MAX_REQUEST_LINE_BYTES}-byte maximum"),
+                )?;
+                continue;
+            }
+        };
+        if line.iter().all(|byte| byte.is_ascii_whitespace()) {
             continue;
         }
-        handle_line(server, line.trim(), output)?;
+        handle_line(server, &line, output)?;
+    }
+}
+
+enum BoundedLine {
+    Eof,
+    Line(Vec<u8>),
+    TooLarge,
+}
+
+fn read_bounded_line<R: BufRead>(input: &mut R, max: usize) -> io::Result<BoundedLine> {
+    let mut line = Vec::new();
+    loop {
+        let buffer = input.fill_buf()?;
+        if buffer.is_empty() {
+            return if line.is_empty() {
+                Ok(BoundedLine::Eof)
+            } else {
+                Ok(BoundedLine::Line(line))
+            };
+        }
+
+        if let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+            let content_len = line.len().saturating_add(newline);
+            let consume_len = newline + 1;
+            if content_len > max {
+                input.consume(consume_len);
+                return Ok(BoundedLine::TooLarge);
+            }
+            line.extend_from_slice(&buffer[..consume_len]);
+            input.consume(consume_len);
+            return Ok(BoundedLine::Line(line));
+        }
+
+        if line.len().saturating_add(buffer.len()) > max {
+            let consume_len = buffer.len();
+            input.consume(consume_len);
+            drain_to_newline(input)?;
+            return Ok(BoundedLine::TooLarge);
+        }
+
+        line.extend_from_slice(buffer);
+        let consume_len = buffer.len();
+        input.consume(consume_len);
+    }
+}
+
+fn drain_to_newline<R: BufRead>(input: &mut R) -> io::Result<()> {
+    loop {
+        let buffer = input.fill_buf()?;
+        if buffer.is_empty() {
+            return Ok(());
+        }
+        if let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+            let consume_len = newline + 1;
+            input.consume(consume_len);
+            return Ok(());
+        }
+        let consume_len = buffer.len();
+        input.consume(consume_len);
     }
 }
 
 fn handle_line<W: Write>(
     server: &ReadOnlyFilesystem,
-    line: &str,
+    line: &[u8],
     output: &mut W,
 ) -> io::Result<()> {
-    let message: Value = match serde_json::from_str(line) {
+    let message: Value = match serde_json::from_slice(line) {
         Ok(value) => value,
         Err(_) => {
             return send_error(output, Value::Null, PARSE_ERROR, "Parse error");
@@ -623,6 +692,65 @@ mod tests {
                 .unwrap()
                 .contains("unknown tool")
         );
+    }
+
+    #[test]
+    fn accepts_request_line_at_the_limit() {
+        let root = TempRoot::new("request-limit");
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {}
+        })
+        .to_string();
+        assert!(request.len() <= MAX_REQUEST_LINE_BYTES);
+        let mut input = request.into_bytes();
+        let padding = MAX_REQUEST_LINE_BYTES - input.len();
+        input.extend_from_slice(" ".repeat(padding).as_bytes());
+        input.push(b'\n');
+
+        let mut output = Vec::new();
+        serve(&server(&root), Cursor::new(input), &mut output).expect("serve at-limit request");
+        let response: Value =
+            serde_json::from_slice(output.strip_suffix(b"\n").expect("trailing newline"))
+                .expect("parse response");
+        assert_eq!(response["result"]["tools"][0]["name"], "read_file");
+    }
+
+    #[test]
+    fn rejects_oversized_request_line_and_recovers() {
+        let root = TempRoot::new("request-oversized");
+        let mut input = vec![b'x'; MAX_REQUEST_LINE_BYTES + 1];
+        input.push(b'\n');
+        input.extend_from_slice(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {}
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        input.push(b'\n');
+
+        let mut output = Vec::new();
+        serve(&server(&root), Cursor::new(input), &mut output).expect("serve oversized request");
+        let responses: Vec<Value> = String::from_utf8(output)
+            .expect("utf-8 protocol output")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("parse protocol response"))
+            .collect();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["error"]["code"], INVALID_REQUEST);
+        assert!(
+            responses[0]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("maximum")
+        );
+        assert_eq!(responses[1]["result"]["tools"][0]["name"], "read_file");
     }
 
     #[test]

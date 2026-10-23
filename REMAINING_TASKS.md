@@ -20,10 +20,12 @@ Baseline at the time this document was written:
 
 Progress after this baseline:
 
-- The read-only `filesystem_mcp` milestone is implemented in
-  `src/mcp/fs_server.rs`, `src/bin/filesystem_mcp.rs`, and
-  `tests/filesystem_mcp_tests.rs`.
-- Default suite: 263 passing / remote: 262 passing, 2 intentionally ignored.
+- The read-only `filesystem_mcp` milestone is implemented and pending
+  acceptance. It lives in `src/mcp/fs_server.rs`,
+  `src/bin/filesystem_mcp.rs`, and `tests/filesystem_mcp_tests.rs`.
+- Follow-up hardening adds committed parent-directory symlink-escape coverage
+  and a 1 MiB bound on inbound JSON-RPC request lines.
+- Default suite: 266 passing / remote: 265 passing, 2 intentionally ignored.
 - P0.1 still needs `write_file`/`apply_patch`, `git_mcp`, and `shell_mcp`.
 
 ## What exists

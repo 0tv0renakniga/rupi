@@ -212,6 +212,37 @@ fn binary_rejects_symlink_escape() {
     server.finish();
 }
 
+#[cfg(unix)]
+#[test]
+fn binary_rejects_parent_directory_symlink_escape() {
+    use std::os::unix::fs::symlink;
+
+    let repo = TempRepo::new("parent-symlink");
+    let outside = TempRepo::new("outside-parent");
+    outside.write("secret.txt", "outside\n");
+    symlink(outside.path(), repo.path().join("linked-parent"))
+        .expect("create parent-directory symlink");
+
+    let mut server = ServerProcess::start(repo.path());
+    let response = server.request(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "read_file",
+            "arguments": {"path": "linked-parent/secret.txt"}
+        }
+    }));
+    assert_eq!(response["result"]["isError"], true);
+    assert!(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("escapes the repository root")
+    );
+    server.finish();
+}
+
 fn find_bwrap() -> Option<PathBuf> {
     ["/usr/bin/bwrap", "/bin/bwrap"]
         .into_iter()
