@@ -654,6 +654,39 @@ Do not start these without a new product decision and a security review:
 
 ---
 
+## Task Modes / Skill Manifests
+
+Status: future design only. This is not a runtime subsystem in the current
+scope, and it must not introduce dynamic MCP discovery or model-selected tools.
+
+The harness remains one orchestrator with one state machine. A task mode is an
+operator-selected policy bundle that determines which stages, capabilities,
+prompt context, artifacts, approval rules, verification requirements, and
+stopping conditions apply to a task. It does not create a second orchestrator or
+bypass the existing capability manifest, policy checks, approval gate, or
+sandbox.
+
+A skill manifest is reviewed declarative metadata for a bounded capability. It
+should describe the skill's required tools, inputs, outputs, preconditions,
+verification expectations, artifact locations, and stop conditions. Manifests
+should be fixed, versioned, and digest-pinned like MCP executables. They must not
+be authored by the model at runtime, loaded from arbitrary paths, or allowed to
+expand the mode's authority.
+
+Design questions to settle before implementation:
+
+- How modes are selected and displayed in the TUI and configuration.
+- Whether mode changes are allowed between tasks only, never mid-task.
+- The manifest schema, compatibility rules, and validation tests.
+- How mode and manifest identity are recorded in audit evidence.
+- How modes compose with read-only, workspace-mutation, and future pilot
+  profiles without weakening the fixed capability boundary.
+
+This work should follow the real-server read-only and mutation pilots, not
+precede them.
+
+---
+
 ## Recommended execution order
 
 1. Implement and test the production MCP servers (P0.1).
