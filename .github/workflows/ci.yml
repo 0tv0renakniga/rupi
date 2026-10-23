@@ -36,6 +36,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
       - name: Install Bubblewrap
         run: |
           sudo apt-get update
@@ -51,3 +53,12 @@ jobs:
         run: cargo test --test e2e_lifecycle_tests contained_real_mcp_mutation_is_verified_audited_and_wiki_compiled -- --exact --nocapture
       - name: Unconditional fail-closed test
         run: cargo test --test mcp_runtime_tests missing_bubblewrap_fails_closed_regardless_of_host_installation -- --exact --nocapture
+      - name: Production-safe demonstration
+        run: ./demo/run.sh
+      - name: Upload demonstration evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-evidence
+          path: target/demo-evidence/
+          if-no-files-found: warn

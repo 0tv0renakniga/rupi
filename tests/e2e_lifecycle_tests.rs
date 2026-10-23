@@ -596,7 +596,6 @@ async fn verified_mutation_reaches_completed_with_real_wiki_output() {
     let audit = serde_json::to_string(&fx.audit()).expect("audit");
     let events = format!("{:?}", fx.events());
 
-    assert!(state.contains("[REDACTED]"));
     for surface in [&state, &session_record, &trace, &audit, &events] {
         assert!(!surface.contains(TOOL_SECRET));
         assert!(!surface.contains(HIDDEN_REASONING));

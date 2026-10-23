@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use reqwest::Url;
@@ -17,6 +17,7 @@ use crate::state_machine::TaskBudget;
 /// This milestone uses a deliberately small environment-variable source:
 ///
 /// - `HARNESS_ROOT` (default: current directory)
+/// - `HARNESS_AUDIT_PATH` (default: `<root>/.harness-audit/audit.jsonl`)
 /// - `HARNESS_ENDPOINT_PROFILE` (default: `local`)
 /// - `HARNESS_LLM_BASE` (default: `http://127.0.0.1:8080`)
 /// - `HARNESS_MODEL` (default: `local-model`; required for approved-remote)
@@ -126,6 +127,8 @@ impl Default for EndpointConfig {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub root: PathBuf,
+    /// Append-only local audit evidence path. Defaults outside `.ai-wiki/`.
+    pub audit_path: PathBuf,
     pub llm_base: String,
     pub model: String,
     pub jev_base: String,
@@ -141,6 +144,13 @@ impl Config {
         let root = std::env::var_os("HARNESS_ROOT")
             .map(PathBuf::from)
             .unwrap_or(std::env::current_dir()?);
+
+        let audit_path = resolve_audit_path(
+            &root,
+            std::env::var_os("HARNESS_AUDIT_PATH")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+        )?;
 
         let budget = TaskBudget {
             max_act_turns: parse_env("HARNESS_MAX_ACT_TURNS", 40usize)?,
@@ -174,6 +184,7 @@ impl Config {
 
         Ok(Self {
             root,
+            audit_path,
             llm_base: env_or("HARNESS_LLM_BASE", "http://127.0.0.1:8080"),
             model: env_or("HARNESS_MODEL", "local-model"),
             jev_base: env_or("HARNESS_JEV_BASE", "http://127.0.0.1:9090"),
@@ -220,6 +231,7 @@ impl Config {
         }
 
         validate_budget(&self.budget)?;
+        validate_audit_path(&self.root, &self.audit_path)?;
         validate_endpoint_profile(&self.endpoint, &self.llm_base, &self.model)?;
         validate_local_endpoint("jev_base", &self.jev_base)?;
         self.approval.validate()?;
@@ -915,6 +927,116 @@ fn validate_credential_reference(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Default audit directory under the repository root.
+pub const DEFAULT_AUDIT_DIR: &str = ".harness-audit";
+/// Default append-only audit file name.
+pub const DEFAULT_AUDIT_FILE: &str = "audit.jsonl";
+
+fn resolve_audit_path(root: &Path, configured: Option<PathBuf>) -> Result<PathBuf> {
+    let normalized_root = normalize_lexically(root);
+    let path = configured.unwrap_or_else(|| root.join(DEFAULT_AUDIT_DIR).join(DEFAULT_AUDIT_FILE));
+    let (path, was_relative) = if path.is_absolute() {
+        (path, false)
+    } else {
+        (root.join(path), true)
+    };
+    if was_relative && !normalize_lexically(&path).starts_with(&normalized_root) {
+        return Err(AgentError::Config(
+            "HARNESS_AUDIT_PATH must not escape the repository root".into(),
+        ));
+    }
+    validate_audit_path(root, &path)?;
+    Ok(path)
+}
+
+fn validate_audit_path(root: &Path, path: &Path) -> Result<()> {
+    let root = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(root)
+    };
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    if path.as_os_str().is_empty() || path.file_name().is_none() {
+        return Err(AgentError::Config(
+            "HARNESS_AUDIT_PATH must name a file".into(),
+        ));
+    }
+
+    let normalized = normalize_lexically(&path);
+    let normalized_root = normalize_lexically(&root);
+    let wiki = normalize_lexically(&root.join(crate::wiki::WIKI_DIR));
+    let audit_dir = normalized_root.join(DEFAULT_AUDIT_DIR);
+    if normalized == normalized_root {
+        return Err(AgentError::Config(
+            "HARNESS_AUDIT_PATH must name a file, not the repository root".into(),
+        ));
+    }
+    if normalized.starts_with(&wiki) {
+        return Err(AgentError::Config(
+            "HARNESS_AUDIT_PATH must be outside .ai-wiki".into(),
+        ));
+    }
+    if normalized.starts_with(&normalized_root)
+        && (!normalized.starts_with(&audit_dir) || normalized == audit_dir)
+    {
+        return Err(AgentError::Config(
+            "HARNESS_AUDIT_PATH inside the repository must be a file under .harness-audit".into(),
+        ));
+    }
+
+    if root.exists() {
+        let canonical_root = root.canonicalize()?;
+        let Some(ancestor) = deepest_existing_ancestor(&path) else {
+            return Err(AgentError::Config(
+                "HARNESS_AUDIT_PATH has no existing ancestor".into(),
+            ));
+        };
+        let canonical_ancestor = ancestor.canonicalize()?;
+        if normalized.starts_with(&normalized_root)
+            && !canonical_ancestor.starts_with(&canonical_root)
+        {
+            return Err(AgentError::Config(
+                "HARNESS_AUDIT_PATH must not escape the repository through symlinks".into(),
+            ));
+        }
+        if canonical_ancestor.starts_with(canonical_root.join(crate::wiki::WIKI_DIR)) {
+            return Err(AgentError::Config(
+                "HARNESS_AUDIT_PATH must be outside .ai-wiki".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn deepest_existing_ancestor(path: &Path) -> Option<&Path> {
+    let mut current = Some(path);
+    while let Some(candidate) = current {
+        if std::fs::symlink_metadata(candidate).is_ok() {
+            return Some(candidate);
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
 fn parse_origin_list(name: &str) -> Result<BTreeSet<String>> {
     let Ok(raw) = std::env::var(name) else {
         return Ok(BTreeSet::new());
@@ -1103,6 +1225,7 @@ mod tests {
     fn config_with(llm_base: &str, jev_base: &str) -> Config {
         Config {
             root: PathBuf::from("."),
+            audit_path: PathBuf::from(".harness-audit/audit.jsonl"),
             llm_base: llm_base.to_owned(),
             model: "local-model".into(),
             jev_base: jev_base.to_owned(),
@@ -1309,6 +1432,62 @@ mod tests {
         let mut config = config_with("http://127.0.0.1:8080", "http://127.0.0.1:9090");
         config.budget.max_tool_calls = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn audit_path_defaults_outside_wiki_and_rejects_unsafe_paths() {
+        let root = Path::new("/srv/repo");
+        assert_eq!(
+            resolve_audit_path(root, None).unwrap(),
+            root.join(DEFAULT_AUDIT_DIR).join(DEFAULT_AUDIT_FILE)
+        );
+        assert_eq!(
+            resolve_audit_path(root, Some(PathBuf::from(".harness-audit/audit.jsonl"))).unwrap(),
+            root.join(".harness-audit/audit.jsonl")
+        );
+        assert_eq!(
+            resolve_audit_path(root, Some(PathBuf::from("/var/lib/harness/audit.jsonl"))).unwrap(),
+            PathBuf::from("/var/lib/harness/audit.jsonl")
+        );
+        assert!(resolve_audit_path(root, Some(PathBuf::from("logs/audit.jsonl"))).is_err());
+        assert!(resolve_audit_path(root, Some(PathBuf::from("../audit.jsonl"))).is_err());
+        assert!(resolve_audit_path(root, Some(PathBuf::from(".ai-wiki/audit.jsonl"))).is_err());
+        assert!(
+            resolve_audit_path(root, Some(PathBuf::from("logs/../.ai-wiki/audit.jsonl"))).is_err()
+        );
+        assert!(resolve_audit_path(root, Some(PathBuf::from(".harness-audit"))).is_err());
+        assert!(resolve_audit_path(root, Some(PathBuf::new())).is_err());
+        assert!(resolve_audit_path(root, Some(PathBuf::from("."))).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_path_rejects_symlinks_into_wiki_or_outside_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("rupi-audit-links-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join(crate::wiki::WIKI_DIR)).expect("create wiki");
+        symlink(
+            root.join(crate::wiki::WIKI_DIR),
+            root.join(DEFAULT_AUDIT_DIR),
+        )
+        .expect("link audit dir to wiki");
+        assert!(resolve_audit_path(&root, None).is_err());
+
+        std::fs::remove_file(root.join(DEFAULT_AUDIT_DIR)).expect("remove link");
+        std::fs::create_dir_all(root.join(DEFAULT_AUDIT_DIR)).expect("create audit dir");
+        let outside =
+            std::env::temp_dir().join(format!("rupi-audit-outside-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&outside).expect("create outside");
+        symlink(
+            outside.join("audit.jsonl"),
+            root.join(DEFAULT_AUDIT_DIR).join("audit.jsonl"),
+        )
+        .expect("link audit file");
+        assert!(resolve_audit_path(&root, None).is_err());
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside);
     }
 
     #[test]

@@ -118,6 +118,7 @@ impl Policy {
                 ".azure",
                 ".password-store",
                 ".config",
+                ".harness-audit",
             ]
             .into_iter()
             .map(str::to_owned)
@@ -302,6 +303,15 @@ mod tests {
 
     fn policy() -> Policy {
         Policy::default_for_root("/tmp/local-agent-harness-policy-tests")
+    }
+
+    #[test]
+    fn denies_operator_audit_directory_to_the_model() {
+        let policy = policy();
+        assert!(matches!(
+            policy.authorize_path(".harness-audit/audit.jsonl"),
+            Err(PolicyViolation::SensitivePath(_))
+        ));
     }
 
     #[test]

@@ -14,8 +14,9 @@ policy and symlink checks, deterministic verification, redacted audit/Wiki
 persistence, streaming LLM client with request/response bounds, event-driven
 TUI, interactive approvals, cancellation, validated local/approved-remote
 endpoints, and fail-closed MCP sandboxing. The current implementation test
-baseline is 247 passing tests in the default build and 246 with
-`--features remote`, with one intentionally ignored test in both builds.
+baseline is 252 passing tests in the default build and 251 with
+`--features remote`, with two intentionally ignored tests in both builds: the
+live local-model smoke test and the production-safe demonstration.
 
 Work-API specialization is intentionally deferred. The approved-remote profile
 reuses the existing OpenAI-compatible backend and differs only in validated
@@ -29,13 +30,20 @@ with route, interface, and DNS evidence; adversarial path/symlink/secret/
 metacharacter and timeout/cancellation tests; and an authorized mutation through
 deterministic verification, redacted audit, and Wiki compilation.
 
-The operational-hardening milestone is in progress: MCP executable provenance,
-canonical absolute paths, optional deny-by-default SHA-256 allowlisting, local
-audit metadata, documented local-first production profiles, and a CI lane that
-requires positive Bubblewrap containment instead of allowing skips. Dynamic MCP
-discovery, arbitrary MCP dispatch, Git mutation, package installation, shell
-command strings, generic network access, and separate work-API adapter
-specialization remain deferred.
+The operational-hardening milestone is accepted at
+`operational-hardening-review`: MCP executable provenance, canonical absolute
+paths, optional deny-by-default SHA-256 allowlisting, local audit metadata,
+documented local-first production profiles, and a CI lane that requires positive
+Bubblewrap containment instead of allowing skips. The stability and
+demonstration milestone is accepted at `stability-demo-review`: a deterministic
+production-safe demo covering read-only inspection, approved mutation, and
+failed-verification recovery; bounded local audit evidence; an operator
+setup/recovery runbook; and reliability fixes found while exercising real MCP
+and verification paths.
+
+Dynamic MCP discovery, arbitrary MCP dispatch, Git mutation, package
+installation, shell command strings, generic network access, and separate
+work-API adapter specialization remain deferred.
 
 ---
 

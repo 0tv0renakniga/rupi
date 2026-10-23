@@ -5,11 +5,12 @@ Local, air-gapped agent harness for one repository task at a time.
 ## Status
 
 The Milestone 12 endpoint-and-sandbox baseline is accepted at
-`m12-endpoint-sandbox-review`. Operational hardening is in progress:
-MCP binary provenance/pinning, production deployment profiles, and a required
-Bubblewrap CI lane. Dynamic MCP discovery, Git mutation, package installation,
-generic network access, and separate work-API adapter specialization remain
-deferred.
+`m12-endpoint-sandbox-review`; operational hardening is accepted at
+`operational-hardening-review`; the stability and demonstration milestone is
+accepted at `stability-demo-review`: a repeatable production-safe demo, bounded
+operator audit evidence, and an operator setup/recovery runbook. Dynamic MCP
+discovery, Git mutation, package installation, generic network access, and
+separate work-API adapter specialization remain deferred.
 
 ## Repository history
 
@@ -32,11 +33,12 @@ explicit `approved_remote` profile requires the `remote` Cargo feature, an exact
 HTTPS origin allowlist, an explicit model name, and a credential-reference
 environment variable; Jev remains loopback-only.
 
-Useful environment variables include `HARNESS_ROOT`, `HARNESS_ENDPOINT_PROFILE`,
-`HARNESS_LLM_BASE`, `HARNESS_MODEL`, `HARNESS_LLM_ALLOWED_ORIGINS`,
-`HARNESS_LLM_CREDENTIAL_ENV`, `HARNESS_JEV_BASE`, `HARNESS_MCP_PROFILE`,
-`HARNESS_MCP_ALLOW_UNSANDBOXED`, `HARNESS_MCP_APPROVED_DIGESTS`, and the
-`HARNESS_APPROVAL_*` policy variables documented below.
+Useful environment variables include `HARNESS_ROOT`, `HARNESS_AUDIT_PATH`,
+`HARNESS_ENDPOINT_PROFILE`, `HARNESS_LLM_BASE`, `HARNESS_MODEL`,
+`HARNESS_LLM_ALLOWED_ORIGINS`, `HARNESS_LLM_CREDENTIAL_ENV`, `HARNESS_JEV_BASE`,
+`HARNESS_MCP_PROFILE`, `HARNESS_MCP_ALLOW_UNSANDBOXED`,
+`HARNESS_MCP_APPROVED_DIGESTS`, and the `HARNESS_APPROVAL_*` policy variables
+documented below.
 
 To validate static MCP configuration, start the enabled servers, verify their
 advertised tools, shut them down, and exit without opening the TUI or starting a
@@ -156,6 +158,9 @@ HARNESS_MCP_SHELL_SANDBOX_EXECUTABLE=/usr/bin/bwrap
 
 # Pin the exact reviewed binaries.
 HARNESS_MCP_APPROVED_DIGESTS='{"filesystem":"<64-hex>","git":"<64-hex>","shell":"<64-hex>"}'
+
+# Optional: default is <root>/.harness-audit/audit.jsonl.
+# HARNESS_AUDIT_PATH=/var/lib/harness/audit.jsonl
 ```
 
 Do not set `HARNESS_MCP_ALLOW_UNSANDBOXED=true` in production. It is a visibly
@@ -169,6 +174,49 @@ the exact HTTPS `HARNESS_LLM_ALLOWED_ORIGINS`, an explicit `HARNESS_MODEL`, and
 `HARNESS_LLM_CREDENTIAL_ENV`; Jev remains loopback-only. The default build,
 local profile, and local-first deployment do not activate remote access.
 
+## Operator audit evidence
+
+The TUI writes append-only JSON Lines audit evidence. The default path is
+`<root>/.harness-audit/audit.jsonl`; override it with `HARNESS_AUDIT_PATH`. The
+path must name a file, must not be the repository root, and must be outside
+`.ai-wiki/`. A path inside the repository must be a file under `.harness-audit/`;
+a relative path must not escape the repository root. An absolute path outside
+the repository is allowed. The `.harness-audit/` directory is denied to model
+file tools, so audit evidence remains local operator evidence. Symlinks that
+resolve into `.ai-wiki/` or outside the repository are rejected.
+
+Each record is bounded to 16 KiB. Tool audit records classify the outcome
+without recording raw tool payloads or file contents; prompts, hidden reasoning,
+credentials, and complete HTTP/MCP bodies are never recorded. Verification tails
+are bounded and redacted but remain sensitive local evidence. Audit failures
+fail the task rather than allowing false completion.
+
+```sh
+jq -c '{timestamp,task_id,kind,message}' .harness-audit/audit.jsonl | tail -40
+```
+
+Retention and rotation are operator-owned. See
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md) for setup, evidence inspection, and
+recovery.
+
+## Production-safe demonstration
+
+A repeatable demonstration runs three realistic fixture tasks through the
+production-safe MCP shape: a read-only inspection, an approved mutation with
+tests, and a failed-verification recovery. It uses the repository's mock MCP
+test binary in real-filesystem mode, fixed MCP slots, canonical paths, digest
+pinning, Bubblewrap, default mutation approvals, real Cargo verification, audit,
+and Wiki compilation.
+
+```sh
+./demo/run.sh
+```
+
+The model is scripted so the run is deterministic; this proves the harness
+boundary rather than live model quality. Evidence is written under
+`target/demo-evidence/run-*` and is intentionally small. See
+[`demo/README.md`](demo/README.md).
+
 ## CI
 
 `.github/workflows/ci.yml` has two lanes:
@@ -179,8 +227,9 @@ local profile, and local-first deployment do not activate remote access.
 - The `sandbox` lane installs Bubblewrap, verifies `bwrap --version`, and runs
   the positive containment and real-MCP E2E tests with
   `HARNESS_REQUIRE_BWRAP=1`, so a missing Bubblewrap installation fails the lane
-  instead of silently skipping. The unconditional missing-Bubblewrap
-  fail-closed test also runs.
+  instead of silently skipping. It also runs the production-safe demonstration
+  and uploads the bounded evidence bundle. The unconditional missing-Bubblewrap
+  fail-closed test always runs.
 
 ## Offline and vendored builds
 
@@ -276,3 +325,6 @@ failure, run:
 ```sh
 reset
 ```
+
+For task, audit, MCP-process, verification, Wiki, and credential-exposure
+recovery, see [`docs/OPERATIONS.md`](docs/OPERATIONS.md).

@@ -1140,18 +1140,19 @@ impl Orchestrator {
             .map(CapabilityManifest::capability_name)
             .map(str::to_owned)
             .unwrap_or_else(|| self.summary(&call.function.name, 64));
-        let summary = self.summary(&text, 256);
         let ok = !outcome.is_error;
+        let summary = format!("{tool_name} {}", if ok { "completed" } else { "failed" });
 
         if outcome.kind == ToolOutcomeKind::PolicyDenied {
-            push_unique(&mut ctx.session_trace.policy_denials, summary.clone());
+            let denial = self.summary(&text, 256);
+            push_unique(&mut ctx.session_trace.policy_denials, denial.clone());
             self.events.emit(AgentEvent::PolicyDenied {
-                summary: summary.clone(),
+                summary: denial.clone(),
             });
             self.audit(
                 ctx,
                 AuditKind::PolicyDenied,
-                summary.clone(),
+                denial,
                 json!({"tool": tool_name, "tool_call_id": self.summary(&call.id, 128)}),
             )
             .await?;

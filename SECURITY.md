@@ -146,13 +146,41 @@ task complete.
 - Context compaction preserves the system policy, task objective, plan, and
   verification evidence while dropping or bounding older messages. Tool output,
   plan text, review evidence, audit records, and event payloads are bounded and
-  redacted before persistence or emission. Hidden reasoning is never added to
-  the conversation, Wiki trace, audit, or events.
+  redacted before persistence or emission. Tool audit and event summaries
+  classify the outcome and do not embed raw tool payloads or file contents;
+  verification tails are bounded, redacted local evidence. Hidden reasoning is
+  never added to the conversation, Wiki trace, audit, or events.
 - Cancellation is checked around model, tool, verifier, Wiki, and Jev awaits.
   Cancellation cannot be converted into completion.
 - Audit failures surface as errors rather than allowing a false completion.
 - This boundary does not isolate processes or the network. Strict deployments
   must still enforce filesystem and network isolation externally.
+
+## Audit evidence
+
+The TUI attaches an append-only `AuditLog` before terminal setup. The default
+path is `<root>/.harness-audit/audit.jsonl`; `HARNESS_AUDIT_PATH` may select
+another file. The path must not be the repository root and must be outside
+`.ai-wiki/`. A path inside the repository must be a file under `.harness-audit/`;
+a relative path must not escape the repository root. The `.harness-audit/`
+directory is denied to model file tools, so provenance and lifecycle evidence
+are not exposed to the model through the filesystem capability. Symlinks that
+resolve into `.ai-wiki/` or outside the repository are rejected.
+
+- Each serialized record is bounded to 16 KiB. An oversized record fails the
+  audit write rather than being silently truncated.
+- Tool records contain the canonical tool name, outcome classification, and
+  bounded identifiers. They do not contain raw tool output, file contents,
+  patches, prompts, hidden reasoning, credentials, or complete HTTP/MCP bodies.
+- Verification records contain bounded, redacted tails. Treat them as sensitive
+  local evidence because verifier output can include repository details.
+- Audit failures surface as task errors and cannot allow false completion.
+- The audit file is local evidence, not prompt context. Retention, backup, and
+  rotation are operator responsibilities; do not edit evidence in place.
+
+The TUI and the `--headless` startup check use the same MCP lifecycle. The TUI
+also validates and creates the audit parent directory before terminal setup, so
+a bad audit path fails before a task can start.
 
 ## TUI boundary
 
@@ -305,8 +333,12 @@ adapters for orchestration. They prove the orchestration, policy, verification,
 and persistence wiring. One boundary E2E test runs fixed MCP servers inside
 harness-managed bubblewrap, performs a real workspace mutation through the mock
 test server, verifies the resulting file, and checks redacted audit and Wiki
-output. Runtime MCP tests also attempt an outbound loopback connection from inside and
-outside the network namespace and inspect the sandbox route table, network
+output. A separate deterministic demonstration runs read-only inspection,
+approved mutation, and failed-verification recovery against temporary Cargo
+fixtures, using the repository's mock MCP test binary with digest-pinned
+Bubblewrap MCP slots, real Cargo verification, and bounded audit evidence. Runtime MCP tests also attempt an outbound loopback
+connection from inside and outside the network namespace and inspect the sandbox
+route table, network
 interfaces, DNS resolution, and resolver configuration. Inside bubblewrap they
 require the loopback connection and DNS resolution to fail, no default route,
 and only the `lo` interface; the control process outside proves the same
@@ -317,13 +349,13 @@ the positive containment and real-MCP tests fail rather than skip when the
 sandbox is unavailable. The default lane prints an explicit sandbox-availability
 report, and the unconditional missing-Bubblewrap fail-closed test always runs.
 
-Current operational-hardening scope:
+Accepted stability and demonstration scope:
 
 ```text
-Pin MCP executables by canonical absolute path and optional SHA-256 allowlist;
-record path/version/digest in local audit metadata; document a local-first
-production profile; and require positive Bubblewrap containment tests in CI
-while retaining unconditional fail-closed tests for hosts without Bubblewrap.
+Run a small repeatable set of realistic repository tasks in the production-safe
+local profile; collect bounded, redacted audit evidence; document operator setup
+and recovery; and fix reliability issues found in real use. The demonstration
+uses a scripted model for determinism and does not certify live model quality.
 ```
 
 ## Offline and vendored deployment

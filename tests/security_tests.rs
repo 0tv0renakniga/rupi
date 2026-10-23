@@ -85,6 +85,7 @@ fn local_endpoint() -> EndpointConfig {
 fn config_with(llm_base: &str, jev_base: &str) -> Config {
     Config {
         root: PathBuf::from("."),
+        audit_path: PathBuf::from(".harness-audit/audit.jsonl"),
         llm_base: llm_base.to_owned(),
         model: "local-model".into(),
         jev_base: jev_base.to_owned(),

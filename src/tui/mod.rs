@@ -26,6 +26,7 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc::error::TrySendError;
 
 use crate::approval::InteractiveApprovalGate;
+use crate::audit::AuditLog;
 use crate::config::Config;
 use crate::error::{AgentError, Result};
 use crate::events::{AgentEvent, Command, EventLevel};
@@ -134,6 +135,9 @@ fn build_orchestrator(
     mcp_provenance: Vec<crate::mcp::McpProvenance>,
     approvals: InteractiveApprovalGate,
 ) -> Result<Orchestrator> {
+    let audit = Arc::new(AuditLog::new(config.audit_path.clone()));
+    audit.prepare()?;
+
     let mut llm = OpenAiCompatClient::new(config.llm_base.clone(), config.model.clone());
     if let Some(credential) = config.llm_credential()? {
         llm = llm.with_bearer_token(credential);
@@ -156,6 +160,7 @@ fn build_orchestrator(
     .with_limits(limits)
     .with_approval_policy(config.approval.clone())
     .with_approval_gate(Arc::new(approvals))
+    .with_audit(audit)
     .with_mcp_provenance(mcp_provenance))
 }
 
@@ -291,6 +296,7 @@ mod tests {
     fn config() -> Config {
         Config {
             root: PathBuf::from("."),
+            audit_path: PathBuf::from(".harness-audit/audit.jsonl"),
             llm_base: "http://127.0.0.1:8080".into(),
             model: "local-model".into(),
             jev_base: "http://127.0.0.1:9090".into(),
@@ -303,6 +309,19 @@ mod tests {
                 ..McpRuntimeConfig::default()
             },
         }
+    }
+
+    #[tokio::test]
+    async fn invalid_audit_path_is_returned_before_terminal_setup() {
+        let mut config = config();
+        config.mcp = McpRuntimeConfig::default();
+        config.audit_path = std::env::temp_dir();
+
+        let error = prepare(&config)
+            .await
+            .err()
+            .expect("directory audit path must fail startup");
+        assert!(error.to_string().contains("audit path"), "{error}");
     }
 
     #[tokio::test]
