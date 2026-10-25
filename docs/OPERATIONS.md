@@ -90,6 +90,28 @@ Use a disposable repository for the first live task. Start with a read-only
 inspection task. Confirm the audit file exists before enabling
 `workspace_mutation`.
 
+## Script runtime boundary
+
+The fixed helper-script runner is the only script execution path. It launches a
+reviewed script by canonical path and argv, with no shell and no model-selected
+executable or working directory. The default hard timeout is 60 seconds; the
+maximum accepted timeout is 3,600 seconds. Timeout and cancellation explicitly
+terminate and reap the child, so a timed-out or cancelled action cannot report
+success.
+
+Helper scripts do not inherit the harness environment. They receive only a
+controlled `PATH`, a harness-owned temporary `HOME` (mode `0700`, removed after
+the run), locale variables, and a temporary directory where applicable
+(`LANG`, `LC_ALL`, `TMPDIR` on Unix; `USERPROFILE`, `TEMP`, `TMP` on Windows).
+Proxy variables, cloud credentials, model credentials, and arbitrary ambient
+variables are absent by construction.
+
+When invoked through the audited execution path, a `script_finished` record
+contains the action ID, fixed script file name, canonical script identity,
+success flag, bounded result classification, duration, and exit code. It does not
+contain request parameters, stdout data, stderr diagnostics, or environment
+values.
+
 ## Audit evidence
 
 Audit records are append-only JSON Lines. The default location is:
@@ -99,12 +121,12 @@ $HARNESS_ROOT/.harness-audit/audit.jsonl
 ```
 
 Each record is bounded to 16 KiB. Records include task/phase transitions, plan
-summary, tool classification, approval decisions, verification outcomes, Wiki
-compilation, and local MCP provenance (canonical executable path, SHA-256, and
-reported version). Raw tool payloads, file contents, prompts, hidden reasoning,
-credentials, and complete HTTP/MCP bodies are not recorded in tool audit
-records. Verification output is bounded and redacted, but it is still local
-evidence and should be treated as sensitive.
+summary, tool classification, script action outcomes, approval decisions,
+verification outcomes, Wiki compilation, and local MCP provenance (canonical
+executable path, SHA-256, and reported version). Raw tool payloads, file
+contents, prompts, hidden reasoning, credentials, and complete HTTP/MCP bodies
+are not recorded in tool audit records. Verification output is bounded and
+redacted, but it is still local evidence and should be treated as sensitive.
 
 Inspect evidence with:
 

@@ -2,14 +2,18 @@
 //!
 //! The runner writes exactly one bounded JSON request to stdin and accepts
 //! exactly one bounded JSON response on stdout. Stdout is protocol data only;
-//! stderr is bounded and redacted diagnostic text. Timeout, cancellation,
-//! environment policy, and audit integration are added by TASK-012.
+//! stderr is bounded and redacted diagnostic text. Runtime timeout, cancellation,
+//! minimal environment, and audit metadata are enforced by the runner.
 
-use std::path::Path;
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
+use uuid::Uuid;
 
+use crate::audit::{AuditKind, AuditRecord};
 use crate::error::{AgentError, Result};
 use crate::wiki::redact::redact;
 
@@ -50,8 +54,11 @@ pub enum ProtocolErrorCode {
     InvalidProtocolResponse,
     ProtocolVersionMismatch,
     ScriptExitNonzero,
+    ScriptTimeout,
+    ScriptCancelled,
     StreamReadFailed,
     ChildWaitFailed,
+    ChildTerminationFailed,
 }
 
 impl ProtocolErrorCode {
@@ -67,8 +74,11 @@ impl ProtocolErrorCode {
             Self::InvalidProtocolResponse => "INVALID_PROTOCOL_RESPONSE",
             Self::ProtocolVersionMismatch => "PROTOCOL_VERSION_MISMATCH",
             Self::ScriptExitNonzero => "SCRIPT_EXIT_NONZERO",
+            Self::ScriptTimeout => "SCRIPT_TIMEOUT",
+            Self::ScriptCancelled => "SCRIPT_CANCELLED",
             Self::StreamReadFailed => "STREAM_READ_FAILED",
             Self::ChildWaitFailed => "CHILD_WAIT_FAILED",
+            Self::ChildTerminationFailed => "CHILD_TERMINATION_FAILED",
         }
     }
 
@@ -84,8 +94,11 @@ impl ProtocolErrorCode {
             Self::InvalidProtocolResponse => "helper script response did not match the protocol",
             Self::ProtocolVersionMismatch => "helper script protocol version is not supported",
             Self::ScriptExitNonzero => "helper script exited with a nonzero status",
+            Self::ScriptTimeout => "helper script exceeded the configured timeout",
+            Self::ScriptCancelled => "helper script execution was cancelled",
             Self::StreamReadFailed => "helper script output could not be read",
             Self::ChildWaitFailed => "helper script exit status could not be collected",
+            Self::ChildTerminationFailed => "helper script could not be terminated cleanly",
         }
     }
 }
@@ -200,7 +213,7 @@ pub struct ScriptError {
 }
 
 /// Structured, bounded outcome of one script action.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct ScriptOutcome {
     action: ActionId,
     protocol_version: u32,
@@ -209,6 +222,8 @@ pub struct ScriptOutcome {
     error: Option<ScriptOutcomeError>,
     diagnostic: Option<String>,
     exit_code: Option<i32>,
+    script: Option<PathBuf>,
+    duration: Duration,
 }
 
 impl ScriptOutcome {
@@ -240,8 +255,67 @@ impl ScriptOutcome {
         self.exit_code
     }
 
+    /// Canonical helper-script path when launch succeeded.
+    pub fn script(&self) -> Option<&Path> {
+        self.script.as_deref()
+    }
+
+    /// Elapsed wall time from execution start through cleanup.
+    pub fn duration(&self) -> Duration {
+        self.duration
+    }
+
+    /// Stable result classification: `OK` or the bounded error code.
+    pub fn result_code(&self) -> &str {
+        self.error
+            .as_ref()
+            .map_or("OK", |error| error.code.as_str())
+    }
+
+    /// Bounded audit metadata safe to persist outside model context.
+    ///
+    /// This intentionally excludes request parameters, stdout data, and stderr
+    /// diagnostics. It includes only fixed action/script identity, outcome
+    /// classification, duration, and exit status.
+    pub fn audit_metadata(&self) -> Value {
+        let script = self
+            .script
+            .as_deref()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.action.script_file_name().to_owned());
+        json!({
+            "action": self.action.as_str(),
+            "script": script,
+            "script_file": self.action.script_file_name(),
+            "ok": self.ok,
+            "result": self.result_code(),
+            "protocol_version": self.protocol_version,
+            "duration_ms": u64::try_from(self.duration.as_millis()).unwrap_or(u64::MAX),
+            "exit_code": self.exit_code,
+        })
+    }
+
+    /// Build one bounded audit record for this action.
+    pub fn audit_record(&self, task_id: Uuid) -> AuditRecord {
+        AuditRecord::new(
+            task_id,
+            AuditKind::ScriptFinished,
+            format!(
+                "script action {} {}",
+                self.action.as_str(),
+                self.result_code()
+            ),
+            self.audit_metadata(),
+        )
+    }
+
+    pub(crate) fn set_duration(&mut self, duration: Duration) {
+        self.duration = duration;
+    }
+
     pub(crate) fn success(
         action: ActionId,
+        script: Option<PathBuf>,
         data: Value,
         diagnostic: Option<String>,
         exit_code: Option<i32>,
@@ -254,11 +328,14 @@ impl ScriptOutcome {
             error: None,
             diagnostic,
             exit_code,
+            script,
+            duration: Duration::ZERO,
         }
     }
 
     pub(crate) fn helper_failure(
         action: ActionId,
+        script: Option<PathBuf>,
         error: ScriptError,
         diagnostic: Option<String>,
         exit_code: Option<i32>,
@@ -274,11 +351,14 @@ impl ScriptOutcome {
             }),
             diagnostic,
             exit_code,
+            script,
+            duration: Duration::ZERO,
         }
     }
 
     pub(crate) fn protocol_failure(
         action: ActionId,
+        script: Option<PathBuf>,
         code: ProtocolErrorCode,
         diagnostic: Option<String>,
         exit_code: Option<i32>,
@@ -294,7 +374,26 @@ impl ScriptOutcome {
             }),
             diagnostic,
             exit_code,
+            script,
+            duration: Duration::ZERO,
         }
+    }
+}
+
+impl fmt::Debug for ScriptOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ScriptOutcome")
+            .field("action", &self.action)
+            .field("protocol_version", &self.protocol_version)
+            .field("ok", &self.ok)
+            .field("error", &self.error)
+            .field("diagnostic", &self.diagnostic)
+            .field("exit_code", &self.exit_code)
+            .field("script", &self.script)
+            .field("duration", &self.duration)
+            .field("data_present", &self.data.is_some())
+            .finish()
     }
 }
 

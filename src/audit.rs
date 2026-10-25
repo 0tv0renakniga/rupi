@@ -23,6 +23,7 @@ pub enum AuditKind {
     ApprovalRequested,
     ApprovalResolved,
     ToolFinished,
+    ScriptFinished,
     VerificationStarted,
     VerificationFinished,
     ReviewVerdict,

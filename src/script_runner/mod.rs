@@ -1,10 +1,11 @@
 //! Fixed action-to-script dispatch for the harness-owned helper inventory.
 //!
 //! TASK-010 provides the action mapping and argv-only child launch foundation.
-//! TASK-011 adds the versioned one-request/one-response JSON protocol, bounded
-//! stream collection, and structured action outcomes. Script behavior, timeout
-//! and cancellation policy, environment policy, and audit integration arrive in
-//! later tasks.
+//! TASK-011 adds the versioned one-request/one-response JSON protocol and
+//! bounded stream collection. TASK-012 adds the minimal child environment,
+//! hard timeout, cancellation, explicit process cleanup, duration measurement,
+//! and bounded audit metadata. Script behavior, action dispatch, timeout/cancel
+//! UX, and real helper scripts arrive in later tasks.
 
 mod actions;
 pub mod protocol;
@@ -16,4 +17,7 @@ pub use protocol::{
     MAX_STDERR_BYTES, ProtocolErrorCode, SCRIPT_PROTOCOL_VERSION, ScriptError, ScriptOutcome,
     ScriptOutcomeError, ScriptRequest, ScriptResponse,
 };
-pub use runner::{RunningScript, ScriptInvocation, ScriptRunner};
+pub use runner::{
+    DEFAULT_SCRIPT_TIMEOUT, MAX_SCRIPT_TIMEOUT, RunningScript, SCRIPT_ENV_PATH, ScriptInvocation,
+    ScriptRunner,
+};
