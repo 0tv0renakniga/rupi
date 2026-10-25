@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use local_agent_harness::config::{Config, log_safe_endpoint};
-use local_agent_harness::error::Result;
+use local_agent_harness::error::{AgentError, Result};
 use local_agent_harness::mcp::McpRuntime;
 use local_agent_harness::policy::Policy;
 use local_agent_harness::tui;
@@ -32,7 +32,9 @@ async fn main() -> Result<()> {
 }
 
 async fn run_headless(config: Config) -> Result<()> {
-    let policy = Policy::default_for_root(config.root.clone());
+    let policy = Policy::new(config.root.clone()).map_err(|error| {
+        AgentError::Config(format!("repository path policy is invalid: {error}"))
+    })?;
     let runtime = McpRuntime::start(
         &config.mcp,
         &config.root,

@@ -90,6 +90,21 @@ Use a disposable repository for the first live task. Start with a read-only
 inspection task. Confirm the audit file exists before enabling
 `workspace_mutation`.
 
+## Path policy
+
+The configured project root is canonicalized once when the shared path policy is
+created. Model-supplied file paths must be repository-relative: absolute paths,
+empty paths, NUL bytes, lexical root traversal, paths outside the canonical root,
+and sensitive or harness-private targets are denied before approval or dispatch.
+
+The shared policy is implemented by `src/path_policy.rs` for the orchestrator
+and `scripts/path_policy.py` for fixed helper scripts. It is used for both
+existing-path and proposed new-file checks. It denies credential names and
+directories (for example `.env`, `.ssh`, `credentials.json`, and key material)
+plus the harness-private `.harness-audit/` and `.ai-wiki/` trees. Matching is by
+path component, file name, and extension, not by substring over the whole path.
+Policy errors use stable `PATH_*` codes and bound the echoed path to 256 bytes.
+
 ## Script runtime boundary
 
 The fixed helper-script runner is the only script execution path. It launches a

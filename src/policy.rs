@@ -1,9 +1,10 @@
 use std::collections::BTreeSet;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
 use crate::mcp::tools::AgentTool;
+use crate::path_policy::{PathPolicy, PathPolicyError};
 
 /// Upper bound for model-requested command timeouts.
 pub const MAX_COMMAND_TIMEOUT_SECS: u64 = 900;
@@ -34,17 +35,8 @@ const SHELL_METACHARACTERS: &[char] = &[
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PolicyViolation {
-    #[error("path must not be empty")]
-    EmptyPath,
-
-    #[error("absolute paths are not allowed: {0}")]
-    AbsolutePath(String),
-
-    #[error("path escapes the repository root: {0}")]
-    PathTraversal(String),
-
-    #[error("sensitive path is denied: {0}")]
-    SensitivePath(String),
+    #[error("{0}")]
+    Path(#[from] PathPolicyError),
 
     #[error("program must be a bare executable name: {0}")]
     InvalidProgram(String),
@@ -73,63 +65,30 @@ pub enum PolicyViolation {
 pub struct Policy {
     pub repo_root: PathBuf,
     pub allowed_programs: BTreeSet<String>,
-    pub sensitive_names: BTreeSet<String>,
-    pub sensitive_directories: BTreeSet<String>,
-    pub sensitive_extensions: BTreeSet<String>,
     pub allow_git_commit: bool,
     pub allow_network: bool,
+    path_policy: PathPolicy,
 }
 
 impl Policy {
-    pub fn default_for_root(repo_root: impl Into<PathBuf>) -> Self {
-        Self {
-            repo_root: repo_root.into(),
+    /// Build the policy for one repository task.
+    ///
+    /// The configured root is canonicalized once. A missing root, a non-directory
+    /// root, or an inaccessible root fails closed before any tool can run.
+    pub fn new(repo_root: impl Into<PathBuf>) -> Result<Self, PolicyViolation> {
+        let repo_root: PathBuf = repo_root.into();
+        let path_policy = PathPolicy::new(&repo_root)?;
+
+        Ok(Self {
+            repo_root: path_policy.root().to_path_buf(),
             allowed_programs: DEFAULT_ALLOWED_PROGRAMS
                 .iter()
                 .map(|program| (*program).to_owned())
                 .collect(),
-            sensitive_names: [
-                ".env",
-                ".envrc",
-                ".netrc",
-                ".npmrc",
-                ".pypirc",
-                ".git-credentials",
-                "credentials",
-                "credentials.json",
-                "secrets",
-                "secrets.json",
-                "id_rsa",
-                "id_dsa",
-                "id_ecdsa",
-                "id_ed25519",
-                "authorized_keys",
-                "known_hosts",
-            ]
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-            sensitive_directories: [
-                ".ssh",
-                ".aws",
-                ".gnupg",
-                ".docker",
-                ".kube",
-                ".azure",
-                ".password-store",
-                ".config",
-                ".harness-audit",
-            ]
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-            sensitive_extensions: ["pem", "key", "p12", "pfx", "jks", "kdbx"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
             allow_git_commit: false,
             allow_network: false,
-        }
+            path_policy,
+        })
     }
 
     pub fn authorize(&self, tool: &AgentTool) -> Result<(), PolicyViolation> {
@@ -151,42 +110,14 @@ impl Policy {
         }
     }
 
+    /// Shared path policy for pre-dispatch checks and script-layer callers.
+    pub fn path_policy(&self) -> &PathPolicy {
+        &self.path_policy
+    }
+
     /// Validate and lexically normalize a repository-relative path.
     pub fn authorize_path(&self, raw: &str) -> Result<PathBuf, PolicyViolation> {
-        if raw.trim().is_empty() {
-            return Err(PolicyViolation::EmptyPath);
-        }
-
-        let path = Path::new(raw);
-        if path.is_absolute() {
-            return Err(PolicyViolation::AbsolutePath(raw.to_owned()));
-        }
-
-        let mut normalized = PathBuf::new();
-        for component in path.components() {
-            match component {
-                Component::Normal(part) => normalized.push(part),
-                Component::CurDir => {}
-                Component::ParentDir => {
-                    if !normalized.pop() {
-                        return Err(PolicyViolation::PathTraversal(raw.to_owned()));
-                    }
-                }
-                Component::RootDir | Component::Prefix(_) => {
-                    return Err(PolicyViolation::AbsolutePath(raw.to_owned()));
-                }
-            }
-        }
-
-        if normalized.as_os_str().is_empty() {
-            return Err(PolicyViolation::EmptyPath);
-        }
-        if self.is_sensitive(&normalized) {
-            return Err(PolicyViolation::SensitivePath(raw.to_owned()));
-        }
-
-        self.reject_existing_symlink_escape(&normalized, raw)?;
-        Ok(normalized)
+        Ok(self.path_policy.authorize_path(raw)?)
     }
 
     pub fn authorize_command(
@@ -246,54 +177,7 @@ impl Policy {
     }
 
     pub fn is_sensitive(&self, path: &Path) -> bool {
-        for component in path.components() {
-            if let Component::Normal(part) = component {
-                let part = part.to_string_lossy().to_ascii_lowercase();
-                if self.sensitive_directories.contains(&part) {
-                    return true;
-                }
-            }
-        }
-
-        let Some(file_name) = path.file_name() else {
-            return false;
-        };
-        let file_name = file_name.to_string_lossy().to_ascii_lowercase();
-
-        if self.sensitive_names.contains(&file_name) || file_name.starts_with(".env.") {
-            return true;
-        }
-
-        path.extension()
-            .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
-            .map(|extension| self.sensitive_extensions.contains(&extension))
-            .unwrap_or(false)
-    }
-
-    fn reject_existing_symlink_escape(
-        &self,
-        relative: &Path,
-        raw: &str,
-    ) -> Result<(), PolicyViolation> {
-        let Ok(root) = self.repo_root.canonicalize() else {
-            // Policy remains useful for a not-yet-created repository root.
-            return Ok(());
-        };
-
-        let candidate = root.join(relative);
-        let mut existing = candidate.as_path();
-        while !existing.exists() {
-            let Some(parent) = existing.parent() else {
-                return Ok(());
-            };
-            existing = parent;
-        }
-
-        match existing.canonicalize() {
-            Ok(resolved) if resolved.starts_with(&root) => Ok(()),
-            Ok(_) => Err(PolicyViolation::PathTraversal(raw.to_owned())),
-            Err(_) => Ok(()),
-        }
+        self.path_policy.is_sensitive(path)
     }
 }
 
@@ -302,7 +186,7 @@ mod tests {
     use super::*;
 
     fn policy() -> Policy {
-        Policy::default_for_root("/tmp/local-agent-harness-policy-tests")
+        Policy::new(std::env::current_dir().expect("current directory")).expect("policy")
     }
 
     #[test]
@@ -310,7 +194,7 @@ mod tests {
         let policy = policy();
         assert!(matches!(
             policy.authorize_path(".harness-audit/audit.jsonl"),
-            Err(PolicyViolation::SensitivePath(_))
+            Err(PolicyViolation::Path(PathPolicyError::SensitivePath(_)))
         ));
     }
 
@@ -321,7 +205,7 @@ mod tests {
             assert!(
                 matches!(
                     policy.authorize_path(path),
-                    Err(PolicyViolation::AbsolutePath(_))
+                    Err(PolicyViolation::Path(PathPolicyError::AbsolutePath(_)))
                 ),
                 "{path} should be rejected"
             );
@@ -340,7 +224,7 @@ mod tests {
             assert!(
                 matches!(
                     policy.authorize_path(path),
-                    Err(PolicyViolation::PathTraversal(_))
+                    Err(PolicyViolation::Path(PathPolicyError::Traversal(_)))
                 ),
                 "{path} should be rejected"
             );
@@ -383,7 +267,7 @@ mod tests {
             assert!(
                 matches!(
                     policy.authorize_path(path),
-                    Err(PolicyViolation::SensitivePath(_))
+                    Err(PolicyViolation::Path(PathPolicyError::SensitivePath(_)))
                 ),
                 "{path} should be denied"
             );
@@ -406,14 +290,14 @@ mod tests {
         std::fs::write(root.join("inside.txt"), "inside").unwrap();
         symlink(root.join("inside.txt"), root.join("linked-inside")).unwrap();
 
-        let policy = Policy::default_for_root(&root);
+        let policy = Policy::new(&root).expect("policy");
         assert!(matches!(
             policy.authorize_path("linked-file"),
-            Err(PolicyViolation::PathTraversal(_))
+            Err(PolicyViolation::Path(PathPolicyError::Traversal(_)))
         ));
         assert!(matches!(
             policy.authorize_path("linked-dir/secret.txt"),
-            Err(PolicyViolation::PathTraversal(_))
+            Err(PolicyViolation::Path(PathPolicyError::Traversal(_)))
         ));
         assert!(policy.authorize_path("linked-inside").is_ok());
 

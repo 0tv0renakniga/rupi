@@ -1,2 +1,4 @@
 /target/
 /.harness-audit/
+__pycache__/
+*.pyc

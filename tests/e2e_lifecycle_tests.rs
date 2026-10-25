@@ -143,7 +143,7 @@ impl RepoExecutor {
     fn new(root: &Path) -> Self {
         Self {
             root: root.to_path_buf(),
-            policy: Policy::default_for_root(root),
+            policy: Policy::new(root).expect("test policy"),
             cancel_on_write: None,
             seen: Mutex::new(Vec::new()),
             process_calls: AtomicUsize::new(0),
@@ -1031,7 +1031,7 @@ async fn contained_real_mcp_mutation_is_verified_audited_and_wiki_compiled() {
     let runtime = McpRuntime::start(
         &config,
         repo.path(),
-        Policy::default_for_root(repo.path()),
+        Policy::new(repo.path()).expect("policy"),
         8_000,
     )
     .await

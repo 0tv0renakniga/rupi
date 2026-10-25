@@ -78,7 +78,7 @@ async fn runtime(
     McpRuntime::start(
         config,
         root,
-        Policy::default_for_root(root.to_path_buf()),
+        Policy::new(root.to_path_buf()).expect("policy"),
         4_000,
     )
     .await

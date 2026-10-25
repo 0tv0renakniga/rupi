@@ -224,7 +224,7 @@ async fn run_demo_task(bwrap: &Path, run_dir: &Path, spec: TaskSpec) -> Value {
     let runtime = McpRuntime::start(
         &config,
         &repo,
-        Policy::default_for_root(repo.clone()),
+        Policy::new(repo.clone()).expect("policy"),
         8_000,
     )
     .await

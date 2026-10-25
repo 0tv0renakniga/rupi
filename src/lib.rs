@@ -15,6 +15,7 @@ pub mod jev;
 pub mod llm;
 pub mod mcp;
 pub mod orchestrator;
+pub mod path_policy;
 pub mod policy;
 pub mod script_runner;
 pub mod state_machine;

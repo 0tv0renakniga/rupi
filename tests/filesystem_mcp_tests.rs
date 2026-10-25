@@ -319,7 +319,7 @@ async fn read_only_filesystem_mcp_runs_under_bubblewrap() {
     let runtime = McpRuntime::start(
         &config,
         repo.path(),
-        Policy::default_for_root(repo.path()),
+        Policy::new(repo.path()).expect("policy"),
         4_000,
     )
     .await

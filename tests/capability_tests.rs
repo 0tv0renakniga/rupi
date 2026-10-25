@@ -51,7 +51,7 @@ async fn connect_capability(name: &str, extra: &[(&str, &str)]) -> McpClient {
 }
 
 fn policy() -> Policy {
-    Policy::default_for_root(std::env::current_dir().expect("current directory"))
+    Policy::new(std::env::current_dir().expect("current directory")).expect("policy")
 }
 
 async fn full_dispatcher() -> ToolDispatcher {

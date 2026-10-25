@@ -100,7 +100,9 @@ async fn prepare(config: &Config) -> Result<PreparedApp> {
     app.endpoint_mode = config.endpoint.profile.as_str().to_owned();
     app.model = config.model.clone();
 
-    let policy = Policy::default_for_root(config.root.clone());
+    let policy = Policy::new(config.root.clone()).map_err(|error| {
+        AgentError::Config(format!("repository path policy is invalid: {error}"))
+    })?;
     let runtime = McpRuntime::start(
         &config.mcp,
         &config.root,
