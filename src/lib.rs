@@ -16,6 +16,7 @@ pub mod llm;
 pub mod mcp;
 pub mod orchestrator;
 pub mod policy;
+pub mod script_runner;
 pub mod state_machine;
 pub mod tui;
 pub mod wiki;

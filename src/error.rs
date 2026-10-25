@@ -33,6 +33,9 @@ pub enum AgentError {
     #[error("policy denied action: {0}")]
     PolicyDenied(String),
 
+    #[error("script runner error: {0}")]
+    Script(String),
+
     #[error("verification blocked: {0}")]
     Blocked(String),
 
