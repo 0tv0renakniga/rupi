@@ -210,7 +210,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState) {
     let text = if app.show_help {
         "Esc/? close help | Ctrl-C cancel | q quit"
     } else if app.input_mode == InputMode::TaskEntry {
-        "Enter submit | F2 mode | F1 help | Ctrl-C quit | Up/Down scroll | Tab pane"
+        "Enter submit | F2 cycle mode | F1 help | Ctrl-C quit | Up/Down scroll | Tab pane"
     } else if app.input_mode == InputMode::Approval {
         "y/Enter approve | n/Esc deny | Ctrl-C cancel | ? help"
     } else if app.input_mode.is_terminal() {
@@ -234,9 +234,9 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &AppState) {
     let text = vec![
         Line::from("Enter        submit task; approve in approval mode"),
         Line::from(if app.change_available {
-            "F2           toggle Change/Investigate mode before submission"
+            "F2           cycle Change/Investigate/Plan mode before submission"
         } else {
-            "F2           Investigate selected; Change is gated until write scripts exist"
+            "F2           cycle Investigate/Plan; Change is gated until write scripts exist"
         }),
         Line::from("Esc          deny approval; close help; interrupt is unsupported"),
         Line::from("Ctrl-C       cancel active task; quit when idle"),

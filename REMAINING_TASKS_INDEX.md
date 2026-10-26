@@ -26,7 +26,7 @@ listed dependencies are accepted.
 
 ## Next Allowed Task
 
-`TASK-010-script-runner-foundation.md`
+None — `TASK-050-write-schema-preflight.md` is awaiting review.
 
 ## Status Legend
 
@@ -51,9 +51,9 @@ listed dependencies are accepted.
 | TASK-031 | `git_status` helper script | Blocked | TASK-012, TASK-020 |
 | TASK-032 | `git_diff` helper script | Blocked | TASK-012, TASK-020 |
 | TASK-033 | Read-only action dispatch and bounded model context | Blocked | TASK-030–032 |
-| TASK-040 | Investigate mode and evidence brief | Blocked | TASK-033 |
-| TASK-041 | Plan mode and durable plan artifact | Blocked | TASK-040 |
-| TASK-050 | Write-file schema and policy preflight | Blocked | TASK-012, TASK-021 |
+| TASK-040 | Investigate mode and evidence brief | Accepted | TASK-033 |
+| TASK-041 | Plan mode and durable plan artifact | Accepted | TASK-040 |
+| TASK-050 | Write-file schema and policy preflight | Awaiting review | TASK-012, TASK-021 |
 | TASK-051 | New-file creation with approval and atomic write | Blocked | TASK-050 |
 | TASK-052 | Guarded overwrite with expected SHA-256 | Blocked | TASK-051 |
 | TASK-060 | Script-backed deterministic verifier | Blocked | TASK-012 |

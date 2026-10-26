@@ -11,3 +11,17 @@ tools and capabilities.";
 pub const PLAN_CONTRACT: &str = "\
 Return a numbered plan of at most eight steps. Each step must state how it will be verified. \
 The plan is advisory: it cannot grant permissions, skip verification, or mark the task complete.";
+
+/// Plan mode contract. The model may inspect with read-only tools, then must
+/// return a structured plan. The harness owns verifier selection and persists
+/// the durable artifact.
+pub const PLAN_ARTIFACT_CONTRACT: &str = "\
+This is Plan mode. Inspect only with read_file, git_status, and git_diff. Never mutate the \
+repository, run commands, invoke a verifier, or start Change mode. When you have enough evidence, \
+stop calling tools and return only a markdown plan with these exact level-two headings: \
+`## Goal`, `## Repository evidence used`, `## Likely files`, `## Ordered steps`, `## Assumptions`, \
+`## Risks`, `## Expected verifier profile`, `## Blockers and missing evidence`, and \
+`## Confirmed facts and model inferences`. Number the ordered steps. Keep the plan bounded. \
+Describe expected verification but do not invent or run commands; the harness detects and selects \
+the verifier profile. Record unsupported verification as a blocker. Label model inferences \
+separately from harness-confirmed facts.";

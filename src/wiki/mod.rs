@@ -6,6 +6,7 @@
 
 pub mod compile;
 pub mod evidence;
+pub mod plan;
 pub mod redact;
 
 use std::path::{Path, PathBuf};

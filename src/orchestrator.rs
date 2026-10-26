@@ -18,7 +18,7 @@ use crate::audit::{AuditKind, AuditRecord, AuditSink};
 use crate::error::Result;
 use crate::events::AgentEvent;
 use crate::jev::{JevClient, Route, Verdict};
-use crate::llm::prompts::{PLAN_CONTRACT, UNTRUSTED_CONTENT_INVARIANT};
+use crate::llm::prompts::{PLAN_ARTIFACT_CONTRACT, PLAN_CONTRACT, UNTRUSTED_CONTENT_INVARIANT};
 use crate::llm::{AssistantTurn, ChatMessage, ChatRequest, LlmBackend, LlmStreamEvent, ToolCall};
 use crate::mcp::{
     AgentTool, CapabilityManifest, McpProvenance, ToolDispatcher, ToolOutcome, ToolOutcomeKind,
@@ -31,6 +31,7 @@ use crate::wiki::compile::{
     WikiLimitsWithTrace,
 };
 use crate::wiki::evidence::EvidenceReport;
+use crate::wiki::plan::{self, PlanVerifier};
 use crate::wiki::redact::redact;
 use crate::wiki::{self, WikiContext};
 
@@ -288,6 +289,7 @@ pub struct TaskContext {
     pub review_rounds: u8,
     pub pending_plan: Option<PlanEvidence>,
     pub evidence_draft: Option<String>,
+    pub plan_review_error: Option<String>,
     pub pending_actions: VecDeque<ToolCall>,
     pub verification_commands: Vec<VerificationCommand>,
     pub verification_report: Option<VerifyReport>,
@@ -365,7 +367,7 @@ impl Default for OrchestratorLimits {
         Self {
             max_context_bytes: 32 * 1024,
             max_message_bytes: 4 * 1024,
-            max_plan_bytes: 4 * 1024,
+            max_plan_bytes: 12 * 1024,
             max_wiki_context_bytes: 8 * 1024,
             max_wiki_section_bytes: 4 * 1024,
             max_wiki_sections: 6,
@@ -587,6 +589,7 @@ impl Orchestrator {
                         self.run_investigate_review(&mut ctx, started, &cancel)
                             .await?
                     }
+                    TaskMode::Plan => self.run_plan_review(&mut ctx, started, &cancel).await?,
                 },
                 LoopState::Compile => self.run_compile(&mut ctx, started, &cancel).await?,
                 LoopState::Boot
@@ -609,10 +612,16 @@ impl Orchestrator {
             now.to_rfc3339(),
         );
         trace.mode = request.mode.as_str().to_owned();
-        trace.decisions.push(if request.mode.is_read_only() {
-            "read-only investigation started under harness-owned policy".into()
-        } else {
-            "orchestration started under harness-owned policy and verification".into()
+        trace.decisions.push(match request.mode {
+            TaskMode::Investigate => {
+                "read-only investigation started under harness-owned policy".into()
+            }
+            TaskMode::Plan => {
+                "read-only planning started without mutation or verification authority".into()
+            }
+            TaskMode::Change => {
+                "orchestration started under harness-owned policy and verification".into()
+            }
         });
 
         let tool_catalog = if request.mode.is_read_only() {
@@ -639,6 +648,7 @@ impl Orchestrator {
             review_rounds: 0,
             pending_plan: None,
             evidence_draft: None,
+            plan_review_error: None,
             pending_actions: VecDeque::new(),
             verification_commands: Vec::new(),
             verification_report: None,
@@ -782,14 +792,20 @@ impl Orchestrator {
             ChatMessage::system(self.system_prompt(ctx)),
             ChatMessage::user(self.base_context(ctx)),
         ];
-        if ctx.mode.is_read_only() {
-            ctx.conversation.push(ChatMessage::user(
+        match ctx.mode {
+            TaskMode::Investigate => ctx.conversation.push(ChatMessage::user(
                 "INVESTIGATE CONTRACT. Inspect the repository with read-only tools only. \
                  When you have sufficient evidence, reply without tool calls and report \
                  CONFIRMED FACTS, HYPOTHESES, MISSING EVIDENCE, and RECOMMENDED NEXT ACTION. \
                  Model claims are recorded as unverified hypotheses; harness-recorded \
                  action and Git observations are the confirmed facts.",
-            ));
+            )),
+            TaskMode::Plan => ctx.conversation.push(ChatMessage::user(format!(
+                "PLAN CONTRACT. Inspect the repository with read-only tools only. When you have \
+                 sufficient evidence, stop calling tools and return the structured plan.\n\n\
+                 {PLAN_ARTIFACT_CONTRACT}"
+            ))),
+            TaskMode::Change => {}
         }
 
         let summary = format!(
@@ -808,10 +824,9 @@ impl Orchestrator {
         )
         .await?;
 
-        if ctx.mode.is_read_only() {
-            self.transition(ctx, LoopState::Review).await
-        } else {
-            self.transition(ctx, LoopState::Plan).await
+        match ctx.mode {
+            TaskMode::Investigate => self.transition(ctx, LoopState::Review).await,
+            TaskMode::Change | TaskMode::Plan => self.transition(ctx, LoopState::Plan).await,
         }
     }
 
@@ -821,6 +836,10 @@ impl Orchestrator {
         started: Duration,
         cancel: &CancellationToken,
     ) -> Result<()> {
+        if ctx.mode == TaskMode::Plan {
+            return self.run_plan_mode(ctx, started, cancel).await;
+        }
+
         if let Err(limit) = ctx.budget.check_wall_time(self.elapsed(started)) {
             return self
                 .terminal(
@@ -911,6 +930,179 @@ impl Orchestrator {
         .await?;
 
         self.transition(ctx, LoopState::Act).await
+    }
+
+    async fn run_plan_mode(
+        &self,
+        ctx: &mut TaskContext,
+        started: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        if let Err(limit) = ctx.budget.check_wall_time(self.elapsed(started)) {
+            return self
+                .terminal(
+                    ctx,
+                    LoopState::Blocked,
+                    format!("wall-time budget exhausted during Plan: {limit}"),
+                )
+                .await;
+        }
+        if let Err(limit) = ctx
+            .budget
+            .try_begin_act_turn(&mut ctx.usage, self.elapsed(started))
+        {
+            return self
+                .terminal(
+                    ctx,
+                    LoopState::Blocked,
+                    format!("planning turn budget exhausted: {limit}"),
+                )
+                .await;
+        }
+        if let Err(limit) = ctx
+            .budget
+            .try_record_system2_call(&mut ctx.usage, self.elapsed(started))
+        {
+            return self
+                .terminal(
+                    ctx,
+                    LoopState::Blocked,
+                    format!("System 2 budget exhausted before Plan: {limit}"),
+                )
+                .await;
+        }
+
+        self.compact_context(ctx).await?;
+        let request = ChatRequest::new(ctx.conversation.clone())
+            .with_tools(ctx.tool_catalog.specs())
+            .with_temperature(0.2)
+            .with_max_tokens(2048);
+
+        let Some(turn) = self.model_turn(request, cancel).await else {
+            return self
+                .terminal(ctx, LoopState::Cancelled, "task cancelled")
+                .await;
+        };
+        let turn = match turn {
+            Ok(turn) => turn.finish_ids(),
+            Err(error) => {
+                let reason = format!(
+                    "planning model call failed; deterministic plan fallback required: {}",
+                    self.summary(&error.to_string(), 256)
+                );
+                ctx.plan_review_error = Some(reason.clone());
+                push_unique(&mut ctx.session_trace.decisions, reason);
+                return self.transition(ctx, LoopState::Review).await;
+            }
+        };
+
+        let calls = turn.calls;
+        if calls.len() > self.limits.max_actions_per_turn {
+            return self
+                .terminal(
+                    ctx,
+                    LoopState::Blocked,
+                    "model requested too many read-only actions in one plan turn",
+                )
+                .await;
+        }
+
+        let text = self.multiline(&turn.text, self.limits.max_plan_bytes);
+        if !text.trim().is_empty() || !calls.is_empty() {
+            if calls.is_empty() {
+                ctx.conversation.push(ChatMessage::assistant(text.clone()));
+            } else {
+                ctx.conversation
+                    .push(ChatMessage::assistant_with_tool_calls(
+                        text.clone(),
+                        calls.clone(),
+                    ));
+            }
+        }
+
+        if calls.is_empty() {
+            if text.trim().is_empty() {
+                let reason = "planning model produced no usable structured plan".to_owned();
+                ctx.plan_review_error = Some(reason.clone());
+                push_unique(&mut ctx.session_trace.decisions, reason);
+                return self.transition(ctx, LoopState::Review).await;
+            }
+
+            let summary = first_line(&text, 256);
+            let steps = count_plan_steps(&text);
+            ctx.pending_plan = Some(PlanEvidence {
+                text,
+                summary: summary.clone(),
+                steps,
+            });
+            push_unique(
+                &mut ctx.session_trace.decisions,
+                format!("plan draft produced for deterministic review: {summary}"),
+            );
+            self.events.emit(AgentEvent::PlanProduced {
+                summary: summary.clone(),
+                steps,
+            });
+            self.audit(
+                ctx,
+                AuditKind::PlanProduced,
+                "plan draft produced",
+                json!({"summary": summary, "steps": steps}),
+            )
+            .await?;
+            return self.transition(ctx, LoopState::Review).await;
+        }
+
+        for call in calls {
+            self.process_tool_call(ctx, call, started, cancel).await?;
+            if ctx.state.is_terminal() {
+                return Ok(());
+            }
+        }
+
+        self.transition(ctx, LoopState::Plan).await
+    }
+
+    async fn run_plan_review(
+        &self,
+        ctx: &mut TaskContext,
+        started: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        if let Err(limit) = ctx.budget.check_wall_time(self.elapsed(started)) {
+            return self
+                .terminal(
+                    ctx,
+                    LoopState::Blocked,
+                    format!("wall-time budget exhausted during Review: {limit}"),
+                )
+                .await;
+        }
+
+        if cancel.is_cancelled() {
+            return self
+                .terminal(ctx, LoopState::Cancelled, "task cancelled")
+                .await;
+        }
+
+        if ctx.plan_review_error.is_none() {
+            let draft = ctx.pending_plan.as_ref().map(|plan| plan.text.as_str());
+            if let Err(reason) = plan::review_draft(draft) {
+                ctx.plan_review_error = Some(reason.clone());
+                push_unique(
+                    &mut ctx.session_trace.decisions,
+                    format!("plan review rejected model draft: {reason}"),
+                );
+            } else {
+                push_unique(
+                    &mut ctx.session_trace.decisions,
+                    "plan review accepted every required section; harness compilation is next"
+                        .into(),
+                );
+            }
+        }
+
+        self.transition(ctx, LoopState::Compile).await
     }
 
     async fn run_act(
@@ -1131,6 +1323,18 @@ impl Orchestrator {
                     CapabilityManifest::capability_name(&tool)
                 ),
             );
+            return self
+                .record_tool_outcome(ctx, &call, Some(&tool), outcome)
+                .await;
+        }
+
+        if let Err(error) = crate::write_policy::preflight(&tool, ctx.mode) {
+            let message = format!("write preflight rejected request: {error}");
+            let outcome = if error.is_policy_denial() {
+                ToolOutcome::policy_denied(call.id.clone(), message)
+            } else {
+                ToolOutcome::teaching_error(call.id.clone(), message)
+            };
             return self
                 .record_tool_outcome(ctx, &call, Some(&tool), outcome)
                 .await;
@@ -1936,12 +2140,148 @@ impl Orchestrator {
         self.terminal(ctx, LoopState::Completed, summary).await
     }
 
+    async fn run_plan_compile(
+        &self,
+        ctx: &mut TaskContext,
+        started: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        if let Err(limit) = ctx.budget.check_wall_time(self.elapsed(started)) {
+            return self
+                .terminal(
+                    ctx,
+                    LoopState::Blocked,
+                    format!("wall-time budget exhausted during Compile: {limit}"),
+                )
+                .await;
+        }
+        if cancel.is_cancelled() {
+            return self
+                .terminal(ctx, LoopState::Cancelled, "task cancelled")
+                .await;
+        }
+
+        if ctx.session_trace.finished_at.is_none() {
+            ctx.session_trace.finished_at = Some(self.clock.now_utc().to_rfc3339());
+        }
+        push_unique(
+            &mut ctx.session_trace.decisions,
+            "completion requires a durable, bounded plan artifact compiled by the harness".into(),
+        );
+
+        let Some(detected) = cancellable(cancel, self.verifier.detect(&ctx.repo_root)).await else {
+            return self
+                .terminal(ctx, LoopState::Cancelled, "task cancelled")
+                .await;
+        };
+        let verifier = match detected {
+            Ok(commands) if commands.is_empty() => PlanVerifier::unsupported(
+                "no supported verifier profile was detected; the harness will not invent verification commands",
+            ),
+            Ok(commands) => PlanVerifier::supported(
+                commands
+                    .iter()
+                    .map(verify::render_command)
+                    .collect::<Vec<_>>(),
+            ),
+            Err(error) => PlanVerifier::unsupported(format!(
+                "verifier profile detection failed; the harness will not invent verification commands: {}",
+                self.summary(&error.to_string(), 256)
+            )),
+        };
+        if let Some(blocker) = &verifier.blocker {
+            push_unique(&mut ctx.session_trace.blockers, blocker.clone());
+        }
+
+        let today = self.clock.now_utc().format("%Y-%m-%d").to_string();
+        let trace = ctx.session_trace.clone();
+        let fallback_reason = ctx.plan_review_error.clone();
+        let draft = if fallback_reason.is_none() {
+            ctx.pending_plan.as_ref().map(|plan| plan.text.as_str())
+        } else {
+            None
+        };
+        let Some(compiled) = cancellable(
+            cancel,
+            plan::compile(
+                &ctx.repo_root,
+                ctx.task_id,
+                &trace,
+                draft,
+                &verifier,
+                fallback_reason.as_deref(),
+                &today,
+            ),
+        )
+        .await
+        else {
+            return self
+                .terminal(ctx, LoopState::Cancelled, "task cancelled")
+                .await;
+        };
+
+        let report = match compiled {
+            Ok(report) => report,
+            Err(error) => {
+                let reason = format!(
+                    "plan artifact compilation failed: {}",
+                    self.summary(&error.to_string(), 512)
+                );
+                push_unique(&mut ctx.session_trace.blockers, reason.clone());
+                return self.terminal(ctx, LoopState::Failed, reason).await;
+            }
+        };
+
+        let path = self.summary(&report.path.display().to_string(), 512);
+        self.events
+            .emit(AgentEvent::PlanCompiled { path: path.clone() });
+        self.audit(
+            ctx,
+            AuditKind::PlanCompiled,
+            "plan artifact compiled",
+            json!({
+                "path": path,
+                "bytes": report.bytes,
+                "fallback": report.fallback,
+                "verifier_blocker": report.verifier_blocker,
+            }),
+        )
+        .await?;
+
+        if let Some(blocker) = &report.verifier_blocker {
+            return self
+                .terminal(
+                    ctx,
+                    LoopState::Blocked,
+                    format!(
+                        "plan artifact written to {path}, but verification is unsupported: {blocker}"
+                    ),
+                )
+                .await;
+        }
+
+        let summary = format!(
+            "plan complete; artifact {} ({} bytes{})",
+            path,
+            report.bytes,
+            if report.fallback {
+                ", compiler fallback"
+            } else {
+                ""
+            }
+        );
+        self.terminal(ctx, LoopState::Completed, summary).await
+    }
+
     async fn run_compile(
         &self,
         ctx: &mut TaskContext,
         started: Duration,
         cancel: &CancellationToken,
     ) -> Result<()> {
+        if ctx.mode == TaskMode::Plan {
+            return self.run_plan_compile(ctx, started, cancel).await;
+        }
         if ctx.mode.is_read_only() {
             return self.run_investigate_compile(ctx, started, cancel).await;
         }
@@ -2146,20 +2486,26 @@ impl Orchestrator {
     }
 
     fn system_prompt(&self, ctx: &TaskContext) -> String {
-        let (mode_contract, plan_contract) = if ctx.mode.is_read_only() {
-            (
+        let (mode_contract, plan_contract) = match ctx.mode {
+            TaskMode::Investigate => (
                 "Mode: Investigate. This is a read-only task. Inspect repository evidence, then report \
                  confirmed facts, hypotheses, missing evidence, and a recommended next action. \
                  Mutation, Plan, Act, and Verify are unavailable. The harness compiles the durable \
                  evidence brief and owns completion.",
                 "Do not produce an implementation plan. Return investigation findings only.",
-            )
-        } else {
-            (
+            ),
+            TaskMode::Plan => (
+                "Mode: Plan. This is a read-only planning task. Gather bounded repository evidence, \
+                 then produce a structured implementation plan. Do not mutate the repository, run \
+                 commands, verify, complete the implementation, or start Change mode. The harness \
+                 reviews and compiles the durable plan artifact; the plan is advisory.",
+                PLAN_ARTIFACT_CONTRACT,
+            ),
+            TaskMode::Change => (
                 "Mode: Change. Propose bounded actions; the Rust harness owns policy, execution, \
                  budgets, verification, and completion.",
                 PLAN_CONTRACT,
-            )
+            ),
         };
         format!(
             "You are the System 2 reasoning component of a local, air-gapped coding harness. \
@@ -2199,12 +2545,20 @@ impl Orchestrator {
             ctx.budget.max_wall_time.as_secs(),
         );
 
-        let completion_contract = if ctx.mode.is_read_only() {
-            "This is a read-only Investigate task. The harness compiles a durable evidence \
-             brief before completion. No mutation or verification gate is available."
-        } else {
-            "Verification commands are selected and executed by the harness. Mutations must \
-             pass verification before review or completion."
+        let completion_contract = match ctx.mode {
+            TaskMode::Investigate => {
+                "This is a read-only Investigate task. The harness compiles a durable evidence \
+                 brief before completion. No mutation or verification gate is available."
+            }
+            TaskMode::Plan => {
+                "This is a read-only Plan task. The harness compiles a durable plan artifact and \
+                 detects the verifier profile without running it. Missing or unsupported \
+                 verification is a blocker; this task cannot mutate files or start Change mode."
+            }
+            TaskMode::Change => {
+                "Verification commands are selected and executed by the harness. Mutations must \
+                 pass verification before review or completion."
+            }
         };
         let text = format!(
             "TASK OBJECTIVE:\n{}\n\n\
@@ -2540,13 +2894,23 @@ fn tool_specs_for(names: &[&str]) -> Value {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Write a complete file with an optional expected content hash.",
+                "description": "Write one complete UTF-8 text file with an optional expected content hash.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string"},
-                        "content": {"type": "string"},
-                        "expected_sha256": {"type": "string"}
+                        "path": {
+                            "type": "string",
+                            "description": "Repository-relative path with at most 256 bytes."
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "UTF-8 text with at most 49152 bytes."
+                        },
+                        "expected_sha256": {
+                            "type": "string",
+                            "pattern": "^[a-f0-9]{64}$",
+                            "description": "Optional lowercase SHA-256 digest of the current file."
+                        }
                     },
                     "required": ["path", "content"],
                     "additionalProperties": false

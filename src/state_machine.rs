@@ -18,6 +18,8 @@ pub enum TaskMode {
     Change,
     /// Read-only repository investigation producing an evidence brief.
     Investigate,
+    /// Read-only planning producing a durable implementation plan.
+    Plan,
 }
 
 impl TaskMode {
@@ -25,11 +27,12 @@ impl TaskMode {
         match self {
             Self::Change => "change",
             Self::Investigate => "investigate",
+            Self::Plan => "plan",
         }
     }
 
     pub const fn is_read_only(self) -> bool {
-        matches!(self, Self::Investigate)
+        matches!(self, Self::Investigate | Self::Plan)
     }
 }
 
@@ -98,8 +101,9 @@ pub fn transition_allowed(from: LoopState, to: LoopState) -> bool {
 /// Mode-specific transition table.
 ///
 /// `Investigate` never enters Plan, Act, or Verify and therefore cannot reach
-/// a mutation or verification gate. Emergency exits remain available from
-/// every state.
+/// a mutation or verification gate. `Plan` uses Plan only for read-only
+/// evidence gathering and advisory plan creation; it never enters Act or
+/// Verify. Emergency exits remain available from every state.
 pub fn transition_allowed_for_mode(mode: TaskMode, from: LoopState, to: LoopState) -> bool {
     use LoopState::*;
 
@@ -110,6 +114,21 @@ pub fn transition_allowed_for_mode(mode: TaskMode, from: LoopState, to: LoopStat
             (Boot, Learn)
                 | (Learn, Review)
                 | (Learn, Blocked)
+                | (Review, Compile)
+                | (Review, Blocked)
+                | (Compile, Completed)
+                | (Compile, Blocked)
+                | (_, Cancelled)
+                | (_, Failed)
+        ),
+        TaskMode::Plan => matches!(
+            (from, to),
+            (Boot, Learn)
+                | (Learn, Plan)
+                | (Learn, Blocked)
+                | (Plan, Plan)
+                | (Plan, Review)
+                | (Plan, Blocked)
                 | (Review, Compile)
                 | (Review, Blocked)
                 | (Compile, Completed)
@@ -377,8 +396,62 @@ mod tests {
         ));
         assert_eq!(TaskMode::default(), TaskMode::Change);
         assert_eq!(TaskMode::Investigate.as_str(), "investigate");
+        assert_eq!(TaskMode::Plan.as_str(), "plan");
         assert!(TaskMode::Investigate.is_read_only());
+        assert!(TaskMode::Plan.is_read_only());
         assert!(!TaskMode::Change.is_read_only());
+    }
+
+    #[test]
+    fn plan_mode_never_reaches_act_or_verify() {
+        let path = [
+            LoopState::Boot,
+            LoopState::Learn,
+            LoopState::Plan,
+            LoopState::Review,
+            LoopState::Compile,
+            LoopState::Completed,
+        ];
+
+        for pair in path.windows(2) {
+            assert!(
+                transition_allowed_for_mode(TaskMode::Plan, pair[0], pair[1]),
+                "{:?} -> {:?} should be allowed in Plan",
+                pair[0],
+                pair[1]
+            );
+        }
+
+        for forbidden in [LoopState::Act, LoopState::Verify] {
+            for from in [
+                LoopState::Boot,
+                LoopState::Learn,
+                LoopState::Plan,
+                LoopState::Review,
+                LoopState::Compile,
+            ] {
+                assert!(
+                    !transition_allowed_for_mode(TaskMode::Plan, from, forbidden),
+                    "{from:?} -> {forbidden:?} should be rejected in Plan"
+                );
+            }
+        }
+
+        assert!(transition_allowed_for_mode(
+            TaskMode::Plan,
+            LoopState::Plan,
+            LoopState::Blocked
+        ));
+        assert!(transition_allowed_for_mode(
+            TaskMode::Plan,
+            LoopState::Review,
+            LoopState::Blocked
+        ));
+        assert!(transition_allowed_for_mode(
+            TaskMode::Plan,
+            LoopState::Compile,
+            LoopState::Blocked
+        ));
     }
 
     #[test]

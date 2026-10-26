@@ -23,3 +23,4 @@ pub mod script_tools;
 pub mod state_machine;
 pub mod tui;
 pub mod wiki;
+pub mod write_policy;

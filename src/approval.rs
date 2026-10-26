@@ -368,6 +368,20 @@ mod tests {
 
     #[test]
     fn request_metadata_excludes_payload_content_and_redacts_arguments() {
+        let write = AgentTool::WriteFile {
+            path: "src/main.rs".into(),
+            content: "RAW_WRITE_CONTENT_SECRET".into(),
+            expected_sha256: Some("ab".repeat(32)),
+        };
+        let request =
+            ApprovalRequest::for_tool(&write, "workspace mutation requires approval").unwrap();
+        assert_eq!(request.action, ApprovalAction::WriteFile);
+        assert_eq!(request.target.as_deref(), Some("src/main.rs"));
+        assert!(!request.summary().contains("RAW_WRITE_CONTENT_SECRET"));
+        assert!(!request.summary().contains(&"ab".repeat(32)));
+        assert!(!format!("{request:?}").contains("RAW_WRITE_CONTENT_SECRET"));
+        assert!(!format!("{request:?}").contains(&"ab".repeat(32)));
+
         let write = AgentTool::ApplyPatch {
             path: "src/main.rs".into(),
             unified_diff: "RAW_PATCH_SECRET".into(),

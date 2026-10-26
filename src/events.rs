@@ -90,6 +90,9 @@ pub enum AgentEvent {
     EvidenceCompiled {
         path: String,
     },
+    PlanCompiled {
+        path: String,
+    },
     Blocked {
         reason: String,
     },

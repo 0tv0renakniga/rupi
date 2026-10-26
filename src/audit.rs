@@ -31,6 +31,7 @@ pub enum AuditKind {
     PolicyDenied,
     WikiCompiled,
     EvidenceCompiled,
+    PlanCompiled,
     TaskFinished,
 }
 

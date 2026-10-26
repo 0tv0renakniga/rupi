@@ -538,6 +538,14 @@ impl AppState {
                     format!("evidence brief compiled: {path}"),
                 );
             }
+            AgentEvent::PlanCompiled { path } => {
+                let path = bounded_display_text(&path, MAX_DISPLAY_TEXT_BYTES);
+                self.detail = format!("Plan artifact compiled: {path}");
+                self.push_entry(
+                    TranscriptKind::Plan,
+                    format!("plan artifact compiled: {path}"),
+                );
+            }
             AgentEvent::Blocked { reason } => {
                 self.finish_task(
                     TaskStatus::Blocked,

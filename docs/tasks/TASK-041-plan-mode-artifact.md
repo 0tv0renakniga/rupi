@@ -1,6 +1,7 @@
 # TASK-041 — Plan Mode and Durable Plan Artifact
 
-**Initial status:** Blocked  
+**Initial status:** Blocked
+**Status:** Accepted
 **Depends on:** TASK-040 accepted
 
 ## Goal

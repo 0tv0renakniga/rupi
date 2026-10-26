@@ -363,6 +363,30 @@ fn canonical_root_cannot_be_supplied_as_a_relative_escape() {
     assert!(Path::new(raw.as_ref()).is_absolute());
 }
 
+#[cfg(unix)]
+#[test]
+fn write_preflight_rejects_symlink_escape() {
+    use std::os::unix::fs::symlink;
+
+    let root = TempRoot::new("write-symlink-escape");
+    let outside = TempRoot::new("write-symlink-outside");
+    symlink(&outside.path, root.path.join("linked-parent")).expect("parent symlink");
+    let policy = Policy::new(&root.path).expect("policy");
+
+    let violation = policy
+        .authorize(&AgentTool::WriteFile {
+            path: "linked-parent/new.txt".into(),
+            content: "not written".into(),
+            expected_sha256: None,
+        })
+        .expect_err("symlink write escape");
+
+    let local_agent_harness::policy::PolicyViolation::Path(error) = violation else {
+        panic!("expected path violation");
+    };
+    assert_eq!(error.code(), "PATH_SYMLINK_ESCAPE");
+}
+
 #[test]
 fn pre_dispatch_policy_rejects_sensitive_paths_with_stable_codes() {
     let root = TempRoot::new("pre-dispatch");

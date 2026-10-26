@@ -23,6 +23,7 @@ use local_agent_harness::orchestrator::{
     ChannelEventSink, Clock, EventSink, JevAdvisor, Orchestrator, OrchestratorLimits,
     OrchestratorOutcome, TaskContext, TaskRequest, ToolExecutor, VerificationEngine, WikiStore,
 };
+use local_agent_harness::policy::Policy;
 use local_agent_harness::state_machine::{LoopState, TaskBudget};
 use local_agent_harness::wiki::compile::{CompileReport, SessionTrace};
 use local_agent_harness::wiki::{WikiContext, WikiStatus};
@@ -231,6 +232,7 @@ struct FakeTools {
     seen: Mutex<Vec<AgentTool>>,
     authorize_deny: Option<String>,
     capability_deny: Option<String>,
+    policy: Option<Policy>,
 }
 
 impl FakeTools {
@@ -240,6 +242,7 @@ impl FakeTools {
             seen: Mutex::new(Vec::new()),
             authorize_deny: None,
             capability_deny: None,
+            policy: None,
         }
     }
 
@@ -253,6 +256,11 @@ impl FakeTools {
         self
     }
 
+    fn with_policy(mut self, policy: Policy) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
     fn seen(&self) -> Vec<AgentTool> {
         self.seen.lock().expect("seen lock").clone()
     }
@@ -260,9 +268,12 @@ impl FakeTools {
 
 #[async_trait]
 impl ToolExecutor for FakeTools {
-    fn authorize(&self, _tool: &AgentTool) -> std::result::Result<(), String> {
-        match &self.authorize_deny {
-            Some(reason) => Err(reason.clone()),
+    fn authorize(&self, tool: &AgentTool) -> std::result::Result<(), String> {
+        if let Some(reason) = &self.authorize_deny {
+            return Err(reason.clone());
+        }
+        match &self.policy {
+            Some(policy) => policy.authorize(tool).map_err(|error| error.to_string()),
             None => Ok(()),
         }
     }
@@ -1313,6 +1324,122 @@ async fn policy_denial_never_reaches_the_approval_gate() {
 
     assert!(approvals.requests().is_empty());
     assert!(fx.tools.seen().is_empty());
+    assert_eq!(outcome.context.session_trace.policy_denials.len(), 1);
+    assert!(!has_event(&fx.events.events(), |event| matches!(
+        event,
+        AgentEvent::ApprovalRequired { .. }
+    )));
+}
+
+#[tokio::test]
+async fn invalid_write_hash_never_reaches_approval_or_dispatch() {
+    let placeholder = TempDir::new("invalid-write-hash");
+    let approvals = Arc::new(RecordingApprovals::new(ApprovalDecision::Approved));
+    let fx = Fixture::build(
+        vec![
+            turn("1. Edit"),
+            tool_turn(
+                "write_file",
+                r#"{"path":"src/lib.rs","content":"ok","expected_sha256":"ABC123"}"#,
+            ),
+            turn("DONE"),
+        ],
+        Vec::new(),
+        FakeJev::pass(),
+        FakeTools::new(Vec::new()),
+        FakeVerifier::new(
+            vec![verification_command(placeholder.path())],
+            vec![pass_report()],
+        ),
+        FakeWiki::ok(placeholder.path()),
+        OrchestratorLimits::default(),
+        CollectAudit::default(),
+        ApprovalPolicy::default(),
+        approvals.clone(),
+    );
+
+    let outcome = fx.run(TaskBudget::default()).await.expect("run");
+
+    assert!(approvals.requests().is_empty());
+    assert!(fx.tools.seen().is_empty());
+    let feedback = conversation_text(&outcome.context);
+    assert!(feedback.contains("WRITE_HASH_FORMAT"));
+    assert!(feedback.contains("TOOL_INPUT_ERROR"));
+    assert!(!has_event(&fx.events.events(), |event| matches!(
+        event,
+        AgentEvent::ApprovalRequired { .. }
+    )));
+}
+
+#[tokio::test]
+async fn oversized_write_content_never_reaches_approval_or_dispatch() {
+    use local_agent_harness::write_policy::MAX_WRITE_CONTENT_BYTES;
+
+    let placeholder = TempDir::new("oversized-write");
+    let approvals = Arc::new(RecordingApprovals::new(ApprovalDecision::Approved));
+    let content = "x".repeat(MAX_WRITE_CONTENT_BYTES + 1);
+    let arguments = format!(r#"{{"path":"src/lib.rs","content":"{content}"}}"#);
+    let fx = Fixture::build(
+        vec![
+            turn("1. Edit"),
+            tool_turn("write_file", arguments),
+            turn("DONE"),
+        ],
+        Vec::new(),
+        FakeJev::pass(),
+        FakeTools::new(Vec::new()),
+        FakeVerifier::new(
+            vec![verification_command(placeholder.path())],
+            vec![pass_report()],
+        ),
+        FakeWiki::ok(placeholder.path()),
+        OrchestratorLimits::default(),
+        CollectAudit::default(),
+        ApprovalPolicy::default(),
+        approvals.clone(),
+    );
+
+    let outcome = fx.run(TaskBudget::default()).await.expect("run");
+
+    assert!(approvals.requests().is_empty());
+    assert!(fx.tools.seen().is_empty());
+    let feedback = conversation_text(&outcome.context);
+    assert!(feedback.contains("WRITE_CONTENT_TOO_LARGE"));
+    assert!(feedback.contains("TOOL_INPUT_ERROR"));
+}
+
+#[tokio::test]
+async fn sensitive_write_path_never_reaches_approval_or_dispatch() {
+    let placeholder = TempDir::new("sensitive-write");
+    let policy = Policy::new(placeholder.path()).expect("policy");
+    let approvals = Arc::new(RecordingApprovals::new(ApprovalDecision::Approved));
+    let fx = Fixture::build(
+        vec![
+            turn("1. Edit"),
+            tool_turn("write_file", r#"{"path":".env","content":"SECRET"}"#),
+            turn("DONE"),
+        ],
+        Vec::new(),
+        FakeJev::pass(),
+        FakeTools::new(Vec::new()).with_policy(policy),
+        FakeVerifier::new(
+            vec![verification_command(placeholder.path())],
+            vec![pass_report()],
+        ),
+        FakeWiki::ok(placeholder.path()),
+        OrchestratorLimits::default(),
+        CollectAudit::default(),
+        ApprovalPolicy::default(),
+        approvals.clone(),
+    );
+
+    let outcome = fx.run(TaskBudget::default()).await.expect("run");
+
+    assert!(approvals.requests().is_empty());
+    assert!(fx.tools.seen().is_empty());
+    assert!(
+        conversation_text(&outcome.context).contains("[PATH_SENSITIVE] sensitive path is denied")
+    );
     assert_eq!(outcome.context.session_trace.policy_denials.len(), 1);
     assert!(!has_event(&fx.events.events(), |event| matches!(
         event,

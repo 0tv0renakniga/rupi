@@ -218,9 +218,9 @@ helper failures.
 ## Investigate mode
 
 The operator selects `Investigate` before submitting a task. In the TUI, press
-`F2` while the task-entry field is focused to toggle between `change` and
-`investigate`; the header and prompt show the selected mode. A mode is fixed for
-the lifetime of the task and cannot be changed by the model.
+`F2` while the task-entry field is focused to cycle through `change`,
+`investigate`, and `plan`; the header and prompt show the selected mode. A mode
+is fixed for the lifetime of the task and cannot be changed by the model.
 
 Investigate tasks use the read-only transition path `Learn -> Review ->
 Compile`. Plan, Act, and Verify are unavailable, so no mutation can be approved
@@ -252,6 +252,55 @@ selected as an automatic fallback. The script inventory and installed location
 are resolved at startup; release packaging and checksum verification remain
 separate release work.
 
+## Plan mode
+
+Plan mode is a no-mutation planning workflow using the transition path
+`Learn -> Plan -> Review -> Compile -> Completed`. The model may gather bounded
+repository evidence with only `read_file`, `git_status`, and `git_diff`, then
+must return a structured plan. Plan never enters Act or Verify, cannot mutate
+task/source files, cannot run a verifier, and never starts Change mode. The only
+write is the harness-owned plan artifact under `.ai-wiki/plans/`.
+
+The deterministic review step requires non-empty sections for the goal,
+repository evidence used, likely files, ordered steps, assumptions, risks,
+expected verifier profile, blockers/missing evidence, and confirmed facts
+versus model inferences. Invalid or missing model output produces a bounded,
+redacted deterministic fallback artifact rather than a false "valid" plan.
+
+Plan artifacts are written to:
+
+```text
+$HARNESS_ROOT/.ai-wiki/plans/<task-id>.md
+```
+
+The harness detects the verifier profile through the existing deterministic
+detection path but does not execute it in Plan mode. The artifact records the
+harness-selected commands as authoritative and ignores any model-proposed
+commands. If no supported profile is detected, the artifact records an explicit
+blocker and the task ends blocked; the harness never invents verification
+commands. Starting implementation requires a separate operator-submitted Change
+task after reviewing the plan.
+
+## Write-file schema preflight
+
+Change-mode `write_file` requests pass a strict schema gate before the shared
+path policy, capability check, or approval prompt. The validated form is
+`WriteFile { path, content, expected_sha256 }`:
+
+- `path` must be a non-empty repository-relative path of at most 256 bytes,
+  without NUL or other control characters, and must not escape the project root.
+- `content` must be UTF-8 text of at most 49,152 bytes and must not contain NUL.
+- `expected_sha256`, when present, must be exactly 64 lowercase hexadecimal
+  characters. Upper-case or prefixed digests are rejected.
+- `write_file` is rejected in Investigate and Plan modes before approval. A
+  denied path or invalid schema never creates an approval prompt or dispatches
+  an action.
+- Approval metadata includes only the bounded target path and reason; it never
+  includes file content or the expected digest.
+
+This task sequence does not dispatch writes yet. New-file creation and guarded
+overwrite are separate reviewed tasks.
+
 ## Audit evidence
 
 Audit records are append-only JSON Lines. The default location is:
@@ -262,9 +311,10 @@ $HARNESS_ROOT/.harness-audit/audit.jsonl
 
 Each record is bounded to 16 KiB. Records include task/phase transitions, plan
 summary, tool classification, fixed script identity and action outcomes,
-approval decisions, verification outcomes, Wiki compilation, and evidence brief
-compilation. Raw tool payloads, file contents, prompts, hidden reasoning, and
-credentials are not recorded in tool audit records. The frozen MCP adapter, if
+approval decisions, verification outcomes, Wiki compilation, evidence brief
+compilation, and plan artifact compilation. Raw tool payloads, file contents,
+prompts, hidden reasoning, and credentials are not recorded in tool audit
+records. The frozen MCP adapter, if
 run explicitly, would also record local executable provenance; it is not part of
 the normal startup path. Verification output is bounded and redacted, but it is
 still local evidence and should be treated as sensitive.

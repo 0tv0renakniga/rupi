@@ -133,13 +133,14 @@ fn handle_task_entry(app: &mut AppState, key: KeyEvent, ctrl: bool, alt: bool) -
         KeyCode::F(2) => {
             app.selected_mode = match app.selected_mode {
                 TaskMode::Change => TaskMode::Investigate,
-                TaskMode::Investigate if app.change_available => TaskMode::Change,
-                TaskMode::Investigate => {
+                TaskMode::Investigate => TaskMode::Plan,
+                TaskMode::Plan if app.change_available => TaskMode::Change,
+                TaskMode::Plan => {
                     app.push_notice(
                         TranscriptKind::Warning,
                         "Change mode is gated until reviewed write and verifier scripts are installed",
                     );
-                    return None;
+                    TaskMode::Investigate
                 }
             };
             app.push_notice(

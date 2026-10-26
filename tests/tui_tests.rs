@@ -98,10 +98,31 @@ fn f2_toggles_mode_only_before_submission() {
 }
 
 #[test]
+fn f2_cycles_through_plan_mode_before_submission() {
+    let mut app = AppState::default();
+    assert_eq!(app.selected_mode, TaskMode::Change);
+
+    assert_eq!(handle_key(&mut app, key(KeyCode::F(2))), None);
+    assert_eq!(app.selected_mode, TaskMode::Investigate);
+
+    assert_eq!(handle_key(&mut app, key(KeyCode::F(2))), None);
+    assert_eq!(app.selected_mode, TaskMode::Plan);
+
+    app.task_input = "plan the repository change".into();
+    assert_eq!(
+        handle_key(&mut app, key(KeyCode::Enter)),
+        Some(Command::Submit {
+            objective: "plan the repository change".into(),
+            mode: TaskMode::Plan,
+        })
+    );
+}
+
+#[test]
 fn change_mode_is_gated_when_write_scripts_are_unavailable() {
     let mut app = AppState::default();
     app.change_available = false;
-    app.selected_mode = TaskMode::Investigate;
+    app.selected_mode = TaskMode::Plan;
 
     assert_eq!(handle_key(&mut app, key(KeyCode::F(2))), None);
     assert_eq!(app.selected_mode, TaskMode::Investigate);
@@ -279,6 +300,9 @@ fn reducer_handles_every_agent_event_variant() {
         },
         AgentEvent::WikiCompiled {
             path: ".ai-wiki/index.md".into(),
+        },
+        AgentEvent::PlanCompiled {
+            path: ".ai-wiki/plans/task.md".into(),
         },
         AgentEvent::Blocked {
             reason: "blocked".into(),

@@ -142,9 +142,19 @@ task complete.
   completion.
 - Investigate mode uses `Learn -> Review -> Compile -> Completed`; Plan, Act, and
   Verify are unavailable, so no mutation can be approved or dispatched.
+- Plan mode uses `Learn -> Plan -> Review -> Compile -> Completed`. Its Plan
+  phase is limited to read-only evidence gathering and structured plan
+  generation; Act and Verify are unavailable. The harness writes a bounded,
+  redacted advisory plan artifact, detects but never runs the verifier, and
+  records missing verifier support as a blocker. Plan cannot start Change mode.
 - Tool calls are parsed into canonical `AgentTool` values before dispatch.
   Malformed arguments are returned to the model as bounded teaching feedback and
-  are not sent to the dispatcher.
+  are not sent to the dispatcher. Write requests additionally require a strict
+  Change-mode schema preflight: a bounded relative path, bounded NUL-free UTF-8
+  content, and an optional 64-character lowercase SHA-256 digest. Schema or
+  path denial occurs before capability checks and approval; approval metadata
+  never contains file content. No write dispatch is enabled in this task
+  sequence.
 - Context compaction preserves the system policy, task objective, plan, and
   verification evidence while dropping or bounding older messages. Tool output,
   plan text, review evidence, audit records, and event payloads are bounded and

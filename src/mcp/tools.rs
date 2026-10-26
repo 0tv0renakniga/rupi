@@ -74,7 +74,7 @@ impl AgentTool {
                 content: string_arg(arguments, &["content", "text", "contents"])
                     .ok_or("write_file requires string field `content`")?
                     .to_owned(),
-                expected_sha256: string_arg(arguments, &["expected_sha256"]).map(str::to_owned),
+                expected_sha256: optional_string_arg(arguments, "expected_sha256")?,
             }),
 
             "applypatch" | "patch" | "editfile" => Ok(Self::ApplyPatch {
@@ -84,7 +84,7 @@ impl AgentTool {
                 unified_diff: string_arg(arguments, &["unified_diff", "diff", "patch"])
                     .ok_or("apply_patch requires string field `unified_diff`")?
                     .to_owned(),
-                expected_sha256: string_arg(arguments, &["expected_sha256"]).map(str::to_owned),
+                expected_sha256: optional_string_arg(arguments, "expected_sha256")?,
             }),
 
             "runcommand" | "run" | "exec" => {
@@ -175,6 +175,14 @@ fn string_arg<'a>(arguments: &'a Value, aliases: &[&str]) -> Option<&'a str> {
     aliases
         .iter()
         .find_map(|key| arguments.get(*key).and_then(Value::as_str))
+}
+
+fn optional_string_arg(arguments: &Value, key: &str) -> Result<Option<String>, String> {
+    match arguments.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(format!("field `{key}` must be a string")),
+    }
 }
 
 fn optional_u32(arguments: &Value, key: &str) -> Result<Option<u32>, String> {
@@ -396,6 +404,13 @@ mod tests {
 
         let error = AgentTool::parse_tolerant("write_file", &json!({"path": "x"})).unwrap_err();
         assert!(error.contains("write_file requires string field `content`"));
+
+        let error = AgentTool::parse_tolerant(
+            "write_file",
+            &json!({"path": "x", "content": "ok", "expected_sha256": 3}),
+        )
+        .unwrap_err();
+        assert!(error.contains("field `expected_sha256` must be a string"));
 
         let error = AgentTool::parse_tolerant(
             "run_command",

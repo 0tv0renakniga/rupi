@@ -387,7 +387,7 @@ fn is_forbidden_program(program: &str) -> bool {
     )
 }
 
-fn render_command(command: &VerificationCommand) -> String {
+pub(crate) fn render_command(command: &VerificationCommand) -> String {
     let mut rendered = command.program.clone();
     for arg in &command.args {
         rendered.push(' ');
