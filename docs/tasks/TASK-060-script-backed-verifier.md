@@ -1,6 +1,7 @@
 # TASK-060 — Script-Backed Deterministic Verifier
 
 **Initial status:** Blocked  
+**Status:** Awaiting review
 **Depends on:** TASK-012 accepted
 
 ## Goal

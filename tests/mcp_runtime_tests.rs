@@ -491,7 +491,7 @@ fn headless_startup_checks_scripts_without_mcp_or_model_services() {
         "stdout: {stdout}"
     );
     assert!(
-        stdout.contains("change mode: gated; missing run_verifier.py"),
+        stdout.contains("change mode: available"),
         "stdout: {stdout}"
     );
     assert!(!stdout.contains("mcp startup"), "stdout: {stdout}");

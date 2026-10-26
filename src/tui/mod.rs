@@ -32,10 +32,10 @@ use crate::error::{AgentError, Result};
 use crate::events::{AgentEvent, Command, EventLevel};
 use crate::jev::JevClient;
 use crate::llm::OpenAiCompatClient;
-use crate::orchestrator::{
-    LocalVerificationEngine, LocalWikiStore, Orchestrator, OrchestratorLimits, ToolExecutor,
-};
+use crate::orchestrator::{LocalWikiStore, Orchestrator, OrchestratorLimits, ToolExecutor};
 use crate::runtime;
+use crate::script_runner::ScriptRunner;
+use crate::script_verification::ScriptVerificationEngine;
 
 const TICK_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -105,6 +105,7 @@ async fn prepare(config: &Config) -> Result<PreparedApp> {
         config,
         runtime.executor.clone(),
         runtime.audit.clone(),
+        runtime.runner.clone(),
         approvals.clone(),
     )?;
 
@@ -119,6 +120,7 @@ fn build_orchestrator(
     config: &Config,
     tools: Arc<dyn ToolExecutor>,
     audit: Arc<AuditLog>,
+    runner: ScriptRunner,
     approvals: InteractiveApprovalGate,
 ) -> Result<Orchestrator> {
     let mut llm = OpenAiCompatClient::new(config.llm_base.clone(), config.model.clone());
@@ -137,7 +139,7 @@ fn build_orchestrator(
         llm,
         jev,
         tools,
-        Arc::new(LocalVerificationEngine),
+        Arc::new(ScriptVerificationEngine::new(runner)),
         Arc::new(LocalWikiStore::default()),
     )
     .with_limits(limits)
@@ -337,14 +339,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_uses_script_runtime_and_gates_change_without_mcp() {
+    async fn prepare_uses_script_runtime_and_enables_change_without_mcp() {
         let fixture = Fixture::new("script-runtime");
         let prepared = prepare(&fixture.config)
             .await
             .expect("script runtime startup");
 
-        assert_eq!(prepared.app.selected_mode, TaskMode::Investigate);
-        assert!(!prepared.app.change_available);
+        assert_eq!(prepared.app.selected_mode, TaskMode::Change);
+        assert!(prepared.app.change_available);
         assert!(fixture.project.join(".harness-audit").is_dir());
         let warnings = prepared
             .app
@@ -353,7 +355,7 @@ mod tests {
             .map(|entry| entry.text.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(warnings.contains("run_verifier.py"), "{warnings}");
+        assert!(!warnings.contains("run_verifier.py"), "{warnings}");
         assert!(!warnings.contains("write_file.py"), "{warnings}");
     }
 

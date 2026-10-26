@@ -293,14 +293,12 @@ fn headless_preflight_uses_scripts_and_does_not_read_mcp_configuration() {
             ActionId::GitStatus,
             ActionId::GitDiff,
             ActionId::WriteFile,
+            ActionId::RunVerifier,
         ]
     );
     assert!(preflight.capabilities.read_only_ready());
-    assert!(!preflight.capabilities.change_ready());
-    assert_eq!(
-        preflight.capabilities.missing_file_names(),
-        vec!["run_verifier.py"]
-    );
+    assert!(preflight.capabilities.change_ready());
+    assert!(preflight.capabilities.missing_file_names().is_empty());
     assert!(preflight.audit_path.starts_with(&project));
 }
 
@@ -318,7 +316,7 @@ async fn tui_worker_dispatches_investigate_through_the_script_runtime() {
 
     let config = config(&project);
     let script_runtime = runtime::build(&config).expect("script runtime");
-    assert!(!script_runtime.capabilities.change_ready());
+    assert!(script_runtime.capabilities.change_ready());
 
     let llm = Arc::new(FakeLlm::new(vec![
         tool_turn(vec![

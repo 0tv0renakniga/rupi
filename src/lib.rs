@@ -20,6 +20,7 @@ pub mod policy;
 pub mod runtime;
 pub mod script_runner;
 pub mod script_tools;
+pub mod script_verification;
 pub mod state_machine;
 pub mod tui;
 pub mod wiki;

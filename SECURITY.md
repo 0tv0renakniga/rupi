@@ -410,19 +410,23 @@ uses a scripted model for determinism and does not certify live model quality.
 
 ## Deterministic verification boundary
 
-Verification commands are selected by harness code from repository signals. The
-model, Jev, Wiki status, assistant finish reason, and tool results cannot add,
-remove, or declare verification passed.
+Verification commands are selected by harness code from repository signals and
+executed through the fixed `run_verifier.py` script boundary. The model, Jev,
+Wiki status, assistant finish reason, and tool results cannot add, remove, supply
+a program/argument vector, or declare verification passed.
 
-- Commands are represented as `program + args`, never as shell strings, and
-  are spawned directly without a shell. Shell programs (`sh`, `bash`, `cmd`,
-  PowerShell, and similar) and privilege/escalation wrappers such as `sudo`,
-  `su`, `doas`, and `env` are rejected.
+- Rust detection produces `program + args` values, never shell strings. The
+  engine sends exactly one command per helper request; the helper validates the
+  argv, cwd, timeout, and output cap, then spawns the command directly without a
+  shell. Shell programs (`sh`, `bash`, `cmd`, PowerShell, and similar) and
+  privilege/escalation wrappers such as `sudo`, `su`, `doas`, and `env` are
+  rejected by both the Rust validation and helper boundary.
 - Every command runs with an explicit working directory canonicalized beneath
   the repository root. Paths that escape the root are rejected before any
   command starts.
 - Commands have a nonzero timeout and are killed on timeout or cancellation.
-  Their exact exit status, timeout state, and duration are recorded.
+  The helper terminates the verifier process group on timeout; exact exit
+  status, timeout state, and duration are recorded.
 - Captured stdout and stderr are bounded, retaining a head and tail rather than
   unbounded process output. The failure tail is also bounded.
 - Only a real executed command with exit code `0` satisfies a verification

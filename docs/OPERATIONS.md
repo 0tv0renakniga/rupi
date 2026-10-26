@@ -9,10 +9,11 @@ not commit, push, install packages, or discover endpoints.
 - A fixed Python 3 interpreter at an absolute path such as
   `/usr/bin/python3`. PATH lookup is not used for helper execution.
 - Reviewed helper scripts installed at a canonical directory outside the
-  project root. The active read-only inventory is `read_file.py`,
-  `git_status.py`, and `git_diff.py`; `write_file.py` enables approved file
-  creation and digest-guarded replacement. Change remains gated until the
-  reviewed verifier script exists.
+  project root. The active inventory is `read_file.py`, `git_status.py`,
+  `git_diff.py`, `write_file.py`, and `run_verifier.py`. The first three enable
+  Investigate and Plan evidence gathering; `write_file.py` enables approved file
+  creation and digest-guarded replacement; `run_verifier.py` runs the
+  harness-selected verification profile for Change.
 - Rust toolchain, `cargo`, and the verifier tools required by the target
   repository (`rustfmt` for Rust projects).
 - A loopback OpenAI-compatible model server, normally `llama-server` on
@@ -31,9 +32,9 @@ pinned.
 
 ## Minimal production-safe configuration
 
-The default execution backend is the fixed script substrate. Investigate is the
-first enabled workflow. Change remains gated until the reviewed
-`run_verifier.py` script is installed.
+The default execution backend is the fixed script substrate. Investigate and
+Plan use the read-only helpers. Change requires both the approved write helper
+and the reviewed `run_verifier.py` helper.
 
 ```sh
 export HARNESS_ROOT=/srv/harness/workspace
@@ -94,9 +95,10 @@ MCP. Then start the TUI:
 cargo run
 ```
 
-Use a disposable repository for the first live task. Investigate is selected by
-default when Change is gated. Confirm the audit file and evidence brief exist
-before installing the verifier script.
+Use a disposable repository for the first live task. Change is enabled only when
+the write and verifier helpers are installed; review the detected verifier
+profile before submitting a Change task. Confirm the audit file and evidence
+brief exist before accepting the result.
 
 ## Path policy
 
@@ -248,11 +250,11 @@ the orchestrator as a `ToolExecutor`. Investigate tasks dispatch through that
 script runner; no MCP runtime, server, profile, digest, or Bubblewrap startup is
 required.
 
-The TUI shows Change as gated when `run_verifier.py` is not installed. The
-worker also rejects a Change submission defensively. MCP is never selected as
-an automatic fallback. The script inventory and installed location are resolved
-at startup; release packaging and checksum verification remain separate release
-work.
+The TUI enables Change only when the write and verifier helpers are installed;
+the worker also rejects a Change submission defensively if they are missing. MCP
+is never selected as an automatic fallback. The script inventory and installed
+location are resolved at startup; release packaging and checksum verification
+remain separate release work.
 
 ## Plan mode
 
@@ -429,9 +431,12 @@ failed verification returns the task to `Act` only within the retry budget; when
 the budget is exhausted the task becomes `Blocked`. Do not claim completion
 manually. Inspect the workspace diff, fix the cause, and start a new task.
 
-Verification commands run as the harness account, outside the helper-script
-boundary. Run the harness under a dedicated account or container with the same
-filesystem and network policy you intend for verifier commands.
+Verification commands are selected in Rust and executed one bounded argv
+command at a time through the fixed `run_verifier.py` helper; the model cannot
+supply a program, argument vector, shell fragment, or working directory. The
+helper still runs as the harness account and inherits its filesystem and network
+policy. Run the harness under a dedicated account or container with the same
+policy you intend for verifier commands.
 
 ### Wiki load or compile failure
 
@@ -473,7 +478,8 @@ git restore -- <path>
 - Audit retention and rotation are operator responsibilities.
 - The harness enforces one task at a time, but it is not a multi-tenant service.
 - The active script path does not use Bubblewrap; helper scripts are constrained
-  by the fixed inventory and path policy, not an OS sandbox. Verifier commands
-  and the harness itself run outside the helper-script boundary.
+  by the fixed inventory and path policy, not an OS sandbox. The verifier helper
+  and the commands it launches run as the harness account without additional
+  kernel isolation.
 - Remote/work activation is a separate administrative decision and is not part
   of the local-first profile.

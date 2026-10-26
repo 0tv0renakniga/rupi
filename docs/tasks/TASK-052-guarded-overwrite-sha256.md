@@ -1,7 +1,7 @@
 # TASK-052 — Guarded Overwrite with Expected SHA-256
 
 **Initial status:** Blocked
-**Status:** Awaiting review
+**Status:** Accepted
 **Depends on:** TASK-051 accepted
 
 ## Goal
