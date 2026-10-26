@@ -1,7 +1,7 @@
 # TASK-051 — New-File Creation with Approval and Atomic Write
 
 **Initial status:** Blocked  
-**Status:** Awaiting review
+**Status:** Accepted
 **Depends on:** TASK-050 accepted
 
 ## Goal

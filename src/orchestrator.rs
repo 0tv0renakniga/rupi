@@ -2894,7 +2894,7 @@ fn tool_specs_for(names: &[&str]) -> Value {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Write one complete UTF-8 text file with an optional expected content hash.",
+                "description": "Create or replace one complete UTF-8 text file. Existing files require a matching expected content hash.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -2909,7 +2909,7 @@ fn tool_specs_for(names: &[&str]) -> Value {
                         "expected_sha256": {
                             "type": "string",
                             "pattern": "^[a-f0-9]{64}$",
-                            "description": "Optional lowercase SHA-256 digest of the current file."
+                            "description": "Required when replacing an existing file: lowercase SHA-256 digest of its current content."
                         }
                     },
                     "required": ["path", "content"],

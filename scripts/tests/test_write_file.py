@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -107,30 +108,161 @@ class WriteFileScriptTests(unittest.TestCase):
         )
         self.assertEqual((self.root / "empty.txt").read_bytes(), b"")
 
-    def test_existing_targets_are_never_overwritten(self):
+    def test_existing_target_requires_an_expected_digest(self):
         target = self.root / "existing.txt"
         target.write_text("original\n", encoding="utf-8")
         self.assert_error(
             self.execute(path="existing.txt", content="replacement\n"),
-            "WRITE_TARGET_EXISTS",
+            "WRITE_HASH_REQUIRED",
         )
         self.assertEqual(target.read_text(encoding="utf-8"), "original\n")
         self.assert_no_temporary_files(self.root)
 
         (self.root / "directory").mkdir()
         self.assert_error(
-            self.execute(path="directory", content="replacement\n"),
-            "WRITE_TARGET_EXISTS",
+            self.execute(
+                path="directory",
+                content="replacement\n",
+                expected_sha256=hashlib.sha256(b"original\n").hexdigest(),
+            ),
+            "WRITE_TARGET_NOT_FILE",
         )
 
         inside = self.root / "inside.txt"
         inside.write_text("inside\n", encoding="utf-8")
         self.symlink(inside, self.root / "inside-link")
         self.assert_error(
-            self.execute(path="inside-link", content="replacement\n"),
-            "WRITE_TARGET_EXISTS",
+            self.execute(
+                path="inside-link",
+                content="replacement\n",
+                expected_sha256=hashlib.sha256(b"inside\n").hexdigest(),
+            ),
+            "WRITE_TARGET_NOT_FILE",
         )
         self.assertEqual(inside.read_text(encoding="utf-8"), "inside\n")
+
+    def test_matching_digest_replaces_file_and_preserves_mode(self):
+        target = self.root / "existing.txt"
+        original = "original\n"
+        replacement = "replacement\n"
+        target.write_text(original, encoding="utf-8")
+        os.chmod(target, 0o640)
+
+        data = self.assert_success(
+            self.execute(
+                path="existing.txt",
+                content=replacement,
+                expected_sha256=hashlib.sha256(original.encode("utf-8")).hexdigest(),
+            )
+        )
+
+        self.assertEqual(target.read_text(encoding="utf-8"), replacement)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o640)
+        self.assertEqual(
+            data,
+            {
+                "path": "existing.txt",
+                "created": False,
+                "bytes_written": len(replacement.encode("utf-8")),
+                "sha256": hashlib.sha256(replacement.encode("utf-8")).hexdigest(),
+                "previous_sha256": hashlib.sha256(
+                    original.encode("utf-8")
+                ).hexdigest(),
+            },
+        )
+        self.assert_no_temporary_files(self.root)
+
+    def test_digest_mismatch_preserves_original_and_cleans_temporary(self):
+        target = self.root / "existing.txt"
+        original = "original\n"
+        target.write_text(original, encoding="utf-8")
+
+        self.assert_error(
+            self.execute(
+                path="existing.txt",
+                content="replacement\n",
+                expected_sha256=hashlib.sha256(b"different\n").hexdigest(),
+            ),
+            "WRITE_HASH_MISMATCH",
+        )
+
+        self.assertEqual(target.read_text(encoding="utf-8"), original)
+        self.assert_no_temporary_files(self.root)
+
+    def test_target_changed_after_expected_digest_was_computed(self):
+        target = self.root / "existing.txt"
+        original = "original\n"
+        target.write_text(original, encoding="utf-8")
+        expected = hashlib.sha256(original.encode("utf-8")).hexdigest()
+        target.write_text("changed elsewhere\n", encoding="utf-8")
+
+        self.assert_error(
+            self.execute(
+                path="existing.txt",
+                content="replacement\n",
+                expected_sha256=expected,
+            ),
+            "WRITE_HASH_MISMATCH",
+        )
+
+        self.assertEqual(
+            target.read_text(encoding="utf-8"), "changed elsewhere\n"
+        )
+        self.assert_no_temporary_files(self.root)
+
+    def test_sensitive_and_escape_overwrite_paths_are_denied(self):
+        secret = self.root / ".env"
+        secret.write_text("TOKEN=original\n", encoding="utf-8")
+        digest = hashlib.sha256(secret.read_bytes()).hexdigest()
+        self.assert_error(
+            self.execute(
+                path=".env",
+                content="TOKEN=replacement\n",
+                expected_sha256=digest,
+            ),
+            "PATH_SENSITIVE",
+        )
+        self.assertEqual(secret.read_text(encoding="utf-8"), "TOKEN=original\n")
+
+        with tempfile.TemporaryDirectory(prefix="rupi-write-file-outside-") as directory:
+            outside = Path(directory)
+            target = outside / "outside.txt"
+            target.write_text("outside\n", encoding="utf-8")
+            self.symlink(target, self.root / "outside-link")
+            self.assert_error(
+                self.execute(
+                    path="outside-link",
+                    content="replacement\n",
+                    expected_sha256=hashlib.sha256(b"outside\n").hexdigest(),
+                ),
+                "PATH_SYMLINK_ESCAPE",
+            )
+            self.assertEqual(target.read_text(encoding="utf-8"), "outside\n")
+
+    def test_failed_atomic_replace_keeps_original_and_cleans_temporary(self):
+        target = self.root / "existing.txt"
+        original = "original\n"
+        target.write_text(original, encoding="utf-8")
+
+        with mock.patch.object(
+            write_file.os,
+            "replace",
+            side_effect=OSError(5, "forced replace failure"),
+        ):
+            with self.assertRaises(write_file.WriteError) as raised:
+                write_file._execute(
+                    self.request(
+                        path="existing.txt",
+                        content="replacement\n",
+                        expected_sha256=hashlib.sha256(
+                            original.encode("utf-8")
+                        ).hexdigest(),
+                    )
+                )
+
+        self.assertEqual(raised.exception.code, "WRITE_ATOMIC_REPLACE_FAILED")
+        self.assertEqual(target.read_text(encoding="utf-8"), original)
+        self.assert_no_temporary_files(self.root)
 
     def test_rejects_sensitive_traversal_and_symlink_escape_paths(self):
         with tempfile.TemporaryDirectory(prefix="rupi-write-file-outside-") as directory:

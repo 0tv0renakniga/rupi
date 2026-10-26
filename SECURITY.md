@@ -154,12 +154,15 @@ task complete.
   content, and an optional 64-character lowercase SHA-256 digest. Schema or
   path denial occurs before capability checks and approval; approval metadata
   never contains file content. Approved Change-mode writes dispatch only to the
-  fixed new-file helper, which revalidates the target and parent, rejects
-  existing targets, writes a temporary sibling, and publishes atomically without
-  replacing an existing target. Successful write audit metadata is limited to
-  the normalized path, byte count, creation flag, and digest; file content is
-  never persisted in audit or approval data. Guarded overwrite remains disabled
-  until a later reviewed task.
+  fixed write helper, which revalidates the target and parent, writes a temporary
+  sibling, and publishes atomically. New targets are created exclusively.
+  Existing regular targets require a matching expected SHA-256 computed from
+  current content; the helper rechecks identity and metadata before atomic
+  replacement, rejects symlinks and mismatches, and preserves ordinary
+  permission bits where practical. Successful write audit metadata is limited to
+  the normalized path, byte count, creation flag, new digest, and previous
+  digest for replacement; file content is never persisted in audit or approval
+  data.
 - Context compaction preserves the system policy, task objective, plan, and
   verification evidence while dropping or bounding older messages. Tool output,
   plan text, review evidence, audit records, and event payloads are bounded and

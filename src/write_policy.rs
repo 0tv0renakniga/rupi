@@ -28,6 +28,9 @@ pub const MAX_WRITE_PATH_BYTES: usize = 256;
 pub const SHA256_HEX_BYTES: usize = 64;
 
 /// Validated write request. No filesystem mutation occurs here.
+///
+/// The digest is optional at the schema layer because new-file creation does not
+/// need one. The helper requires it before replacing an existing target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteFileRequest {
     pub path: String,

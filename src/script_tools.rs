@@ -1,10 +1,11 @@
 //! Adapter from canonical model actions to fixed helper scripts.
 //!
-//! This module recognizes the accepted read-only actions plus the narrow
-//! new-file `write_file` action. `write_file` does not overwrite existing
-//! targets. Other mutation-capable actions are rejected before execution. The
-//! adapter owns no shell, executable, or script selection: [`ActionId`]
-//! resolves every helper from the harness-owned script inventory.
+//! This module recognizes the accepted read-only actions plus the guarded
+//! `write_file` action. Existing targets require a matching expected digest;
+//! the helper performs the final no-content, atomic replacement. Other
+//! mutation-capable actions are rejected before execution. The adapter owns no
+//! shell, executable, or script selection: [`ActionId`] resolves every helper
+//! from the harness-owned script inventory.
 
 use std::sync::Arc;
 
@@ -20,7 +21,7 @@ use crate::orchestrator::{TaskId, ToolExecutor};
 use crate::policy::Policy;
 use crate::script_runner::{ActionId, ScriptOutcome, ScriptRunner};
 
-/// Script-backed executor for the fixed read-only and new-file action inventory.
+/// Script-backed executor for the fixed read-only and guarded write inventory.
 #[derive(Clone)]
 pub struct ScriptToolExecutor {
     runner: ScriptRunner,

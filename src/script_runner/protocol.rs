@@ -304,13 +304,15 @@ impl ScriptOutcome {
             if let Some(bytes_written) = data.get("bytes_written").and_then(Value::as_u64) {
                 metadata["bytes_written"] = Value::from(bytes_written);
             }
-            if let Some(sha256) = data.get("sha256").and_then(Value::as_str)
-                && sha256.len() == 64
-                && sha256
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-            {
-                metadata["sha256"] = Value::String(sha256.to_owned());
+            for key in ["sha256", "previous_sha256"] {
+                if let Some(digest) = data.get(key).and_then(Value::as_str)
+                    && digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+                {
+                    metadata[key] = Value::String(digest.to_owned());
+                }
             }
             if let Some(created) = data.get("created").and_then(Value::as_bool) {
                 metadata["created"] = Value::Bool(created);
@@ -653,6 +655,7 @@ mod tests {
                 "created": true,
                 "bytes_written": 12,
                 "sha256": digest,
+                "previous_sha256": "cd".repeat(32),
                 "content": "WRITE_CONTENT_SECRET"
             }),
             None,
@@ -664,6 +667,7 @@ mod tests {
         assert_eq!(metadata["created"], true);
         assert_eq!(metadata["bytes_written"], 12);
         assert_eq!(metadata["sha256"], digest);
+        assert_eq!(metadata["previous_sha256"], "cd".repeat(32));
         assert!(metadata.get("content").is_none());
         assert!(!metadata.to_string().contains("WRITE_CONTENT_SECRET"));
 

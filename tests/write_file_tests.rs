@@ -27,6 +27,7 @@ use local_agent_harness::script_tools::ScriptToolExecutor;
 use local_agent_harness::state_machine::{LoopState, TaskBudget, TaskMode};
 use local_agent_harness::wiki::compile::{CompileReport, SessionTrace};
 use local_agent_harness::wiki::{WikiContext, WikiStatus};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -97,6 +98,33 @@ struct PendingApprovals;
 impl ApprovalGate for PendingApprovals {
     fn request(&self, _request: &ApprovalRequest) -> ApprovalFuture {
         Box::pin(std::future::pending())
+    }
+}
+
+struct MutateOnApproval {
+    path: Mutex<Option<PathBuf>>,
+    replacement: String,
+}
+
+impl MutateOnApproval {
+    fn new(replacement: &str) -> Self {
+        Self {
+            path: Mutex::new(None),
+            replacement: replacement.into(),
+        }
+    }
+
+    fn arm(&self, path: PathBuf) {
+        *self.path.lock().expect("path lock") = Some(path);
+    }
+}
+
+impl ApprovalGate for MutateOnApproval {
+    fn request(&self, _request: &ApprovalRequest) -> ApprovalFuture {
+        if let Some(path) = self.path.lock().expect("path lock").take() {
+            std::fs::write(path, &self.replacement).expect("mutate target during approval");
+        }
+        Box::pin(async { ApprovalDecision::Approved })
     }
 }
 
@@ -460,12 +488,39 @@ fn write_turn(path: &str, content: &str) -> AssistantTurn {
     )
 }
 
+fn write_turn_with_digest(path: &str, content: &str, expected_sha256: &str) -> AssistantTurn {
+    tool_turn(
+        "write_file",
+        format!(
+            r#"{{"path":{},"content":{},"expected_sha256":{}}}"#,
+            serde_json::to_string(path).expect("path JSON"),
+            serde_json::to_string(content).expect("content JSON"),
+            serde_json::to_string(expected_sha256).expect("digest JSON")
+        ),
+    )
+}
+
 fn task_script(path: &str, content: &str) -> Vec<AssistantTurn> {
     vec![
         turn("1. Create the requested file"),
         write_turn(path, content),
         turn("DONE"),
     ]
+}
+
+fn task_script_with_digest(path: &str, content: &str, expected_sha256: &str) -> Vec<AssistantTurn> {
+    vec![
+        turn("1. Update the requested file"),
+        write_turn_with_digest(path, content, expected_sha256),
+        turn("DONE"),
+    ]
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn verification_command(root: &Path) -> VerificationCommand {
@@ -735,7 +790,49 @@ async fn cancellation_before_dispatch_creates_no_file() {
 }
 
 #[tokio::test]
-async fn existing_target_is_preserved_and_no_temporary_remains() {
+async fn approved_overwrite_with_matching_digest_is_audited() {
+    let old_content = "original\n";
+    let new_content = "replacement\n";
+    let old_digest = sha256_hex(old_content.as_bytes());
+    let new_digest = sha256_hex(new_content.as_bytes());
+    let approvals = Arc::new(RecordingApprovals::new(ApprovalDecision::Approved));
+    let harness = Harness::new(
+        task_script_with_digest("existing.txt", new_content, &old_digest),
+        approvals.clone(),
+        HarnessOptions::default(),
+    );
+    harness.write("existing.txt", old_content);
+
+    let outcome = harness
+        .run(TaskBudget::default(), CancellationToken::new())
+        .await;
+
+    assert_eq!(outcome.state(), LoopState::Completed);
+    assert_eq!(
+        std::fs::read_to_string(harness.root().join("existing.txt")).expect("existing file"),
+        new_content
+    );
+    assert!(harness.temporary_files().is_empty());
+    assert_eq!(approvals.requests().len(), 1);
+    assert_eq!(
+        approvals.requests()[0].target.as_deref(),
+        Some("existing.txt")
+    );
+
+    let records = harness.write_audit_records();
+    assert_eq!(records.len(), 1);
+    let metadata = &records[0].metadata;
+    assert_eq!(metadata["path"], "existing.txt");
+    assert_eq!(metadata["created"], false);
+    assert_eq!(metadata["bytes_written"], new_content.len());
+    assert_eq!(metadata["sha256"], new_digest);
+    assert_eq!(metadata["previous_sha256"], old_digest);
+    assert!(!metadata.to_string().contains("replacement"));
+    assert_eq!(harness.verifier.run_calls(), 1);
+}
+
+#[tokio::test]
+async fn overwrite_without_expected_digest_is_rejected() {
     let harness = Harness::new(
         task_script("existing.txt", "replacement\n"),
         Arc::new(AllowApprovals),
@@ -765,7 +862,70 @@ async fn existing_target_is_preserved_and_no_temporary_remains() {
         .filter_map(|message| message.content.as_deref())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(feedback.contains("WRITE_TARGET_EXISTS"), "{feedback}");
+    assert!(feedback.contains("WRITE_HASH_REQUIRED"), "{feedback}");
+}
+
+#[tokio::test]
+async fn overwrite_digest_mismatch_preserves_target() {
+    let harness = Harness::new(
+        task_script_with_digest(
+            "existing.txt",
+            "replacement\n",
+            &sha256_hex(b"different content\n"),
+        ),
+        Arc::new(AllowApprovals),
+        HarnessOptions::default(),
+    );
+    harness.write("existing.txt", "original\n");
+
+    let outcome = harness
+        .run(TaskBudget::default(), CancellationToken::new())
+        .await;
+
+    assert_eq!(
+        std::fs::read_to_string(harness.root().join("existing.txt")).expect("existing file"),
+        "original\n"
+    );
+    assert!(harness.temporary_files().is_empty());
+    let feedback = outcome
+        .context
+        .conversation
+        .iter()
+        .filter_map(|message| message.content.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(feedback.contains("WRITE_HASH_MISMATCH"), "{feedback}");
+}
+
+#[tokio::test]
+async fn target_changed_during_approval_is_rejected() {
+    let old_digest = sha256_hex(b"original\n");
+    let gate = Arc::new(MutateOnApproval::new("changed elsewhere\n"));
+    let harness = Harness::new(
+        task_script_with_digest("existing.txt", "replacement\n", &old_digest),
+        gate.clone(),
+        HarnessOptions::default(),
+    );
+    harness.write("existing.txt", "original\n");
+    gate.arm(harness.root().join("existing.txt"));
+
+    let outcome = harness
+        .run(TaskBudget::default(), CancellationToken::new())
+        .await;
+
+    assert_eq!(
+        std::fs::read_to_string(harness.root().join("existing.txt")).expect("existing file"),
+        "changed elsewhere\n"
+    );
+    assert!(harness.temporary_files().is_empty());
+    let feedback = outcome
+        .context
+        .conversation
+        .iter()
+        .filter_map(|message| message.content.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(feedback.contains("WRITE_HASH_MISMATCH"), "{feedback}");
 }
 
 #[tokio::test]

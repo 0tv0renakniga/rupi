@@ -26,7 +26,7 @@ listed dependencies are accepted.
 
 ## Next Allowed Task
 
-None — `TASK-051-new-file-atomic-write.md` is awaiting acceptance.
+None — `TASK-052-guarded-overwrite-sha256.md` is awaiting acceptance.
 
 ## Status Legend
 
@@ -54,8 +54,8 @@ None — `TASK-051-new-file-atomic-write.md` is awaiting acceptance.
 | TASK-040 | Investigate mode and evidence brief | Accepted | TASK-033 |
 | TASK-041 | Plan mode and durable plan artifact | Accepted | TASK-040 |
 | TASK-050 | Write-file schema and policy preflight | Accepted | TASK-012, TASK-021 |
-| TASK-051 | New-file creation with approval and atomic write | Awaiting review | TASK-050 |
-| TASK-052 | Guarded overwrite with expected SHA-256 | Blocked | TASK-051 |
+| TASK-051 | New-file creation with approval and atomic write | Accepted | TASK-050 |
+| TASK-052 | Guarded overwrite with expected SHA-256 | Awaiting review | TASK-051 |
 | TASK-060 | Script-backed deterministic verifier | Blocked | TASK-012 |
 | TASK-061 | Verification gate integration after mutation | Blocked | TASK-052, TASK-060 |
 | TASK-070 | Change-mode end-to-end disposable-repository pilot | Blocked | TASK-040, TASK-041, TASK-061 |

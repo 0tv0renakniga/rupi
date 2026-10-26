@@ -1,18 +1,21 @@
-"""Bounded new-file creation helper for the versioned script protocol.
+"""Bounded create/overwrite helper for the versioned script protocol.
 
-The helper creates exactly one previously nonexistent UTF-8 text file inside
-the canonical project root. It validates the target and parent through the
-shared ``path_policy`` module, writes a temporary sibling, and publishes the
-new file atomically without replacing an existing target. Failures remove the
-temporary artifact and any parent directories created for this request.
+The helper creates one previously nonexistent UTF-8 text file, or replaces an
+existing regular text file only when its current SHA-256 matches the caller's
+expected digest. It validates the target and parent through the shared
+``path_policy`` module, writes a temporary sibling, and publishes atomically.
+Failures leave the existing target unchanged and remove temporary artifacts and
+any parent directories created for this request.
 """
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -139,11 +142,38 @@ def _execute(request: dict[str, Any]) -> dict[str, Any]:
     relative = policy.authorize_new_file_path(raw_path)
     target = policy.root / relative
     if os.path.lexists(target):
-        raise WriteError(
-            "WRITE_TARGET_EXISTS",
-            f"target file already exists: {relative.as_posix()}",
-        )
+        _regular_file_snapshot(target)
+        if expected_sha256 is None:
+            raise WriteError(
+                "WRITE_HASH_REQUIRED",
+                f"overwriting an existing target requires expected_sha256: {relative.as_posix()}",
+            )
+        previous_sha256 = _overwrite_existing_file(target, payload, expected_sha256)
+        created = False
+    else:
+        _create_new_file(policy, relative, target, payload)
+        previous_sha256 = None
+        created = True
 
+    digest = hashlib.sha256(payload).hexdigest()
+    data = {
+        "path": relative.as_posix(),
+        "created": created,
+        "bytes_written": len(payload),
+        "sha256": digest,
+    }
+    if previous_sha256 is not None:
+        data["previous_sha256"] = previous_sha256
+    return {
+        "protocol_version": PROTOCOL_VERSION,
+        "ok": True,
+        "data": data,
+    }
+
+
+def _create_new_file(
+    policy: PathPolicy, relative: Path, target: Path, payload: bytes
+) -> None:
     created_directories: list[Path] = []
     temporary: Path | None = None
     published = False
@@ -179,17 +209,154 @@ def _execute(request: dict[str, Any]) -> dict[str, Any]:
         if not published:
             _cleanup_directories(created_directories)
 
-    digest = hashlib.sha256(payload).hexdigest()
-    return {
-        "protocol_version": PROTOCOL_VERSION,
-        "ok": True,
-        "data": {
-            "path": relative.as_posix(),
-            "created": True,
-            "bytes_written": len(payload),
-            "sha256": digest,
-        },
-    }
+
+def _overwrite_existing_file(target: Path, payload: bytes, expected: str) -> str:
+    temporary: Path | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{target.name}.rupi-",
+            suffix=".tmp",
+            dir=target.parent,
+        )
+        temporary = Path(temporary_name)
+        try:
+            handle = os.fdopen(descriptor, "wb")
+        except BaseException:
+            os.close(descriptor)
+            raise
+        with handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        current_info = _regular_file_snapshot(target)
+        current_digest = _hash_regular_file(target, current_info)
+        if current_digest != expected:
+            raise WriteError(
+                "WRITE_HASH_MISMATCH",
+                f"target content does not match expected_sha256: {target.name}",
+            )
+        _preserve_mode(temporary, current_info)
+        _assert_unchanged(target, current_info)
+        try:
+            os.replace(temporary, target)
+        except OSError as error:
+            raise WriteError(
+                "WRITE_ATOMIC_REPLACE_FAILED",
+                _safe_reason(error),
+            ) from error
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+    return current_digest
+
+
+def _regular_file_snapshot(target: Path) -> os.stat_result:
+    try:
+        info = os.lstat(target)
+    except FileNotFoundError as error:
+        raise WriteError(
+            "WRITE_TARGET_CHANGED",
+            f"target changed before dispatch: {target.name}",
+        ) from error
+    except OSError as error:
+        raise WriteError("WRITE_FAILED", _safe_reason(error)) from error
+    if not stat.S_ISREG(info.st_mode):
+        raise WriteError(
+            "WRITE_TARGET_NOT_FILE",
+            f"target is not a regular file: {target.name}",
+        )
+    return info
+
+
+def _hash_regular_file(target: Path, expected_info: os.stat_result) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(target, flags)
+    except FileNotFoundError as error:
+        raise WriteError(
+            "WRITE_TARGET_CHANGED",
+            f"target changed before dispatch: {target.name}",
+        ) from error
+    except OSError as error:
+        if error.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise WriteError(
+                "WRITE_TARGET_CHANGED",
+                f"target changed before dispatch: {target.name}",
+            ) from error
+        raise WriteError("WRITE_FAILED", _safe_reason(error)) from error
+
+    try:
+        info = os.fstat(descriptor)
+        if not _same_file(info, expected_info) or not stat.S_ISREG(info.st_mode):
+            raise WriteError(
+                "WRITE_TARGET_CHANGED",
+                f"target changed before dispatch: {target.name}",
+            )
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 64 * 1024):
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        if (after.st_size, after.st_mtime_ns, after.st_ctime_ns) != (
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        ):
+            raise WriteError(
+                "WRITE_TARGET_CHANGED",
+                f"target changed while hashing: {target.name}",
+            )
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _assert_unchanged(target: Path, expected_info: os.stat_result) -> None:
+    try:
+        current = os.lstat(target)
+    except OSError as error:
+        raise WriteError(
+            "WRITE_TARGET_CHANGED",
+            f"target changed before replacement: {target.name}",
+        ) from error
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or not _same_file(current, expected_info)
+        or (
+            current.st_size,
+            current.st_mtime_ns,
+            current.st_ctime_ns,
+        )
+        != (
+            expected_info.st_size,
+            expected_info.st_mtime_ns,
+            expected_info.st_ctime_ns,
+        )
+    ):
+        raise WriteError(
+            "WRITE_TARGET_CHANGED",
+            f"target changed before replacement: {target.name}",
+        )
+
+
+def _preserve_mode(temporary: Path, expected_info: os.stat_result) -> None:
+    try:
+        os.chmod(temporary, stat.S_IMODE(expected_info.st_mode) & 0o777)
+    except OSError as error:
+        raise WriteError(
+            "WRITE_MODE_PRESERVATION_FAILED",
+            "existing file mode could not be preserved",
+        ) from error
 
 
 def _validate_path_text(raw: str) -> None:

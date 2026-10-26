@@ -10,8 +10,9 @@ not commit, push, install packages, or discover endpoints.
   `/usr/bin/python3`. PATH lookup is not used for helper execution.
 - Reviewed helper scripts installed at a canonical directory outside the
   project root. The active read-only inventory is `read_file.py`,
-  `git_status.py`, and `git_diff.py`; `write_file.py` enables approved new-file
-  creation. Change remains gated until the reviewed verifier script exists.
+  `git_status.py`, and `git_diff.py`; `write_file.py` enables approved file
+  creation and digest-guarded replacement. Change remains gated until the
+  reviewed verifier script exists.
 - Rust toolchain, `cargo`, and the verifier tools required by the target
   repository (`rustfmt` for Rust projects).
 - A loopback OpenAI-compatible model server, normally `llama-server` on
@@ -292,32 +293,40 @@ path policy, capability check, or approval prompt. The validated form is
   without NUL or other control characters, and must not escape the project root.
 - `content` must be UTF-8 text of at most 49,152 bytes and must not contain NUL.
 - `expected_sha256`, when present, must be exactly 64 lowercase hexadecimal
-  characters. Upper-case or prefixed digests are rejected.
+  characters. Upper-case or prefixed digests are rejected. A missing target may
+  be created without one; an existing target cannot be replaced without it.
 - `write_file` is rejected in Investigate and Plan modes before approval. A
   denied path or invalid schema never creates an approval prompt or dispatches
   an action.
 - Approval metadata includes only the bounded target path and reason; it never
   includes file content or the expected digest.
 
-Approved Change-mode `write_file` requests are now dispatched to the fixed
-`write_file.py` helper for new-file creation only. The helper revalidates the
-target and parent through the Python path policy, rejects any existing target,
-writes a temporary sibling, and publishes the new file atomically with an
-exclusive hard link so an existing target can never be replaced. Missing parent
-directories inside the permitted project tree are created; on failure, the
-temporary file and any directories created for that request are removed.
+Approved Change-mode `write_file` requests are dispatched to the fixed
+`write_file.py` helper. The helper revalidates the target and parent through the
+Python path policy, writes a temporary sibling, and publishes the result
+atomically. If the target does not exist, it is created with an exclusive hard
+link. If it exists, it must be a regular non-symlink file and the request must
+supply `expected_sha256` matching the target's current content; otherwise the
+write fails without modifying the target. Matching overwrites use an atomic
+replacement and preserve ordinary permission bits where practical. Missing
+parent directories inside the permitted project tree are created for new files;
+on failure, the temporary file and any directories created for that request are
+removed.
 
-New files are limited to 49,152 UTF-8 bytes and the same 256-byte path bound as
-preflight. The helper independently enforces both bounds. Successful writes
-report only the normalized path, byte count, creation flag, and lowercase
-SHA-256 digest. Audit `ScriptFinished` metadata records those safe fields and
-never file content. A successful write marks prior verification stale and the
-orchestrator must run harness-selected verification before review and
-completion.
+The helper rechecks the target identity and metadata while hashing and again
+immediately before replacement. A file that appears, disappears, changes type,
+or changes content after the caller computed the digest is rejected rather than
+overwritten. This narrows the check-to-replace race; it is not a filesystem
+transaction or a defense against an attacker who can already modify the
+repository concurrently.
 
-Guarded overwrite with an expected SHA-256 remains a separate reviewed task.
-Until then, `expected_sha256` does not authorize replacing an existing file;
-existing targets are always rejected.
+Request content is limited to 49,152 UTF-8 bytes and the same 256-byte path
+bound as preflight. The helper independently enforces both bounds. Successful writes
+report only the normalized path, byte count, creation flag, new lowercase
+SHA-256 digest, and, for replacement, the previous digest. Audit
+`ScriptFinished` metadata records those safe fields and never file content. A
+successful write marks prior verification stale and the orchestrator must run
+harness-selected verification before review and completion.
 
 ## Audit evidence
 
