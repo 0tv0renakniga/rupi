@@ -10,7 +10,8 @@ not commit, push, install packages, or discover endpoints.
   `/usr/bin/python3`. PATH lookup is not used for helper execution.
 - Reviewed helper scripts installed at a canonical directory outside the
   project root. The active read-only inventory is `read_file.py`,
-  `git_status.py`, and `git_diff.py`.
+  `git_status.py`, and `git_diff.py`; `write_file.py` enables approved new-file
+  creation. Change remains gated until the reviewed verifier script exists.
 - Rust toolchain, `cargo`, and the verifier tools required by the target
   repository (`rustfmt` for Rust projects).
 - A loopback OpenAI-compatible model server, normally `llama-server` on
@@ -30,8 +31,8 @@ pinned.
 ## Minimal production-safe configuration
 
 The default execution backend is the fixed script substrate. Investigate is the
-first enabled workflow; Change is gated until reviewed `write_file.py` and
-`run_verifier.py` scripts are installed.
+first enabled workflow. Change remains gated until the reviewed
+`run_verifier.py` script is installed.
 
 ```sh
 export HARNESS_ROOT=/srv/harness/workspace
@@ -94,7 +95,7 @@ cargo run
 
 Use a disposable repository for the first live task. Investigate is selected by
 default when Change is gated. Confirm the audit file and evidence brief exist
-before installing write/verifier scripts.
+before installing the verifier script.
 
 ## Path policy
 
@@ -246,11 +247,11 @@ the orchestrator as a `ToolExecutor`. Investigate tasks dispatch through that
 script runner; no MCP runtime, server, profile, digest, or Bubblewrap startup is
 required.
 
-The TUI shows Change as gated when `write_file.py` or `run_verifier.py` is not
-installed. The worker also rejects a Change submission defensively. MCP is never
-selected as an automatic fallback. The script inventory and installed location
-are resolved at startup; release packaging and checksum verification remain
-separate release work.
+The TUI shows Change as gated when `run_verifier.py` is not installed. The
+worker also rejects a Change submission defensively. MCP is never selected as
+an automatic fallback. The script inventory and installed location are resolved
+at startup; release packaging and checksum verification remain separate release
+work.
 
 ## Plan mode
 
@@ -298,8 +299,25 @@ path policy, capability check, or approval prompt. The validated form is
 - Approval metadata includes only the bounded target path and reason; it never
   includes file content or the expected digest.
 
-This task sequence does not dispatch writes yet. New-file creation and guarded
-overwrite are separate reviewed tasks.
+Approved Change-mode `write_file` requests are now dispatched to the fixed
+`write_file.py` helper for new-file creation only. The helper revalidates the
+target and parent through the Python path policy, rejects any existing target,
+writes a temporary sibling, and publishes the new file atomically with an
+exclusive hard link so an existing target can never be replaced. Missing parent
+directories inside the permitted project tree are created; on failure, the
+temporary file and any directories created for that request are removed.
+
+New files are limited to 49,152 UTF-8 bytes and the same 256-byte path bound as
+preflight. The helper independently enforces both bounds. Successful writes
+report only the normalized path, byte count, creation flag, and lowercase
+SHA-256 digest. Audit `ScriptFinished` metadata records those safe fields and
+never file content. A successful write marks prior verification stale and the
+orchestrator must run harness-selected verification before review and
+completion.
+
+Guarded overwrite with an expected SHA-256 remains a separate reviewed task.
+Until then, `expected_sha256` does not authorize replacing an existing file;
+existing targets are always rejected.
 
 ## Audit evidence
 

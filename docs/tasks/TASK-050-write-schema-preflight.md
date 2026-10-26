@@ -1,7 +1,7 @@
 # TASK-050 — Write-File Schema and Policy Preflight
 
 **Initial status:** Blocked
-**Status:** Awaiting review
+**Status:** Accepted
 **Depends on:** TASK-012 and TASK-021 accepted
 
 ## Goal

@@ -69,7 +69,7 @@ pub struct ScriptPreflight {
 /// Build the default active execution profile.
 ///
 /// The read-only action set is mandatory because Investigate is the first
-/// supported workflow. Missing write/verifier scripts leave Change gated rather
+/// supported workflow. A missing verifier script leaves Change gated rather
 /// than selecting another backend.
 pub fn build(config: &Config) -> Result<ScriptRuntime> {
     let policy = Policy::new(config.root.clone()).map_err(|error| {
@@ -161,7 +161,7 @@ mod tests {
     }
 
     #[test]
-    fn detects_read_only_and_gates_change_until_write_scripts_exist() {
+    fn detects_read_only_and_gates_change_until_verifier_exists() {
         let (base, project, scripts) = fixture();
         let runner = ScriptRunner::new_with_timeout(
             &project,

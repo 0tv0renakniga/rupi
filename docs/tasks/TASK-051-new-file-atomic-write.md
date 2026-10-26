@@ -1,6 +1,7 @@
 # TASK-051 — New-File Creation with Approval and Atomic Write
 
 **Initial status:** Blocked  
+**Status:** Awaiting review
 **Depends on:** TASK-050 accepted
 
 ## Goal
@@ -10,8 +11,9 @@ Implement approved creation of a previously nonexistent UTF-8 text file.
 ## Scope
 
 Create `scripts/write_file.py` new-file behavior only. Require matching active
-approval; validate parent; write temporary sibling; atomically rename; clean up
-on error; record redacted audit evidence; invalidate verification after success.
+approval; validate parent; write temporary sibling; atomically publish
+without overwrite; clean up on error; record redacted audit evidence;
+invalidate verification after success.
 
 ## Required Tests / Evidence
 

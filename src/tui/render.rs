@@ -236,7 +236,7 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &AppState) {
         Line::from(if app.change_available {
             "F2           cycle Change/Investigate/Plan mode before submission"
         } else {
-            "F2           cycle Investigate/Plan; Change is gated until write scripts exist"
+            "F2           cycle Investigate/Plan; Change is gated until the verifier script exists"
         }),
         Line::from("Esc          deny approval; close help; interrupt is unsupported"),
         Line::from("Ctrl-C       cancel active task; quit when idle"),

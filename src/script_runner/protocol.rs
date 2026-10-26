@@ -283,7 +283,7 @@ impl ScriptOutcome {
             .as_deref()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_else(|| self.action.script_file_name().to_owned());
-        json!({
+        let mut metadata = json!({
             "action": self.action.as_str(),
             "script": script,
             "script_file": self.action.script_file_name(),
@@ -292,7 +292,32 @@ impl ScriptOutcome {
             "protocol_version": self.protocol_version,
             "duration_ms": u64::try_from(self.duration.as_millis()).unwrap_or(u64::MAX),
             "exit_code": self.exit_code,
-        })
+        });
+
+        if self.action == ActionId::WriteFile
+            && self.ok
+            && let Some(data) = self.data.as_ref()
+        {
+            if let Some(path) = data.get("path").and_then(Value::as_str) {
+                metadata["path"] = Value::String(bounded_audit_text(path, 256));
+            }
+            if let Some(bytes_written) = data.get("bytes_written").and_then(Value::as_u64) {
+                metadata["bytes_written"] = Value::from(bytes_written);
+            }
+            if let Some(sha256) = data.get("sha256").and_then(Value::as_str)
+                && sha256.len() == 64
+                && sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+            {
+                metadata["sha256"] = Value::String(sha256.to_owned());
+            }
+            if let Some(created) = data.get("created").and_then(Value::as_bool) {
+                metadata["created"] = Value::Bool(created);
+            }
+        }
+
+        metadata
     }
 
     /// Build one bounded audit record for this action.
@@ -440,6 +465,20 @@ fn sanitize_message(raw: &str) -> String {
         return "helper script reported an error without a message".to_owned();
     }
     bound_text(trimmed, MAX_ERROR_MESSAGE_BYTES)
+}
+
+fn bounded_audit_text(text: &str, cap: usize) -> String {
+    let sanitized = text
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    bound_text(&sanitized, cap)
 }
 
 fn bound_text(text: &str, cap: usize) -> String {
@@ -600,6 +639,46 @@ mod tests {
         assert_eq!(
             ScriptResponse::parse_stdout(&multiple),
             Err(ProtocolErrorCode::TrailingProtocolData)
+        );
+    }
+
+    #[test]
+    fn write_audit_metadata_includes_only_safe_fields() {
+        let digest = "ab".repeat(32);
+        let outcome = ScriptOutcome::success(
+            ActionId::WriteFile,
+            None,
+            json!({
+                "path": "src/new\nfile.txt",
+                "created": true,
+                "bytes_written": 12,
+                "sha256": digest,
+                "content": "WRITE_CONTENT_SECRET"
+            }),
+            None,
+            Some(0),
+        );
+        let metadata = outcome.audit_metadata();
+        assert_eq!(metadata["action"], "write_file");
+        assert_eq!(metadata["path"], "src/new file.txt");
+        assert_eq!(metadata["created"], true);
+        assert_eq!(metadata["bytes_written"], 12);
+        assert_eq!(metadata["sha256"], digest);
+        assert!(metadata.get("content").is_none());
+        assert!(!metadata.to_string().contains("WRITE_CONTENT_SECRET"));
+
+        let read = ScriptOutcome::success(
+            ActionId::ReadFile,
+            None,
+            json!({"path": "src/lib.rs", "content": "READ_CONTENT_SECRET"}),
+            None,
+            Some(0),
+        );
+        assert!(
+            !read
+                .audit_metadata()
+                .to_string()
+                .contains("READ_CONTENT_SECRET")
         );
     }
 

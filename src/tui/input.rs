@@ -138,7 +138,7 @@ fn handle_task_entry(app: &mut AppState, key: KeyEvent, ctrl: bool, alt: bool) -
                 TaskMode::Plan => {
                     app.push_notice(
                         TranscriptKind::Warning,
-                        "Change mode is gated until reviewed write and verifier scripts are installed",
+                        "Change mode is gated until the reviewed verifier script is installed",
                     );
                     TaskMode::Investigate
                 }
@@ -202,7 +202,7 @@ fn submit_task(app: &mut AppState) -> Option<Command> {
     if app.selected_mode == TaskMode::Change && !app.change_available {
         app.push_notice(
             TranscriptKind::Warning,
-            "Change mode is gated until reviewed write and verifier scripts are installed",
+            "Change mode is gated until the reviewed verifier script is installed",
         );
         return None;
     }

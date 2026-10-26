@@ -1,9 +1,10 @@
-//! Read-only adapter from canonical model actions to fixed helper scripts.
+//! Adapter from canonical model actions to fixed helper scripts.
 //!
-//! This module deliberately recognizes only `read_file`, `git_status`, and
-//! `git_diff`. Mutation-capable actions are rejected before approval or
-//! execution. The adapter owns no shell, executable, or script selection:
-//! [`ActionId`] resolves every helper from the harness-owned script inventory.
+//! This module recognizes the accepted read-only actions plus the narrow
+//! new-file `write_file` action. `write_file` does not overwrite existing
+//! targets. Other mutation-capable actions are rejected before execution. The
+//! adapter owns no shell, executable, or script selection: [`ActionId`]
+//! resolves every helper from the harness-owned script inventory.
 
 use std::sync::Arc;
 
@@ -19,7 +20,7 @@ use crate::orchestrator::{TaskId, ToolExecutor};
 use crate::policy::Policy;
 use crate::script_runner::{ActionId, ScriptOutcome, ScriptRunner};
 
-/// Script-backed executor for the fixed read-only action inventory.
+/// Script-backed executor for the fixed read-only and new-file action inventory.
 #[derive(Clone)]
 pub struct ScriptToolExecutor {
     runner: ScriptRunner,
@@ -82,7 +83,7 @@ impl ScriptToolExecutor {
         }
 
         let (action, params) =
-            action_and_params(tool).expect("capability preflight verified read-only action");
+            action_and_params(tool).expect("capability preflight verified supported action");
         let result = match task_id {
             Some(task_id) => {
                 self.runner
@@ -119,7 +120,7 @@ impl ScriptToolExecutor {
 impl ToolExecutor for ScriptToolExecutor {
     fn authorize(&self, tool: &AgentTool) -> std::result::Result<(), String> {
         if action_and_params(tool).is_none() {
-            return Err("the read-only script executor cannot dispatch this action".to_owned());
+            return Err("the script executor cannot dispatch this action".to_owned());
         }
         self.policy
             .authorize(tool)
@@ -129,7 +130,7 @@ impl ToolExecutor for ScriptToolExecutor {
     fn check_capability(&self, tool: &AgentTool) -> std::result::Result<(), String> {
         let Some((action, _)) = action_and_params(tool) else {
             return Err(format!(
-                "capability unavailable: `{}` is not a read-only script action",
+                "capability unavailable: `{}` is not a supported script action",
                 crate::mcp::CapabilityManifest::capability_name(tool)
             ));
         };
@@ -158,8 +159,8 @@ impl ToolExecutor for ScriptToolExecutor {
 
 /// Exact canonical action to script action/parameter mapping.
 ///
-/// Only accepted read-only forms have a mapping. Optional fields are omitted
-/// when absent rather than sent as JSON null.
+/// Only accepted forms have a mapping. Optional fields are omitted when absent
+/// rather than sent as JSON null.
 fn action_and_params(tool: &AgentTool) -> Option<(ActionId, Map<String, Value>)> {
     match tool {
         AgentTool::ReadFile {
@@ -183,10 +184,25 @@ fn action_and_params(tool: &AgentTool) -> Option<(ActionId, Map<String, Value>)>
             params.insert("staged".into(), Value::Bool(*staged));
             Some((ActionId::GitDiff, params))
         }
-        AgentTool::WriteFile { .. }
-        | AgentTool::ApplyPatch { .. }
-        | AgentTool::RunCommand { .. }
-        | AgentTool::McpTool { .. } => None,
+        AgentTool::WriteFile {
+            path,
+            content,
+            expected_sha256,
+        } => {
+            let mut params = Map::new();
+            params.insert("path".into(), Value::String(path.clone()));
+            params.insert("content".into(), Value::String(content.clone()));
+            if let Some(expected_sha256) = expected_sha256 {
+                params.insert(
+                    "expected_sha256".into(),
+                    Value::String(expected_sha256.clone()),
+                );
+            }
+            Some((ActionId::WriteFile, params))
+        }
+        AgentTool::ApplyPatch { .. } | AgentTool::RunCommand { .. } | AgentTool::McpTool { .. } => {
+            None
+        }
     }
 }
 
@@ -238,8 +254,17 @@ fn render_success(outcome: &ScriptOutcome) -> std::result::Result<String, String
                 "git_diff staged={staged} truncated={truncated}\n\n{diff}"
             ))
         }
-        ActionId::WriteFile | ActionId::RunVerifier => Err(format!(
-            "script action `{}` is not a read-only action",
+        ActionId::WriteFile => {
+            let path = string_field(data, "path")?;
+            let created = bool_field(data, "created")?;
+            let bytes_written = number_field(data, "bytes_written")?;
+            let sha256 = string_field(data, "sha256")?;
+            Ok(format!(
+                "write_file path={path} created={created} bytes_written={bytes_written} sha256={sha256}"
+            ))
+        }
+        ActionId::RunVerifier => Err(format!(
+            "script action `{}` is not a supported action",
             action.as_str()
         )),
     }
@@ -255,6 +280,12 @@ fn bool_field(data: &Value, key: &str) -> std::result::Result<bool, String> {
     data.get(key)
         .and_then(Value::as_bool)
         .ok_or_else(|| format!("helper returned malformed data: `{key}` must be a boolean"))
+}
+
+fn number_field(data: &Value, key: &str) -> std::result::Result<u64, String> {
+    data.get(key)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("helper returned malformed data: `{key}` must be a number"))
 }
 
 fn optional_number_field(data: &Value, key: &str) -> std::result::Result<String, String> {

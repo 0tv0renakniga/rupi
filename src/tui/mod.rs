@@ -93,7 +93,7 @@ async fn prepare(config: &Config) -> Result<PreparedApp> {
         app.push_notice(
             TranscriptKind::Warning,
             &format!(
-                "Change mode is gated until reviewed write/verifier scripts are installed: {}",
+                "Change mode is gated until the reviewed verifier script is installed: {}",
                 runtime.capabilities.missing_file_names().join(", ")
             ),
         );
@@ -353,8 +353,8 @@ mod tests {
             .map(|entry| entry.text.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(warnings.contains("write_file.py"), "{warnings}");
         assert!(warnings.contains("run_verifier.py"), "{warnings}");
+        assert!(!warnings.contains("write_file.py"), "{warnings}");
     }
 
     #[tokio::test]

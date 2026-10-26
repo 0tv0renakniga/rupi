@@ -153,8 +153,13 @@ task complete.
   Change-mode schema preflight: a bounded relative path, bounded NUL-free UTF-8
   content, and an optional 64-character lowercase SHA-256 digest. Schema or
   path denial occurs before capability checks and approval; approval metadata
-  never contains file content. No write dispatch is enabled in this task
-  sequence.
+  never contains file content. Approved Change-mode writes dispatch only to the
+  fixed new-file helper, which revalidates the target and parent, rejects
+  existing targets, writes a temporary sibling, and publishes atomically without
+  replacing an existing target. Successful write audit metadata is limited to
+  the normalized path, byte count, creation flag, and digest; file content is
+  never persisted in audit or approval data. Guarded overwrite remains disabled
+  until a later reviewed task.
 - Context compaction preserves the system policy, task objective, plan, and
   verification evidence while dropping or bounding older messages. Tool output,
   plan text, review evidence, audit records, and event payloads are bounded and

@@ -129,7 +129,7 @@ async fn run_worker(
                 if mode == TaskMode::Change && !settings.change_available {
                     let _ = sink
                         .send_critical(AgentEvent::Failed {
-                            reason: "Change mode is gated until reviewed write and verifier scripts are installed"
+                            reason: "Change mode is gated until the reviewed verifier script is installed"
                                 .into(),
                         })
                         .await;

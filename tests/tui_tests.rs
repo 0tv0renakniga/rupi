@@ -119,7 +119,7 @@ fn f2_cycles_through_plan_mode_before_submission() {
 }
 
 #[test]
-fn change_mode_is_gated_when_write_scripts_are_unavailable() {
+fn change_mode_is_gated_when_verifier_script_is_unavailable() {
     let mut app = AppState::default();
     app.change_available = false;
     app.selected_mode = TaskMode::Plan;

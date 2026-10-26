@@ -288,13 +288,18 @@ fn headless_preflight_uses_scripts_and_does_not_read_mcp_configuration() {
             .iter()
             .map(|(action, _)| *action)
             .collect::<Vec<_>>(),
-        vec![ActionId::ReadFile, ActionId::GitStatus, ActionId::GitDiff]
+        vec![
+            ActionId::ReadFile,
+            ActionId::GitStatus,
+            ActionId::GitDiff,
+            ActionId::WriteFile,
+        ]
     );
     assert!(preflight.capabilities.read_only_ready());
     assert!(!preflight.capabilities.change_ready());
     assert_eq!(
         preflight.capabilities.missing_file_names(),
-        vec!["write_file.py", "run_verifier.py"]
+        vec!["run_verifier.py"]
     );
     assert!(preflight.audit_path.starts_with(&project));
 }
