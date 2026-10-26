@@ -25,6 +25,12 @@ class PathPolicyTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, code)
         return raised.exception
 
+    def symlink(self, target, link):
+        try:
+            os.symlink(target, link)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation is unavailable")
+
     def test_canonicalizes_root_and_accepts_nested_paths(self):
         self.assertEqual(self.policy.root, self.root.resolve())
         self.assertEqual(self.policy.authorize_path("src/main.rs"), Path("src/main.rs"))
@@ -77,6 +83,59 @@ class PathPolicyTests(unittest.TestCase):
             self.assertEqual(authorize("src/new_module.rs"), Path("src/new_module.rs"))
             self.assert_code("../outside.txt", "PATH_TRAVERSAL", authorize)
             self.assert_code(".ai-wiki/plans/task.md", "PATH_SENSITIVE", authorize)
+
+    def test_rejects_existing_and_parent_symlink_escapes(self):
+        with tempfile.TemporaryDirectory(prefix="rupi-script-path-outside-") as directory:
+            outside = Path(directory)
+            (outside / "secret.txt").write_text("outside", encoding="utf-8")
+            self.symlink(outside / "secret.txt", self.root / "linked-file")
+            self.symlink(outside, self.root / "linked-parent")
+            self.symlink(outside / "missing.txt", self.root / "broken-link")
+            self.symlink("loop", self.root / "loop")
+
+            for path in ("linked-file", "linked-parent/secret.txt"):
+                self.assert_code(
+                    path, "PATH_SYMLINK_ESCAPE", self.policy.authorize_existing_path
+                )
+            for path in ("linked-parent/new.txt", "broken-link", "loop"):
+                self.assert_code(
+                    path, "PATH_SYMLINK_ESCAPE", self.policy.authorize_new_file_path
+                )
+            self.assert_code("linked-parent/secret.txt", "PATH_SYMLINK_ESCAPE")
+
+    def test_allows_in_root_symlinks_and_missing_nested_parents(self):
+        (self.root / "real").mkdir()
+        (self.root / "real" / "inside.txt").write_text("inside", encoding="utf-8")
+        self.symlink(self.root / "real" / "inside.txt", self.root / "inside-link")
+        self.symlink(self.root / "real", self.root / "real-link")
+
+        self.assertEqual(
+            self.policy.authorize_existing_path("inside-link"), Path("inside-link")
+        )
+        self.assertEqual(
+            self.policy.authorize_existing_path("real-link/inside.txt"),
+            Path("real-link/inside.txt"),
+        )
+        self.assertEqual(
+            self.policy.authorize_new_file_path("real-link/new.txt"),
+            Path("real-link/new.txt"),
+        )
+        self.assertEqual(
+            self.policy.authorize_new_file_path("missing/nested/file.txt"),
+            Path("missing/nested/file.txt"),
+        )
+
+    def test_symlinks_cannot_bypass_sensitive_paths(self):
+        (self.root / ".env").write_text("SECRET", encoding="utf-8")
+        (self.root / ".ssh").mkdir()
+        (self.root / ".ssh" / "key").write_text("SECRET", encoding="utf-8")
+        self.symlink(self.root / ".env", self.root / "env-link")
+        self.symlink(self.root / ".ssh", self.root / "ssh-link")
+
+        self.assert_code("env-link", "PATH_SENSITIVE", self.policy.authorize_existing_path)
+        self.assert_code(
+            "ssh-link/new-key", "PATH_SENSITIVE", self.policy.authorize_new_file_path
+        )
 
     def test_root_errors_have_stable_codes(self):
         missing = self.root / "missing"

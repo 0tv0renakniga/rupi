@@ -2,9 +2,8 @@
 
 The Rust orchestrator uses ``src/path_policy.rs``; helper scripts use this
 module. Both enforce the same repository-relative rules and stable ``PATH_*``
-error codes. Symlink-escape hardening for existing targets and new-file parents
-is extended by TASK-021; the existing nearest-ancestor containment check is kept
-here so the script layer does not become weaker than pre-dispatch policy.
+error codes. Existing targets and the nearest existing ancestor of proposed new
+files are resolved through symlinks; escapes and unresolvable links fail closed.
 """
 
 from __future__ import annotations
@@ -142,11 +141,19 @@ class PathPolicy:
         return relative
 
     def authorize_existing_path(self, raw: str) -> Path:
-        """Validate a path that should identify an existing target."""
+        """Validate a path that should identify an existing target.
+
+        Existing targets and the nearest existing ancestor are resolved through
+        symlinks. Existence and target-type checks remain with the caller.
+        """
         return self.authorize_path(raw)
 
     def authorize_new_file_path(self, raw: str) -> Path:
-        """Validate a proposed new-file path whose final component may not exist."""
+        """Validate a proposed new-file path whose final component may not exist.
+
+        The nearest existing ancestor, including symlinked parent directories,
+        must resolve inside the canonical root and outside sensitive targets.
+        """
         return self.authorize_path(raw)
 
     def is_sensitive(self, path: Path) -> bool:
@@ -168,21 +175,43 @@ class PathPolicy:
     def _reject_symlink_escape(self, relative: Path, requested: str) -> None:
         candidate = self.root / relative
         existing = candidate
-        while existing != self.root and not existing.exists():
-            existing = existing.parent
-        if not existing.exists():
-            return
+        while True:
+            try:
+                existing.lstat()
+                break
+            except FileNotFoundError:
+                if existing == self.root:
+                    return
+                parent = existing.parent
+                if parent == existing:
+                    return
+                existing = parent
+            except OSError as error:
+                raise PathPolicyError(
+                    "PATH_SYMLINK_ESCAPE",
+                    f"symlink path is not contained by the project root: {requested}",
+                ) from error
 
         try:
             resolved = existing.resolve(strict=True)
-        except OSError:
-            return
+        except (OSError, RuntimeError) as error:
+            raise PathPolicyError(
+                "PATH_SYMLINK_ESCAPE",
+                f"symlink path is not contained by the project root: {requested}",
+            ) from error
+
         try:
-            resolved.relative_to(self.root)
+            resolved_relative = resolved.relative_to(self.root)
         except ValueError as error:
             raise PathPolicyError(
-                "PATH_TRAVERSAL", f"path escapes the project root: {requested}"
+                "PATH_SYMLINK_ESCAPE",
+                f"symlink path is not contained by the project root: {requested}",
             ) from error
+
+        if resolved != self.root and self.is_sensitive(resolved_relative):
+            raise PathPolicyError(
+                "PATH_SENSITIVE", f"sensitive path is denied: {requested}"
+            )
 
 
 def _is_drive_or_root_component(part: str) -> bool:

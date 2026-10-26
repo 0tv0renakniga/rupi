@@ -177,6 +177,133 @@ fn existing_and_new_file_apis_share_root_and_sensitive_semantics() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn rejects_existing_and_parent_symlink_escapes() {
+    use std::os::unix::fs::symlink;
+
+    let root = TempRoot::new("symlink-escape");
+    let outside = TempRoot::new("symlink-outside");
+    std::fs::write(outside.path.join("secret.txt"), "outside").expect("outside secret");
+    symlink(
+        outside.path.join("secret.txt"),
+        root.path.join("linked-file"),
+    )
+    .expect("file symlink");
+    symlink(&outside.path, root.path.join("linked-parent")).expect("parent symlink");
+    symlink(
+        outside.path.join("missing.txt"),
+        root.path.join("broken-link"),
+    )
+    .expect("broken symlink");
+    symlink("loop", root.path.join("loop")).expect("symlink loop");
+
+    let policy = root.policy();
+    for path in ["linked-file", "linked-parent/secret.txt"] {
+        assert_eq!(
+            code(
+                policy
+                    .authorize_existing_path(path)
+                    .expect_err("existing symlink escape")
+            ),
+            "PATH_SYMLINK_ESCAPE",
+            "{path}"
+        );
+    }
+    for path in ["linked-parent/new.txt", "broken-link", "loop"] {
+        assert_eq!(
+            code(
+                policy
+                    .authorize_new_file_path(path)
+                    .expect_err("new-file symlink escape")
+            ),
+            "PATH_SYMLINK_ESCAPE",
+            "{path}"
+        );
+    }
+    assert_eq!(
+        code(
+            policy
+                .authorize_path("linked-parent/secret.txt")
+                .expect_err("generic symlink escape")
+        ),
+        "PATH_SYMLINK_ESCAPE"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn allows_in_root_symlinks_and_missing_nested_parents() {
+    use std::os::unix::fs::symlink;
+
+    let root = TempRoot::new("symlink-inside");
+    std::fs::create_dir_all(root.path.join("real")).expect("real directory");
+    std::fs::write(root.path.join("real/inside.txt"), "inside").expect("inside file");
+    symlink(
+        root.path.join("real/inside.txt"),
+        root.path.join("inside-link"),
+    )
+    .expect("inside file symlink");
+    symlink(root.path.join("real"), root.path.join("real-link")).expect("inside directory symlink");
+
+    let policy = root.policy();
+    assert_eq!(
+        policy
+            .authorize_existing_path("inside-link")
+            .expect("inside file symlink"),
+        PathBuf::from("inside-link")
+    );
+    assert_eq!(
+        policy
+            .authorize_existing_path("real-link/inside.txt")
+            .expect("inside parent symlink"),
+        PathBuf::from("real-link/inside.txt")
+    );
+    assert_eq!(
+        policy
+            .authorize_new_file_path("real-link/new.txt")
+            .expect("new file under inside symlink"),
+        PathBuf::from("real-link/new.txt")
+    );
+    assert_eq!(
+        policy
+            .authorize_new_file_path("missing/nested/file.txt")
+            .expect("missing nested parent"),
+        PathBuf::from("missing/nested/file.txt")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinks_cannot_bypass_sensitive_paths() {
+    use std::os::unix::fs::symlink;
+
+    let root = TempRoot::new("symlink-sensitive");
+    std::fs::write(root.path.join(".env"), "SECRET").expect("sensitive file");
+    std::fs::create_dir_all(root.path.join(".ssh")).expect("sensitive directory");
+    std::fs::write(root.path.join(".ssh/key"), "SECRET").expect("sensitive key");
+    symlink(root.path.join(".env"), root.path.join("env-link")).expect("sensitive file symlink");
+    symlink(root.path.join(".ssh"), root.path.join("ssh-link")).expect("sensitive dir symlink");
+
+    let policy = root.policy();
+    assert_eq!(
+        code(
+            policy
+                .authorize_existing_path("env-link")
+                .expect_err("sensitive file alias")
+        ),
+        "PATH_SENSITIVE"
+    );
+    assert_eq!(
+        code(
+            policy
+                .authorize_new_file_path("ssh-link/new-key")
+                .expect_err("sensitive directory alias")
+        ),
+        "PATH_SENSITIVE"
+    );
+}
+
 #[test]
 fn root_construction_fails_closed_with_stable_codes() {
     let base = TempRoot::new("root-errors");

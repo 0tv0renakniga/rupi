@@ -3,9 +3,8 @@
 //! The orchestrator and fixed helper scripts use the same repository-relative
 //! path contract: absolute paths, empty paths, NUL bytes, root traversal,
 //! harness-private locations, and sensitive credential patterns are denied.
-//! Symlink-escape hardening for existing targets and new-file parents is
-//! tracked by TASK-021; this module keeps the pre-existing nearest-ancestor
-//! containment check while providing stable codes for both path intents.
+//! Existing targets and the nearest existing ancestor of proposed new files are
+//! resolved through symlinks; escapes and unresolvable links fail closed.
 
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
@@ -79,6 +78,9 @@ pub enum PathPolicyError {
     #[error("[PATH_TRAVERSAL] path escapes the project root: {0}")]
     Traversal(String),
 
+    #[error("[PATH_SYMLINK_ESCAPE] symlink path is not contained by the project root: {0}")]
+    SymlinkEscape(String),
+
     #[error("[PATH_SENSITIVE] sensitive path is denied: {0}")]
     SensitivePath(String),
 }
@@ -93,6 +95,7 @@ impl PathPolicyError {
             Self::NulByte => "PATH_NUL",
             Self::AbsolutePath(_) => "PATH_ABSOLUTE",
             Self::Traversal(_) => "PATH_TRAVERSAL",
+            Self::SymlinkEscape(_) => "PATH_SYMLINK_ESCAPE",
             Self::SensitivePath(_) => "PATH_SENSITIVE",
         }
     }
@@ -206,19 +209,19 @@ impl PathPolicy {
 
     /// Validate a path that should identify an existing target.
     ///
-    /// Existence and target-type checks remain with the caller; this method
-    /// applies the same root, traversal, sensitive-path, and containment
-    /// semantics as pre-dispatch authorization. TASK-021 hardens existing-target
-    /// symlink resolution.
+    /// Existing targets and the nearest existing ancestor are resolved through
+    /// symlinks. Existence and target-type checks remain with the caller; this
+    /// method applies the shared root, traversal, sensitive-path, and
+    /// containment semantics as pre-dispatch authorization.
     pub fn authorize_existing_path(&self, raw: &str) -> Result<PathBuf, PathPolicyError> {
         self.authorize_path(raw)
     }
 
     /// Validate a proposed new-file path.
     ///
-    /// The final component may not exist. The nearest existing ancestor must
-    /// remain inside the canonical root. TASK-021 hardens new-parent symlink
-    /// resolution.
+    /// The final component may not exist. The nearest existing ancestor, which
+    /// may include symlinked parent directories, must resolve inside the
+    /// canonical root and outside sensitive targets.
     pub fn authorize_new_file_path(&self, raw: &str) -> Result<PathBuf, PathPolicyError> {
         self.authorize_path(raw)
     }
@@ -252,27 +255,42 @@ impl PathPolicy {
         requested: &str,
     ) -> Result<(), PathPolicyError> {
         let candidate = self.root.join(relative);
-        let Some(existing) = deepest_existing_ancestor(&candidate) else {
+        let Some(existing) = deepest_existing_entry(&candidate)
+            .map_err(|_| PathPolicyError::SymlinkEscape(requested.to_owned()))?
+        else {
             return Ok(());
         };
 
-        match existing.canonicalize() {
-            Ok(resolved) if resolved.starts_with(&self.root) => Ok(()),
-            Ok(_) => Err(PathPolicyError::Traversal(requested.to_owned())),
-            Err(_) => Ok(()),
+        let resolved = existing
+            .canonicalize()
+            .map_err(|_| PathPolicyError::SymlinkEscape(requested.to_owned()))?;
+        if !resolved.starts_with(&self.root) {
+            return Err(PathPolicyError::SymlinkEscape(requested.to_owned()));
         }
+
+        let resolved_relative = resolved
+            .strip_prefix(&self.root)
+            .map_err(|_| PathPolicyError::SymlinkEscape(requested.to_owned()))?;
+        if !resolved_relative.as_os_str().is_empty() && self.is_sensitive(resolved_relative) {
+            return Err(PathPolicyError::SensitivePath(requested.to_owned()));
+        }
+
+        Ok(())
     }
 }
 
-fn deepest_existing_ancestor(path: &Path) -> Option<&Path> {
+fn deepest_existing_entry(path: &Path) -> std::io::Result<Option<&Path>> {
     let mut current = Some(path);
     while let Some(candidate) = current {
-        if candidate.exists() {
-            return Some(candidate);
+        match std::fs::symlink_metadata(candidate) {
+            Ok(_) => return Ok(Some(candidate)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                current = candidate.parent();
+            }
+            Err(error) => return Err(error),
         }
-        current = candidate.parent();
     }
-    None
+    Ok(None)
 }
 
 fn lowercase_set(values: impl IntoIterator<Item = String>) -> BTreeSet<String> {

@@ -293,11 +293,11 @@ mod tests {
         let policy = Policy::new(&root).expect("policy");
         assert!(matches!(
             policy.authorize_path("linked-file"),
-            Err(PolicyViolation::Path(PathPolicyError::Traversal(_)))
+            Err(PolicyViolation::Path(PathPolicyError::SymlinkEscape(_)))
         ));
         assert!(matches!(
             policy.authorize_path("linked-dir/secret.txt"),
-            Err(PolicyViolation::Path(PathPolicyError::Traversal(_)))
+            Err(PolicyViolation::Path(PathPolicyError::SymlinkEscape(_)))
         ));
         assert!(policy.authorize_path("linked-inside").is_ok());
 

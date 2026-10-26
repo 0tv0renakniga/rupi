@@ -103,6 +103,12 @@ existing-path and proposed new-file checks. It denies credential names and
 directories (for example `.env`, `.ssh`, `credentials.json`, and key material)
 plus the harness-private `.harness-audit/` and `.ai-wiki/` trees. Matching is by
 path component, file name, and extension, not by substring over the whole path.
+
+Existing targets and the nearest existing ancestor of a proposed new file are
+resolved through symlinks. In-root symlinks are allowed only when the resolved
+target remains inside the canonical root and is not sensitive. Escaping, broken,
+looping, or otherwise unresolvable symlink paths fail closed with
+`PATH_SYMLINK_ESCAPE`; resolved sensitive aliases fail with `PATH_SENSITIVE`.
 Policy errors use stable `PATH_*` codes and bound the echoed path to 256 bytes.
 
 ## Script runtime boundary
