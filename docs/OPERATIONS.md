@@ -426,10 +426,12 @@ write failed.
 
 ### Verification failure or blocked task
 
-The audit `verification_finished` record contains the bounded failure tail. A
-failed verification returns the task to `Act` only within the retry budget; when
-the budget is exhausted the task becomes `Blocked`. Do not claim completion
-manually. Inspect the workspace diff, fix the cause, and start a new task.
+The audit `verification_finished` record contains the bounded failure tail.
+Detection failures, execution errors, and missing profiles also produce a failed
+record rather than silently skipping verification. A failed verification returns
+the task to `Act` only within the retry budget; when the budget is exhausted the
+task becomes `Blocked`. Do not claim completion manually. Inspect the workspace
+diff, fix the cause, and start a new task.
 
 Verification commands are selected in Rust and executed one bounded argv
 command at a time through the fixed `run_verifier.py` helper; the model cannot

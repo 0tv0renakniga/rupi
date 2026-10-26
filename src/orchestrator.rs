@@ -1613,6 +1613,8 @@ impl Orchestrator {
         let commands = match detected {
             Ok(commands) => commands,
             Err(error) => {
+                let detail = self.summary(&error.to_string(), 512);
+                let reason = format!("verification detection failed: {detail}");
                 self.events.emit(AgentEvent::VerificationFinished {
                     passed: false,
                     summary: "verification detection failed".into(),
@@ -1621,20 +1623,23 @@ impl Orchestrator {
                     &mut ctx.session_trace.blockers,
                     "verification detection failed".into(),
                 );
-                return self
-                    .terminal(
-                        ctx,
-                        LoopState::Blocked,
-                        format!(
-                            "verification detection failed: {}",
-                            self.summary(&error.to_string(), 512)
-                        ),
-                    )
-                    .await;
+                self.audit(
+                    ctx,
+                    AuditKind::VerificationFinished,
+                    "verification detection failed",
+                    json!({
+                        "passed": false,
+                        "steps": 0,
+                        "tail": self.summary(&reason, 512),
+                    }),
+                )
+                .await?;
+                return self.terminal(ctx, LoopState::Blocked, reason).await;
             }
         };
 
         if commands.is_empty() {
+            let reason = "no applicable verification commands were detected";
             self.events.emit(AgentEvent::VerificationFinished {
                 passed: false,
                 summary: "no verification commands detected".into(),
@@ -1643,13 +1648,18 @@ impl Orchestrator {
                 &mut ctx.session_trace.blockers,
                 "no verification commands detected".into(),
             );
-            return self
-                .terminal(
-                    ctx,
-                    LoopState::Blocked,
-                    "no applicable verification commands were detected",
-                )
-                .await;
+            self.audit(
+                ctx,
+                AuditKind::VerificationFinished,
+                "no verification commands detected",
+                json!({
+                    "passed": false,
+                    "steps": 0,
+                    "tail": reason,
+                }),
+            )
+            .await?;
+            return self.terminal(ctx, LoopState::Blocked, reason).await;
         }
 
         ctx.verification_commands = commands.clone();
@@ -1667,20 +1677,24 @@ impl Orchestrator {
         let report = match report {
             Ok(report) => report,
             Err(error) => {
+                let detail = self.summary(&error.to_string(), 512);
+                let reason = format!("verification execution failed: {detail}");
                 self.events.emit(AgentEvent::VerificationFinished {
                     passed: false,
                     summary: "verification execution failed".into(),
                 });
-                return self
-                    .terminal(
-                        ctx,
-                        LoopState::Blocked,
-                        format!(
-                            "verification execution failed: {}",
-                            self.summary(&error.to_string(), 512)
-                        ),
-                    )
-                    .await;
+                self.audit(
+                    ctx,
+                    AuditKind::VerificationFinished,
+                    "verification execution failed",
+                    json!({
+                        "passed": false,
+                        "steps": 0,
+                        "tail": self.summary(&reason, 512),
+                    }),
+                )
+                .await?;
+                return self.terminal(ctx, LoopState::Blocked, reason).await;
             }
         };
         let report = VerifyReport {

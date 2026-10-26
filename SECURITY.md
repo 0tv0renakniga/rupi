@@ -431,6 +431,9 @@ a program/argument vector, or declare verification passed.
   unbounded process output. The failure tail is also bounded.
 - Only a real executed command with exit code `0` satisfies a verification
   step. An empty command list is a blocked/not-passed report, never a success.
+- Detection failures, execution errors, and empty profiles emit a failed
+  `verification_finished` audit record. A completed Change task records the
+  verifier step outcomes in its Wiki session trace.
 - The verifier does not automatically install dependencies, create virtual
   environments, or run package-manager installation commands.
 - Verification does not sandbox the child process or remove its network access.

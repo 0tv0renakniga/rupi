@@ -328,6 +328,20 @@ impl FakeVerifier {
     fn run_calls(&self) -> usize {
         self.run_calls.load(Ordering::SeqCst)
     }
+
+    fn with_detect_error(message: impl Into<String>) -> Self {
+        Self {
+            detect_error: Some(message.into()),
+            ..Self::new(Vec::new(), Vec::new())
+        }
+    }
+
+    fn with_run_error(command: VerificationCommand, message: impl Into<String>) -> Self {
+        Self {
+            run_error: Some(message.into()),
+            ..Self::new(vec![command], Vec::new())
+        }
+    }
 }
 
 #[async_trait]
@@ -363,6 +377,7 @@ struct FakeWiki {
     wiki: WikiContext,
     compile_error: Option<String>,
     compile_calls: AtomicUsize,
+    last_trace: Mutex<Option<SessionTrace>>,
 }
 
 impl FakeWiki {
@@ -371,6 +386,7 @@ impl FakeWiki {
             wiki: WikiContext::empty(root),
             compile_error: None,
             compile_calls: AtomicUsize::new(0),
+            last_trace: Mutex::new(None),
         }
     }
 
@@ -379,11 +395,16 @@ impl FakeWiki {
             wiki: WikiContext::empty(root),
             compile_error: Some("compile failed".into()),
             compile_calls: AtomicUsize::new(0),
+            last_trace: Mutex::new(None),
         }
     }
 
     fn compile_calls(&self) -> usize {
         self.compile_calls.load(Ordering::SeqCst)
+    }
+
+    fn last_trace(&self) -> Option<SessionTrace> {
+        self.last_trace.lock().expect("trace lock").clone()
     }
 }
 
@@ -397,10 +418,11 @@ impl WikiStore for FakeWiki {
         &self,
         root: &Path,
         _prior: &WikiContext,
-        _trace: &SessionTrace,
+        trace: &SessionTrace,
         _today: &str,
     ) -> Result<CompileReport> {
         self.compile_calls.fetch_add(1, Ordering::SeqCst);
+        *self.last_trace.lock().expect("trace lock") = Some(trace.clone());
         if let Some(error) = &self.compile_error {
             return Err(AgentError::Wiki(error.clone()));
         }
@@ -847,6 +869,165 @@ async fn verification_failure_returns_bounded_redacted_feedback_to_act() {
 }
 
 #[tokio::test]
+async fn verification_outcome_is_audited_and_recorded_in_wiki_trace() {
+    let placeholder = TempDir::new("audit-wiki");
+    let fixture_root = placeholder.path().to_path_buf();
+    let fx = Fixture::with_audit(
+        vec![
+            turn("1. Edit"),
+            tool_turn("write_file", r#"{"path":"src/lib.rs","content":"ok"}"#),
+            turn("DONE"),
+        ],
+        FakeJev::pass(),
+        FakeTools::new(vec![ToolReply::Success("wrote file".into())]),
+        FakeVerifier::new(
+            vec![verification_command(&fixture_root)],
+            vec![pass_report()],
+        ),
+        FakeWiki::ok(&fixture_root),
+        OrchestratorLimits::default(),
+        CollectAudit::default(),
+    );
+
+    let outcome = fx.run(TaskBudget::default()).await.expect("run");
+
+    assert_eq!(outcome.state(), LoopState::Completed);
+    assert!(outcome.verified());
+    let records = fx
+        .audit
+        .records()
+        .into_iter()
+        .filter(|record| record.kind == AuditKind::VerificationFinished)
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].metadata["passed"], true);
+    assert_eq!(records[0].metadata["steps"], 1);
+
+    let trace = fx.wiki.last_trace().expect("compiled trace");
+    assert_eq!(trace.verification.len(), 1);
+    assert_eq!(trace.verification[0].command, "fake check");
+    assert_eq!(trace.verification[0].exit_code, Some(0));
+    assert!(trace.verification[0].required);
+    assert!(trace.verification[0].summary.is_none());
+}
+
+#[tokio::test]
+async fn verification_detection_failure_is_audited_and_blocks() {
+    let placeholder = TempDir::new("detect-failure");
+    let fx = Fixture::new(
+        vec![turn("1. Check"), turn("DONE")],
+        FakeJev::pass(),
+        FakeTools::new(Vec::new()),
+        FakeVerifier::with_detect_error("detector exploded"),
+        FakeWiki::ok(placeholder.path()),
+        OrchestratorLimits::default(),
+    );
+
+    let outcome = fx.run(TaskBudget::default()).await.expect("run");
+
+    assert_eq!(outcome.state(), LoopState::Blocked);
+    assert!(!outcome.verified());
+    assert_eq!(fx.verifier.detect_calls(), 1);
+    assert_eq!(fx.verifier.run_calls(), 0);
+    assert_eq!(fx.wiki.compile_calls(), 0);
+    let records = fx
+        .audit
+        .records()
+        .into_iter()
+        .filter(|record| record.kind == AuditKind::VerificationFinished)
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].metadata["passed"], false);
+    assert_eq!(records[0].metadata["steps"], 0);
+    assert!(
+        records[0].metadata["tail"]
+            .as_str()
+            .is_some_and(|tail| tail.contains("detector exploded")),
+        "{records:?}"
+    );
+}
+
+#[tokio::test]
+async fn verification_execution_error_is_audited_and_blocks() {
+    let placeholder = TempDir::new("execution-failure");
+    let fx = Fixture::new(
+        vec![turn("1. Check"), turn("DONE")],
+        FakeJev::pass(),
+        FakeTools::new(Vec::new()),
+        FakeVerifier::with_run_error(verification_command(placeholder.path()), "runner exploded"),
+        FakeWiki::ok(placeholder.path()),
+        OrchestratorLimits::default(),
+    );
+
+    let outcome = fx.run(TaskBudget::default()).await.expect("run");
+
+    assert_eq!(outcome.state(), LoopState::Blocked);
+    assert!(!outcome.verified());
+    assert_eq!(fx.verifier.detect_calls(), 1);
+    assert_eq!(fx.verifier.run_calls(), 1);
+    assert_eq!(fx.wiki.compile_calls(), 0);
+    let records = fx
+        .audit
+        .records()
+        .into_iter()
+        .filter(|record| record.kind == AuditKind::VerificationFinished)
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].metadata["passed"], false);
+    assert!(
+        records[0].metadata["tail"]
+            .as_str()
+            .is_some_and(|tail| tail.contains("runner exploded")),
+        "{records:?}"
+    );
+}
+
+#[tokio::test]
+async fn model_done_claim_after_failed_verification_cannot_complete() {
+    let placeholder = TempDir::new("done-after-failure");
+    let budget = TaskBudget {
+        max_verify_retries: 0,
+        ..TaskBudget::default()
+    };
+    let fx = Fixture::new(
+        vec![
+            turn("1. Edit"),
+            tool_turn("write_file", r#"{"path":"src/lib.rs","content":"ok"}"#),
+            turn("DONE"),
+        ],
+        FakeJev::pass(),
+        FakeTools::new(vec![ToolReply::Success("wrote file".into())]),
+        FakeVerifier::new(
+            vec![verification_command(placeholder.path())],
+            vec![fail_report("verifier failed")],
+        ),
+        FakeWiki::ok(placeholder.path()),
+        OrchestratorLimits::default(),
+    );
+
+    let outcome = fx.run(budget).await.expect("run");
+
+    assert_eq!(outcome.state(), LoopState::Blocked);
+    assert!(!outcome.verified());
+    assert!(outcome.context.mutated);
+    assert_eq!(fx.verifier.run_calls(), 1);
+    assert_eq!(fx.jev.noul_calls(), 0);
+    assert_eq!(fx.wiki.compile_calls(), 0);
+    let events = fx.events.events();
+    assert!(!has_event(&events, |event| matches!(
+        event,
+        AgentEvent::Completed { .. }
+    )));
+    assert!(!has_event(&events, |event| matches!(
+        event,
+        AgentEvent::PhaseChanged {
+            to: LoopState::Review,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
 async fn verification_retry_exhaustion_blocks_instead_of_completing() {
     let placeholder = TempDir::new("retry");
     let budget = TaskBudget {
@@ -897,6 +1078,15 @@ async fn missing_verifier_blocks_even_after_a_completion_claim() {
     assert_eq!(fx.verifier.detect_calls(), 1);
     assert_eq!(fx.verifier.run_calls(), 0);
     assert_eq!(fx.wiki.compile_calls(), 0);
+    let records = fx
+        .audit
+        .records()
+        .into_iter()
+        .filter(|record| record.kind == AuditKind::VerificationFinished)
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].metadata["passed"], false);
+    assert_eq!(records[0].metadata["steps"], 0);
 }
 
 #[tokio::test]

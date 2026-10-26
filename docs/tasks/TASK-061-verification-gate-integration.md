@@ -1,6 +1,7 @@
 # TASK-061 — Verification Gate Integration After Mutation
 
 **Initial status:** Blocked  
+**Status:** Awaiting review
 **Depends on:** TASK-052 and TASK-060 accepted
 
 ## Goal
