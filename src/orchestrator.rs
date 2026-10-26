@@ -71,6 +71,21 @@ pub trait ToolExecutor: Send + Sync {
     fn check_capability(&self, tool: &AgentTool) -> std::result::Result<(), String>;
 
     async fn execute(&self, tool_call_id: String, tool: &AgentTool) -> ToolOutcome;
+
+    /// Execute one action with task context for audit correlation.
+    ///
+    /// Executors that do not own audit integration inherit the simple
+    /// `execute` path. Script-backed executors override this to emit bounded
+    /// action evidence without exposing task metadata to the model.
+    async fn execute_for_task(
+        &self,
+        _task_id: TaskId,
+        tool_call_id: String,
+        tool: &AgentTool,
+        _cancel: &CancellationToken,
+    ) -> ToolOutcome {
+        self.execute(tool_call_id, tool).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -257,6 +272,55 @@ pub struct TaskContext {
     pub final_summary: Option<String>,
 }
 
+/// Canonical tool catalog exposed to the model for one task.
+///
+/// `ReadOnly` is an authority boundary, not a prompt hint: the orchestrator
+/// rejects tools outside the catalog before policy, approval, or dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolCatalog {
+    /// Investigation, planning, and review actions only.
+    ReadOnly,
+    /// All accepted canonical actions, including mutation-capable actions.
+    #[default]
+    Full,
+}
+
+impl ToolCatalog {
+    pub const READ_ONLY_NAMES: [&'static str; 3] = ["read_file", "git_status", "git_diff"];
+
+    pub const FULL_NAMES: [&'static str; 6] = [
+        "read_file",
+        "write_file",
+        "apply_patch",
+        "run_command",
+        "git_status",
+        "git_diff",
+    ];
+
+    pub fn names(self) -> &'static [&'static str] {
+        match self {
+            Self::ReadOnly => &Self::READ_ONLY_NAMES,
+            Self::Full => &Self::FULL_NAMES,
+        }
+    }
+
+    pub fn specs(self) -> Value {
+        tool_specs_for(self.names())
+    }
+
+    /// Whether the catalog exposes this action to the model at all.
+    pub fn allows(self, tool: &AgentTool) -> bool {
+        match tool {
+            AgentTool::ReadFile { .. } => true,
+            AgentTool::GitStatus | AgentTool::GitDiff { .. } => true,
+            AgentTool::WriteFile { .. }
+            | AgentTool::ApplyPatch { .. }
+            | AgentTool::RunCommand { .. } => self == Self::Full,
+            AgentTool::McpTool { .. } => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrchestratorLimits {
     pub max_context_bytes: usize,
@@ -349,6 +413,7 @@ pub struct Orchestrator {
     approval_policy: ApprovalPolicy,
     approvals: Arc<dyn ApprovalGate>,
     limits: OrchestratorLimits,
+    tool_catalog: ToolCatalog,
     mcp_provenance: Vec<McpProvenance>,
     task_lock: tokio::sync::Mutex<()>,
 }
@@ -373,6 +438,7 @@ impl Orchestrator {
             approval_policy: ApprovalPolicy::default(),
             approvals: Arc::new(DenyApprovalGate),
             limits: OrchestratorLimits::default(),
+            tool_catalog: ToolCatalog::default(),
             mcp_provenance: Vec::new(),
             task_lock: tokio::sync::Mutex::new(()),
         }
@@ -405,6 +471,15 @@ impl Orchestrator {
 
     pub fn with_limits(mut self, limits: OrchestratorLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Restrict or expand the model-visible canonical action catalog.
+    ///
+    /// The default remains the full accepted catalog so existing Change-mode
+    /// behavior is unchanged. Read-only modes must opt in explicitly.
+    pub fn with_tool_catalog(mut self, catalog: ToolCatalog) -> Self {
+        self.tool_catalog = catalog;
         self
     }
 
@@ -830,7 +905,7 @@ impl Orchestrator {
 
         self.compact_context(ctx).await?;
         let request = ChatRequest::new(ctx.conversation.clone())
-            .with_tools(canonical_tool_specs())
+            .with_tools(self.tool_catalog.specs())
             .with_temperature(0.2)
             .with_max_tokens(2048);
 
@@ -986,6 +1061,19 @@ impl Orchestrator {
             }
         };
 
+        if !self.tool_catalog.allows(&tool) {
+            let outcome = ToolOutcome::policy_denied(
+                call.id.clone(),
+                format!(
+                    "action `{}` is not available in the active tool catalog",
+                    CapabilityManifest::capability_name(&tool)
+                ),
+            );
+            return self
+                .record_tool_outcome(ctx, &call, Some(&tool), outcome)
+                .await;
+        }
+
         if let Err(violation) = self.tools.authorize(&tool) {
             let outcome = ToolOutcome::policy_denied(
                 call.id.clone(),
@@ -1026,8 +1114,12 @@ impl Orchestrator {
 
         let outcome = match decision {
             None | Some(ApprovalDecision::Approved) => {
-                let Some(outcome) =
-                    cancellable(cancel, self.tools.execute(call.id.clone(), &tool)).await
+                let Some(outcome) = cancellable(
+                    cancel,
+                    self.tools
+                        .execute_for_task(ctx.task_id, call.id.clone(), &tool, cancel),
+                )
+                .await
                 else {
                     return self
                         .terminal(ctx, LoopState::Cancelled, "task cancelled")
@@ -1486,7 +1578,7 @@ impl Orchestrator {
         )));
 
         let request = ChatRequest::new(ctx.conversation.clone())
-            .with_tools(canonical_tool_specs())
+            .with_tools(self.tool_catalog.specs())
             .with_temperature(0.1)
             .with_max_tokens(1024);
         let Some(turn) = self.model_turn(request, cancel).await else {
@@ -1765,7 +1857,7 @@ impl Orchestrator {
         } else {
             &ctx.selected_wiki
         };
-        let tools = canonical_tool_names().join(", ");
+        let tools = self.tool_catalog.names().join(", ");
         let remaining = format!(
             "act_turns_remaining={}; tool_calls_remaining={}; verify_retries_remaining={}; \
              system2_calls_remaining={}; wall_time_limit_secs={}",
@@ -2084,19 +2176,12 @@ fn select_wiki(
     selected
 }
 
-fn canonical_tool_names() -> Vec<&'static str> {
-    vec![
-        "read_file",
-        "write_file",
-        "apply_patch",
-        "run_command",
-        "git_status",
-        "git_diff",
-    ]
+pub fn read_only_tool_specs() -> Value {
+    ToolCatalog::ReadOnly.specs()
 }
 
-pub fn canonical_tool_specs() -> Value {
-    json!([
+fn tool_specs_for(names: &[&str]) -> Value {
+    let specs = json!([
         {
             "type": "function",
             "function": {
@@ -2192,7 +2277,27 @@ pub fn canonical_tool_specs() -> Value {
                 }
             }
         }
-    ])
+    ]);
+
+    Value::Array(
+        specs
+            .as_array()
+            .expect("canonical tool specs are an array")
+            .iter()
+            .filter(|spec| {
+                let name = spec
+                    .get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str);
+                name.is_some_and(|name| names.contains(&name))
+            })
+            .cloned()
+            .collect(),
+    )
+}
+
+pub fn canonical_tool_specs() -> Value {
+    tool_specs_for(&ToolCatalog::FULL_NAMES)
 }
 
 fn count_plan_steps(plan: &str) -> usize {

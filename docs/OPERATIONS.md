@@ -185,6 +185,35 @@ success flag, bounded result classification, duration, and exit code. It does no
 contain request parameters, stdout data, stderr diagnostics, or environment
 values.
 
+## Read-only dispatch
+
+Read-only task catalogs expose exactly `read_file`, `git_status`, and
+`git_diff`. The orchestrator rejects any other tool request before policy,
+approval, or dispatch, so a model cannot obtain an approval prompt for a write,
+verifier, or mutation action that its catalog does not expose. Read-only
+actions still pass the shared path and command policy before the script runner
+is called.
+
+The script-backed read-only executor maps the strict canonical action into a
+fixed `ActionId` and action-specific parameters. It does not accept script
+paths, interpreter paths, working directories, or shell strings from the model.
+Successful helper data is rendered as bounded text for the model; the
+orchestrator applies its configured tool-output cap and secret redaction before
+the result enters conversation context. Every dispatched action emits
+tool-requested/tool-finished events and, when audit is configured, a bounded
+`script_finished` record.
+
+Cancellation drops the in-flight runner future; the helper child is configured
+with `kill_on_drop`, so cancellation cannot leave a successful late result in
+the task or mutate repository content. Model-visible tool errors include
+teaching errors for malformed action arguments, policy denials, and bounded
+helper failures.
+
+The interactive TUI still starts through the configured MCP runtime. Selection
+of the read-only script catalog by an operator-facing task mode is introduced
+in the next workflow milestone; until then the catalog and script executor are
+an orchestrator library boundary exercised by integration tests.
+
 ## Audit evidence
 
 Audit records are append-only JSON Lines. The default location is:
