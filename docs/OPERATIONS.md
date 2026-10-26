@@ -146,6 +146,23 @@ capped at 64 KiB and a capped result is marked `truncated`. Clean repositories
 return an empty `status` with `clean: true`. A root that is not inside a Git
 repository returns the helper error `NOT_A_GIT_REPOSITORY`.
 
+## Git diff helper
+
+`scripts/git_diff.py` requires a boolean `staged` parameter and runs only one
+fixed command in the configured root: `git diff` when `staged` is `false`, or
+`git diff --cached` when `staged` is `true`. Both forms are scoped to the root
+and disable the pager, external diff drivers, text conversion, color, terminal
+prompts, and optional locks. The helper uses the same minimal environment and
+system/global configuration isolation as the Git status helper. It does not
+inspect history, include untracked files, or mutate the worktree, index, refs,
+remotes, or Git configuration.
+
+Successful protocol data contains `staged`, `diff`, and `truncated`. Diffs are
+capped at 64 KiB. A truncated diff preserves the beginning and end of the Git
+output with a `[diff truncated]` marker between them and sets `truncated` to
+`true`. Empty diffs return an empty `diff`. A root that is not inside a Git
+repository returns the helper error `NOT_A_GIT_REPOSITORY`.
+
 ## Script runtime boundary
 
 The fixed helper-script runner is the only script execution path. It launches a
