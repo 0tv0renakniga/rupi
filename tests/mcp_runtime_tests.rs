@@ -454,10 +454,29 @@ async fn startup_diagnostics_are_bounded_and_redacted() {
 }
 
 #[test]
-fn headless_startup_checks_mcp_without_model_or_jev_services() {
+fn headless_startup_checks_scripts_without_mcp_or_model_services() {
+    let root = test_root("headless-script");
+    let scripts = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts");
+    let python = [
+        "/usr/bin/python3",
+        "/usr/local/bin/python3",
+        "/bin/python3",
+        "/usr/bin/python",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|path| path.is_file())
+    .expect("python interpreter");
+
     let output = std::process::Command::new(HARNESS_BIN)
         .arg("--headless")
         .env_clear()
+        .env("HARNESS_ROOT", &root)
+        .env("HARNESS_SCRIPT_ROOT", &scripts)
+        .env("HARNESS_SCRIPT_INTERPRETER", &python)
+        .env("HARNESS_MCP_PROFILE", "not-a-real-profile")
+        .env("HARNESS_MCP_FS_EXECUTABLE", "/definitely/missing/mcp")
+        .env("HARNESS_MCP_APPROVED_DIGESTS", "{invalid")
         .output()
         .expect("run harness headless");
     assert!(
@@ -466,10 +485,17 @@ fn headless_startup_checks_mcp_without_model_or_jev_services() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("script runtime ok:"), "stdout: {stdout}");
     assert!(
-        stdout.contains("mcp startup ok: profile=none servers=0"),
+        stdout.contains("script action: read_file ->"),
         "stdout: {stdout}"
     );
+    assert!(
+        stdout.contains("change mode: gated; missing write_file.py, run_verifier.py"),
+        "stdout: {stdout}"
+    );
+    assert!(!stdout.contains("mcp startup"), "stdout: {stdout}");
+    let _ = std::fs::remove_dir_all(root);
 }
 
 fn sha256_file(path: &Path) -> String {

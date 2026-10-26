@@ -36,9 +36,15 @@ pub struct VerificationSummary {
 pub struct SessionTrace {
     pub session_id: String,
     pub task_summary: String,
+    #[serde(default)]
+    pub mode: String,
     pub started_at: String,
     pub finished_at: Option<String>,
     pub changed_files: BTreeSet<String>,
+    #[serde(default)]
+    pub inspected_files: BTreeSet<String>,
+    #[serde(default)]
+    pub git_state: Vec<String>,
     pub actions: Vec<ActionSummary>,
     pub verification: Vec<VerificationSummary>,
     pub policy_denials: Vec<String>,
@@ -68,6 +74,13 @@ impl SessionTrace {
 
         let changed_files = self
             .changed_files
+            .iter()
+            .take(limits.max_trace_items)
+            .map(|value| field(value))
+            .collect::<Result<BTreeSet<_>>>()?;
+
+        let inspected_files = self
+            .inspected_files
             .iter()
             .take(limits.max_trace_items)
             .map(|value| field(value))
@@ -111,9 +124,12 @@ impl SessionTrace {
         Ok(Self {
             session_id: field(&self.session_id)?,
             task_summary: field(&self.task_summary)?,
+            mode: field(&self.mode)?,
             started_at: field(&self.started_at)?,
             finished_at: self.finished_at.as_deref().map(field).transpose()?,
             changed_files,
+            inspected_files,
+            git_state: list(&self.git_state)?,
             actions,
             verification,
             policy_denials: list(&self.policy_denials)?,
@@ -346,7 +362,7 @@ fn bounded_log_entry(entry: &str, max_bytes: usize) -> String {
     bounded
 }
 
-fn sanitize_field(value: &str, max_bytes: usize) -> Result<String> {
+pub(crate) fn sanitize_field(value: &str, max_bytes: usize) -> Result<String> {
     let redacted = redact(value)?;
     let single_line = redacted
         .replace("\r\n", " ")
@@ -598,7 +614,7 @@ async fn append_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| AgentError::Wiki("state file path has no parent directory".into()))?;

@@ -5,6 +5,7 @@
 //! injects them into model prompts automatically.
 
 pub mod compile;
+pub mod evidence;
 pub mod redact;
 
 use std::path::{Path, PathBuf};

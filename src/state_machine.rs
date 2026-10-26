@@ -5,6 +5,34 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AgentError, Result};
 
+/// Operator-selected workflow and policy bundle for one task.
+///
+/// A mode may change only between tasks. The orchestrator derives the allowed
+/// phase transitions and the model-visible action catalog from this value;
+/// model output never selects or upgrades a mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskMode {
+    /// Existing implementation workflow with verified mutation.
+    #[default]
+    Change,
+    /// Read-only repository investigation producing an evidence brief.
+    Investigate,
+}
+
+impl TaskMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Change => "change",
+            Self::Investigate => "investigate",
+        }
+    }
+
+    pub const fn is_read_only(self) -> bool {
+        matches!(self, Self::Investigate)
+    }
+}
+
 /// The only phases a single task may occupy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LoopState {
@@ -65,6 +93,31 @@ pub fn transition_allowed(from: LoopState, to: LoopState) -> bool {
             | (_, Cancelled)
             | (_, Failed)
     )
+}
+
+/// Mode-specific transition table.
+///
+/// `Investigate` never enters Plan, Act, or Verify and therefore cannot reach
+/// a mutation or verification gate. Emergency exits remain available from
+/// every state.
+pub fn transition_allowed_for_mode(mode: TaskMode, from: LoopState, to: LoopState) -> bool {
+    use LoopState::*;
+
+    match mode {
+        TaskMode::Change => transition_allowed(from, to),
+        TaskMode::Investigate => matches!(
+            (from, to),
+            (Boot, Learn)
+                | (Learn, Review)
+                | (Learn, Blocked)
+                | (Review, Compile)
+                | (Review, Blocked)
+                | (Compile, Completed)
+                | (Compile, Blocked)
+                | (_, Cancelled)
+                | (_, Failed)
+        ),
+    }
 }
 
 /// Hard limits for one task. Limits are values; consumption is tracked in
@@ -278,6 +331,54 @@ mod tests {
                 "{from:?} -> {to:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn investigate_mode_uses_the_read_only_path_only() {
+        let path = [
+            LoopState::Boot,
+            LoopState::Learn,
+            LoopState::Review,
+            LoopState::Compile,
+            LoopState::Completed,
+        ];
+
+        for pair in path.windows(2) {
+            assert!(
+                transition_allowed_for_mode(TaskMode::Investigate, pair[0], pair[1]),
+                "{:?} -> {:?} should be allowed in Investigate",
+                pair[0],
+                pair[1]
+            );
+        }
+
+        for forbidden in [LoopState::Plan, LoopState::Act, LoopState::Verify] {
+            assert!(!transition_allowed_for_mode(
+                TaskMode::Investigate,
+                LoopState::Learn,
+                forbidden
+            ));
+        }
+
+        assert!(transition_allowed_for_mode(
+            TaskMode::Investigate,
+            LoopState::Learn,
+            LoopState::Blocked
+        ));
+        assert!(transition_allowed_for_mode(
+            TaskMode::Investigate,
+            LoopState::Review,
+            LoopState::Blocked
+        ));
+        assert!(transition_allowed_for_mode(
+            TaskMode::Investigate,
+            LoopState::Review,
+            LoopState::Cancelled
+        ));
+        assert_eq!(TaskMode::default(), TaskMode::Change);
+        assert_eq!(TaskMode::Investigate.as_str(), "investigate");
+        assert!(TaskMode::Investigate.is_read_only());
+        assert!(!TaskMode::Change.is_read_only());
     }
 
     #[test]

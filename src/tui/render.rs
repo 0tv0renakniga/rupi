@@ -25,7 +25,7 @@ pub fn draw(frame: &mut Frame, app: &AppState) {
     }
 
     if app.show_help {
-        draw_help(frame, area);
+        draw_help(frame, area, app);
     }
 }
 
@@ -90,6 +90,8 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &AppState) {
         Span::styled(status, Style::default().fg(status_color(app.task_status))),
         Span::raw(" | "),
         Span::raw(elapsed),
+        Span::raw(" | mode "),
+        Span::raw(app.selected_mode.as_str()),
         Span::raw(" | tools "),
         Span::raw(app.tool_count.to_string()),
     ];
@@ -208,7 +210,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState) {
     let text = if app.show_help {
         "Esc/? close help | Ctrl-C cancel | q quit"
     } else if app.input_mode == InputMode::TaskEntry {
-        "Enter submit | F1 help | Ctrl-C quit | Up/Down scroll | Tab pane"
+        "Enter submit | F2 mode | F1 help | Ctrl-C quit | Up/Down scroll | Tab pane"
     } else if app.input_mode == InputMode::Approval {
         "y/Enter approve | n/Esc deny | Ctrl-C cancel | ? help"
     } else if app.input_mode.is_terminal() {
@@ -222,7 +224,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState) {
     );
 }
 
-fn draw_help(frame: &mut Frame, area: Rect) {
+fn draw_help(frame: &mut Frame, area: Rect, app: &AppState) {
     let popup = centered_rect(area, 74, 72);
     frame.render_widget(Clear, popup);
     let block = Block::default()
@@ -231,6 +233,11 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         .title(" Keys ");
     let text = vec![
         Line::from("Enter        submit task; approve in approval mode"),
+        Line::from(if app.change_available {
+            "F2           toggle Change/Investigate mode before submission"
+        } else {
+            "F2           Investigate selected; Change is gated until write scripts exist"
+        }),
         Line::from("Esc          deny approval; close help; interrupt is unsupported"),
         Line::from("Ctrl-C       cancel active task; quit when idle"),
         Line::from("q            quit; requests cancellation first while active"),
@@ -303,6 +310,9 @@ fn transcript_style(kind: TranscriptKind) -> Style {
         TranscriptKind::Review => Style::default().fg(Color::Magenta),
         TranscriptKind::Context => Style::default().fg(Color::DarkGray),
         TranscriptKind::Wiki => Style::default().fg(Color::Blue),
+        TranscriptKind::Evidence => Style::default()
+            .fg(Color::LightBlue)
+            .add_modifier(Modifier::BOLD),
         TranscriptKind::Warning => Style::default().fg(Color::Yellow),
         TranscriptKind::Error => Style::default().fg(Color::Red),
         TranscriptKind::Approval => Style::default().fg(Color::Magenta),
@@ -322,13 +332,17 @@ fn input_text(app: &AppState) -> (String, Style) {
         InputMode::TaskEntry => {
             if app.task_input.is_empty() {
                 (
-                    "> Describe a task and press Enter".to_owned(),
+                    format!(
+                        "> [{}] Describe a task and press Enter",
+                        app.selected_mode.as_str()
+                    ),
                     Style::default().fg(Color::DarkGray),
                 )
             } else {
                 (
                     format!(
-                        "> {}",
+                        "> [{}] {}",
+                        app.selected_mode.as_str(),
                         crate::tui::app::bounded_display_text(
                             &app.task_input,
                             crate::tui::app::MAX_DISPLAY_TEXT_BYTES

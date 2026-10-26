@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crate::events::{AgentEvent, EventLevel};
-use crate::state_machine::LoopState;
+use crate::state_machine::{LoopState, TaskMode};
 use crate::wiki::redact::redact;
 
 /// Maximum number of transcript entries retained by the UI.
@@ -92,6 +92,7 @@ pub enum TranscriptKind {
     Review,
     Context,
     Wiki,
+    Evidence,
     Warning,
     Error,
     Approval,
@@ -117,6 +118,7 @@ impl TranscriptKind {
             Self::Review => "REVIEW",
             Self::Context => "CONTEXT",
             Self::Wiki => "WIKI",
+            Self::Evidence => "EVIDENCE",
             Self::Warning => "WARN",
             Self::Error => "ERROR",
             Self::Approval => "APPROVAL",
@@ -164,6 +166,8 @@ pub struct AppState {
     pub phase: LoopState,
     pub task_status: TaskStatus,
     pub input_mode: InputMode,
+    pub selected_mode: TaskMode,
+    pub change_available: bool,
     pub task_input: String,
     pub transcript: VecDeque<TranscriptEntry>,
     pub transcript_bytes: usize,
@@ -198,6 +202,8 @@ impl Default for AppState {
             phase: LoopState::Boot,
             task_status: TaskStatus::Idle,
             input_mode: InputMode::TaskEntry,
+            selected_mode: TaskMode::default(),
+            change_available: true,
             task_input: String::new(),
             transcript: VecDeque::new(),
             transcript_bytes: 0,
@@ -523,6 +529,14 @@ impl AppState {
                 let path = bounded_display_text(&path, MAX_DISPLAY_TEXT_BYTES);
                 self.detail = format!("Wiki compiled: {path}");
                 self.push_entry(TranscriptKind::Wiki, format!("wiki compiled: {path}"));
+            }
+            AgentEvent::EvidenceCompiled { path } => {
+                let path = bounded_display_text(&path, MAX_DISPLAY_TEXT_BYTES);
+                self.detail = format!("Evidence brief compiled: {path}");
+                self.push_entry(
+                    TranscriptKind::Evidence,
+                    format!("evidence brief compiled: {path}"),
+                );
             }
             AgentEvent::Blocked { reason } => {
                 self.finish_task(

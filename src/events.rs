@@ -1,5 +1,5 @@
 use crate::approval::ApprovalRequest;
-use crate::state_machine::LoopState;
+use crate::state_machine::{LoopState, TaskMode};
 
 /// Severity for user-facing notices. Display code must still bound and redact
 /// the message before rendering it.
@@ -87,6 +87,9 @@ pub enum AgentEvent {
     WikiCompiled {
         path: String,
     },
+    EvidenceCompiled {
+        path: String,
+    },
     Blocked {
         reason: String,
     },
@@ -136,7 +139,7 @@ pub enum UiEvent {
 /// UI-to-worker commands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    Submit(String),
+    Submit { objective: String, mode: TaskMode },
     ResolveApproval { approval_id: String, approved: bool },
     Cancel,
     Quit,

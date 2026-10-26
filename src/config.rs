@@ -10,6 +10,7 @@ use crate::approval::{ApprovalPolicy, DEFAULT_APPROVAL_TIMEOUT};
 use crate::error::{AgentError, Result};
 use crate::mcp::client::DEFAULT_MCP_PROTOCOL_VERSION;
 use crate::mcp::process::DEFAULT_STDERR_CAPACITY_BYTES;
+use crate::script_runner::{DEFAULT_SCRIPT_TIMEOUT, MAX_SCRIPT_TIMEOUT};
 use crate::state_machine::TaskBudget;
 
 /// Runtime configuration.
@@ -35,6 +36,9 @@ use crate::state_machine::TaskBudget;
 /// - `HARNESS_APPROVAL_RISKY_COMMANDS` (default: `false`)
 /// - `HARNESS_APPROVAL_RISKY_PROGRAMS` (default: `git,cargo,npm,pip,python3`)
 /// - `HARNESS_APPROVAL_TIMEOUT_SECS` (default: `120`)
+/// - `HARNESS_SCRIPT_ROOT` (default: installed or working-directory `scripts/`)
+/// - `HARNESS_SCRIPT_INTERPRETER` (default: first fixed absolute Python candidate)
+/// - `HARNESS_SCRIPT_TIMEOUT_SECS` (default: `60`, maximum `3600`)
 ///
 /// Endpoint profiles are mutually exclusive:
 ///
@@ -49,9 +53,10 @@ use crate::state_machine::TaskBudget;
 /// Enabling the `remote` Cargo feature does not by itself select the remote
 /// profile, configure an endpoint, contact a service, or upload data.
 ///
-/// Static MCP server configuration is read from the fixed `HARNESS_MCP_*`
-/// variables documented in `README.md`. No server name, executable, argument,
-/// working directory, or sandbox comes from model output.
+/// The frozen MCP adapter still defines `HARNESS_MCP_*` settings and tests, but
+/// the normal TUI and headless paths use the fixed helper-script substrate and
+/// never start an MCP runtime. No server name, executable, argument, working
+/// directory, or sandbox comes from model output.
 /// Maximum number of exact origins accepted for the approved-remote profile.
 pub const MAX_ALLOWED_ORIGINS: usize = 16;
 /// Maximum accepted model-name length.
@@ -124,6 +129,55 @@ impl Default for EndpointConfig {
     }
 }
 
+/// Fixed script-substrate runtime settings.
+///
+/// Values are operator configuration, never model output. The runner performs
+/// the authoritative canonical-path and interpreter checks during startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptConfig {
+    pub root: PathBuf,
+    pub interpreter: PathBuf,
+    pub timeout: Duration,
+}
+
+impl Default for ScriptConfig {
+    fn default() -> Self {
+        Self {
+            root: PathBuf::new(),
+            interpreter: PathBuf::new(),
+            timeout: DEFAULT_SCRIPT_TIMEOUT,
+        }
+    }
+}
+
+impl ScriptConfig {
+    pub fn from_env() -> Result<Self> {
+        let root = match env_path("HARNESS_SCRIPT_ROOT")? {
+            Some(root) => root,
+            None => discover_script_root()?,
+        };
+        let interpreter = match env_path("HARNESS_SCRIPT_INTERPRETER")? {
+            Some(interpreter) => interpreter,
+            None => discover_script_interpreter()?,
+        };
+        let timeout = Duration::from_secs(parse_env(
+            "HARNESS_SCRIPT_TIMEOUT_SECS",
+            DEFAULT_SCRIPT_TIMEOUT.as_secs(),
+        )?);
+        if timeout.is_zero() || timeout > MAX_SCRIPT_TIMEOUT {
+            return Err(AgentError::Config(format!(
+                "HARNESS_SCRIPT_TIMEOUT_SECS must be between 1 and {} seconds",
+                MAX_SCRIPT_TIMEOUT.as_secs()
+            )));
+        }
+        Ok(Self {
+            root,
+            interpreter,
+            timeout,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub root: PathBuf,
@@ -136,7 +190,7 @@ pub struct Config {
     pub min_route_conf: f32,
     pub budget: TaskBudget,
     pub approval: ApprovalPolicy,
-    pub mcp: McpRuntimeConfig,
+    pub scripts: ScriptConfig,
 }
 
 impl Config {
@@ -161,7 +215,7 @@ impl Config {
             max_tool_output_bytes: parse_env("HARNESS_MAX_TOOL_OUTPUT_BYTES", 4_000usize)?,
         };
 
-        let mcp = McpRuntimeConfig::from_env(&root)?;
+        let scripts = ScriptConfig::from_env()?;
         let endpoint = EndpointConfig {
             profile: EndpointProfile::parse(&env_or("HARNESS_ENDPOINT_PROFILE", "local"))?,
             allowed_origins: parse_origin_list("HARNESS_LLM_ALLOWED_ORIGINS")?,
@@ -192,7 +246,7 @@ impl Config {
             min_route_conf: parse_env("HARNESS_MIN_ROUTE_CONF", 0.85f32)?,
             budget,
             approval,
-            mcp,
+            scripts,
         })
     }
 
@@ -235,9 +289,72 @@ impl Config {
         validate_endpoint_profile(&self.endpoint, &self.llm_base, &self.model)?;
         validate_local_endpoint("jev_base", &self.jev_base)?;
         self.approval.validate()?;
-        self.mcp.validate()?;
         Ok(())
     }
+}
+
+fn env_path(name: &str) -> Result<Option<PathBuf>> {
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| AgentError::Config(format!("{name} must be valid UTF-8")))?;
+    if value.trim().is_empty() {
+        return Err(AgentError::Config(format!("{name} must not be empty")));
+    }
+    validate_config_string(name, &value)?;
+    Ok(Some(PathBuf::from(value)))
+}
+
+fn discover_script_root() -> Result<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(parent) = executable.parent()
+    {
+        candidates.push(parent.join("scripts"));
+        candidates.push(parent.join("../share/local-agent-harness/scripts"));
+    }
+    if let Ok(current) = std::env::current_dir() {
+        candidates.push(current.join("scripts"));
+    }
+    for candidate in candidates {
+        if candidate.is_dir() {
+            return Ok(candidate);
+        }
+    }
+    Err(AgentError::Config(
+        "HARNESS_SCRIPT_ROOT is not set and no reviewed script directory was found next to the executable or in the working directory"
+            .into(),
+    ))
+}
+
+fn discover_script_interpreter() -> Result<PathBuf> {
+    #[cfg(unix)]
+    const CANDIDATES: &[&str] = &[
+        "/usr/bin/python3",
+        "/usr/local/bin/python3",
+        "/bin/python3",
+        "/usr/bin/python",
+        "/opt/homebrew/bin/python3",
+    ];
+    #[cfg(windows)]
+    const CANDIDATES: &[&str] = &[
+        r"C:\Python313\python.exe",
+        r"C:\Python312\python.exe",
+        r"C:\Python311\python.exe",
+    ];
+
+    for candidate in CANDIDATES {
+        let path = PathBuf::from(candidate);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+    Err(AgentError::Config(
+        "HARNESS_SCRIPT_INTERPRETER is not set and no reviewed absolute Python interpreter was found"
+            .into(),
+    ))
 }
 
 /// Maximum accepted MCP process arguments.
@@ -1233,7 +1350,7 @@ mod tests {
             min_route_conf: 0.85,
             budget: TaskBudget::default(),
             approval: ApprovalPolicy::default(),
-            mcp: McpRuntimeConfig::default(),
+            scripts: ScriptConfig::default(),
         }
     }
 

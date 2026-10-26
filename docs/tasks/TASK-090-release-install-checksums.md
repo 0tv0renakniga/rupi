@@ -13,6 +13,11 @@ Package release binary, reviewed helper scripts, docs, config template, and
 SHA256SUMS. Define installed script location, launcher behavior, provenance,
 and clean-machine headless validation.
 
+This task owns packaging, installation layout, and checksum verification only.
+Runtime executor selection and the shared TUI/headless script-runtime
+composition belong to TASK-040/TASK-033 and are already implemented there; do
+not defer or reintroduce MCP for the normal workflow here.
+
 ## Required Tests / Evidence
 
 Build with `--release --locked`; validate installed artifact against a
@@ -27,7 +32,8 @@ checksums.
 
 ## Non-Goals
 
-Do not publish automatically or add cloud distribution.
+Do not publish automatically or add cloud distribution. Do not change action
+executor selection, add an MCP fallback, or require MCP for installed startup.
 
 ## Delivery
 

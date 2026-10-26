@@ -32,20 +32,17 @@ use crate::error::{AgentError, Result};
 use crate::events::{AgentEvent, Command, EventLevel};
 use crate::jev::JevClient;
 use crate::llm::OpenAiCompatClient;
-use crate::mcp::{McpRuntime, ToolDispatcher};
 use crate::orchestrator::{
-    LocalVerificationEngine, LocalWikiStore, Orchestrator, OrchestratorLimits,
+    LocalVerificationEngine, LocalWikiStore, Orchestrator, OrchestratorLimits, ToolExecutor,
 };
-use crate::policy::Policy;
+use crate::runtime;
 
 const TICK_INTERVAL: Duration = Duration::from_millis(200);
-const MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
 
 struct PreparedApp {
     app: AppState,
-    runtime: McpRuntime,
     orchestrator: Orchestrator,
     approvals: InteractiveApprovalGate,
 }
@@ -55,23 +52,18 @@ struct PreparedApp {
 pub async fn run(config: Config) -> Result<()> {
     let PreparedApp {
         mut app,
-        runtime,
         orchestrator,
         approvals,
     } = prepare(&config).await?;
 
-    let (mut terminal, guard) = match setup_terminal() {
-        Ok(value) => value,
-        Err(error) => {
-            let _ = runtime.shutdown(MCP_SHUTDOWN_TIMEOUT).await;
-            return Err(error);
-        }
-    };
+    let (mut terminal, guard) = setup_terminal()?;
+    let change_available = app.change_available;
     let mut worker = worker::spawn(
         orchestrator,
         config.root.clone(),
         config.budget.clone(),
         approvals,
+        change_available,
     );
 
     let result = event_loop(&mut terminal, &mut app, &mut worker).await;
@@ -79,13 +71,7 @@ pub async fn run(config: Config) -> Result<()> {
     drop(terminal);
     drop(guard);
     worker.shutdown().await;
-    let shutdown = runtime.shutdown(MCP_SHUTDOWN_TIMEOUT).await;
-
-    match (result, shutdown) {
-        (Err(error), _) => Err(error),
-        (Ok(()), Err(error)) => Err(error),
-        (Ok(()), Ok(())) => Ok(()),
-    }
+    result
 }
 
 async fn prepare(config: &Config) -> Result<PreparedApp> {
@@ -100,32 +86,30 @@ async fn prepare(config: &Config) -> Result<PreparedApp> {
     app.endpoint_mode = config.endpoint.profile.as_str().to_owned();
     app.model = config.model.clone();
 
-    let policy = Policy::new(config.root.clone()).map_err(|error| {
-        AgentError::Config(format!("repository path policy is invalid: {error}"))
-    })?;
-    let runtime = McpRuntime::start(
-        &config.mcp,
-        &config.root,
-        policy,
-        config.budget.max_tool_output_bytes,
-    )
-    .await?;
-    for warning in runtime.warnings() {
-        app.push_notice(TranscriptKind::Warning, warning);
+    let runtime = runtime::build(config)?;
+    app.change_available = runtime.capabilities.change_ready();
+    if !app.change_available {
+        app.selected_mode = crate::state_machine::TaskMode::Investigate;
+        app.push_notice(
+            TranscriptKind::Warning,
+            &format!(
+                "Change mode is gated until reviewed write/verifier scripts are installed: {}",
+                runtime.capabilities.missing_file_names().join(", ")
+            ),
+        );
     }
     // Startup happens before terminal setup so failures remain printable on a
     // normal terminal and no task can run with partial tool capabilities.
     let approvals = InteractiveApprovalGate::new();
     let orchestrator = build_orchestrator(
         config,
-        runtime.dispatcher(),
-        runtime.provenance().to_vec(),
+        runtime.executor.clone(),
+        runtime.audit.clone(),
         approvals.clone(),
     )?;
 
     Ok(PreparedApp {
         app,
-        runtime,
         orchestrator,
         approvals,
     })
@@ -133,13 +117,10 @@ async fn prepare(config: &Config) -> Result<PreparedApp> {
 
 fn build_orchestrator(
     config: &Config,
-    tools: Arc<ToolDispatcher>,
-    mcp_provenance: Vec<crate::mcp::McpProvenance>,
+    tools: Arc<dyn ToolExecutor>,
+    audit: Arc<AuditLog>,
     approvals: InteractiveApprovalGate,
 ) -> Result<Orchestrator> {
-    let audit = Arc::new(AuditLog::new(config.audit_path.clone()));
-    audit.prepare()?;
-
     let mut llm = OpenAiCompatClient::new(config.llm_base.clone(), config.model.clone());
     if let Some(credential) = config.llm_credential()? {
         llm = llm.with_bearer_token(credential);
@@ -162,8 +143,7 @@ fn build_orchestrator(
     .with_limits(limits)
     .with_approval_policy(config.approval.clone())
     .with_approval_gate(Arc::new(approvals))
-    .with_audit(audit)
-    .with_mcp_provenance(mcp_provenance))
+    .with_audit(audit))
 }
 
 async fn event_loop(
@@ -226,7 +206,7 @@ fn send_command(app: &mut AppState, worker: &worker::Worker, command: Command) {
             if matches!(command, Command::Cancel | Command::Quit) {
                 worker.cancel.cancel();
             }
-            if matches!(command, Command::Submit(_)) {
+            if matches!(command, Command::Submit { .. }) {
                 app.apply(AgentEvent::Failed {
                     reason: "command queue is full; task was not submitted".into(),
                 });
@@ -291,35 +271,98 @@ fn restore_terminal() {
 mod tests {
     use super::*;
     use crate::approval::ApprovalPolicy;
-    use crate::config::{EndpointConfig, McpProfile, McpRuntimeConfig};
-    use crate::state_machine::TaskBudget;
-    use std::path::PathBuf;
+    use crate::config::{EndpointConfig, ScriptConfig};
+    use crate::state_machine::{TaskBudget, TaskMode};
+    use std::path::{Path, PathBuf};
+    use uuid::Uuid;
 
-    fn config() -> Config {
-        Config {
-            root: PathBuf::from("."),
-            audit_path: PathBuf::from(".harness-audit/audit.jsonl"),
-            llm_base: "http://127.0.0.1:8080".into(),
-            model: "local-model".into(),
-            jev_base: "http://127.0.0.1:9090".into(),
-            endpoint: EndpointConfig::default(),
-            min_route_conf: 0.85,
-            budget: TaskBudget::default(),
-            approval: ApprovalPolicy::default(),
-            mcp: McpRuntimeConfig {
-                profile: McpProfile::ReadOnly,
-                ..McpRuntimeConfig::default()
-            },
+    struct Fixture {
+        base: PathBuf,
+        project: PathBuf,
+        scripts: PathBuf,
+        config: Config,
+    }
+
+    impl Fixture {
+        fn new(label: &str) -> Self {
+            let base = std::env::temp_dir().join(format!("rupi-tui-{label}-{}", Uuid::new_v4()));
+            let project = base.join("project");
+            let scripts = base.join("scripts");
+            std::fs::create_dir_all(&project).expect("create project");
+            std::fs::create_dir_all(&scripts).expect("create scripts");
+            let config = Config {
+                root: project.clone(),
+                audit_path: project.join(".harness-audit/audit.jsonl"),
+                llm_base: "http://127.0.0.1:8080".into(),
+                model: "local-model".into(),
+                jev_base: "http://127.0.0.1:9090".into(),
+                endpoint: EndpointConfig::default(),
+                min_route_conf: 0.85,
+                budget: TaskBudget::default(),
+                approval: ApprovalPolicy::default(),
+                scripts: ScriptConfig {
+                    root: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts"),
+                    interpreter: python_interpreter(),
+                    timeout: crate::script_runner::DEFAULT_SCRIPT_TIMEOUT,
+                },
+            };
+            Self {
+                base,
+                project,
+                scripts,
+                config,
+            }
         }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn python_interpreter() -> PathBuf {
+        for candidate in [
+            "/usr/bin/python3",
+            "/usr/local/bin/python3",
+            "/bin/python3",
+            "/usr/bin/python",
+        ] {
+            let path = Path::new(candidate);
+            if path.is_file() {
+                return path.to_path_buf();
+            }
+        }
+        panic!("python3 is required for TUI runtime tests");
+    }
+
+    #[tokio::test]
+    async fn prepare_uses_script_runtime_and_gates_change_without_mcp() {
+        let fixture = Fixture::new("script-runtime");
+        let prepared = prepare(&fixture.config)
+            .await
+            .expect("script runtime startup");
+
+        assert_eq!(prepared.app.selected_mode, TaskMode::Investigate);
+        assert!(!prepared.app.change_available);
+        assert!(fixture.project.join(".harness-audit").is_dir());
+        let warnings = prepared
+            .app
+            .transcript
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(warnings.contains("write_file.py"), "{warnings}");
+        assert!(warnings.contains("run_verifier.py"), "{warnings}");
     }
 
     #[tokio::test]
     async fn invalid_audit_path_is_returned_before_terminal_setup() {
-        let mut config = config();
-        config.mcp = McpRuntimeConfig::default();
-        config.audit_path = std::env::temp_dir();
+        let mut fixture = Fixture::new("invalid-audit");
+        fixture.config.audit_path = std::env::temp_dir();
 
-        let error = prepare(&config)
+        let error = prepare(&fixture.config)
             .await
             .err()
             .expect("directory audit path must fail startup");
@@ -327,11 +370,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_configuration_error_is_returned_before_terminal_setup() {
-        let error = prepare(&config())
+    async fn incomplete_read_only_scripts_fail_before_terminal_setup() {
+        let mut fixture = Fixture::new("missing-scripts");
+        fixture.config.scripts.root = fixture.scripts.clone();
+
+        let error = prepare(&fixture.config)
             .await
             .err()
-            .expect("invalid MCP profile must fail startup");
-        assert!(error.to_string().contains("requires an enabled"));
+            .expect("missing read-only scripts must fail startup");
+        assert!(
+            error
+                .to_string()
+                .contains("read-only script profile is incomplete"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("read_file.py"), "{error}");
     }
 }

@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use local_agent_harness::approval::{ApprovalAction, ApprovalRequest};
 use local_agent_harness::events::{AgentEvent, Command, EventLevel};
-use local_agent_harness::state_machine::LoopState;
+use local_agent_harness::state_machine::{LoopState, TaskMode};
 use local_agent_harness::tui::app::{MAX_TRANSCRIPT_ENTRIES, StreamState};
 use local_agent_harness::tui::input::{handle_key, handle_paste};
 use local_agent_harness::tui::render;
@@ -66,11 +66,51 @@ fn enter_submits_nonempty_task_and_ignores_empty_input() {
     app.task_input = "fix the failing test".into();
     assert_eq!(
         handle_key(&mut app, key(KeyCode::Enter)),
-        Some(Command::Submit("fix the failing test".into()))
+        Some(Command::Submit {
+            objective: "fix the failing test".into(),
+            mode: TaskMode::Change,
+        })
     );
     assert_eq!(app.input_mode, InputMode::Running);
     assert_eq!(app.task_status, TaskStatus::Running);
     assert!(app.task_input.is_empty());
+}
+
+#[test]
+fn f2_toggles_mode_only_before_submission() {
+    let mut app = AppState::default();
+    assert_eq!(app.selected_mode, TaskMode::Change);
+
+    assert_eq!(handle_key(&mut app, key(KeyCode::F(2))), None);
+    assert_eq!(app.selected_mode, TaskMode::Investigate);
+
+    app.task_input = "inspect the repository".into();
+    assert_eq!(
+        handle_key(&mut app, key(KeyCode::Enter)),
+        Some(Command::Submit {
+            objective: "inspect the repository".into(),
+            mode: TaskMode::Investigate,
+        })
+    );
+
+    assert_eq!(handle_key(&mut app, key(KeyCode::F(2))), None);
+    assert_eq!(app.selected_mode, TaskMode::Investigate);
+}
+
+#[test]
+fn change_mode_is_gated_when_write_scripts_are_unavailable() {
+    let mut app = AppState::default();
+    app.change_available = false;
+    app.selected_mode = TaskMode::Investigate;
+
+    assert_eq!(handle_key(&mut app, key(KeyCode::F(2))), None);
+    assert_eq!(app.selected_mode, TaskMode::Investigate);
+
+    app.task_input = "modify the repository".into();
+    app.selected_mode = TaskMode::Change;
+    assert_eq!(handle_key(&mut app, key(KeyCode::Enter)), None);
+    assert_eq!(app.input_mode, InputMode::TaskEntry);
+    assert_eq!(app.task_input, "modify the repository");
 }
 
 #[test]

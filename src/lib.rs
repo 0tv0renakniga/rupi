@@ -17,6 +17,7 @@ pub mod mcp;
 pub mod orchestrator;
 pub mod path_policy;
 pub mod policy;
+pub mod runtime;
 pub mod script_runner;
 pub mod script_tools;
 pub mod state_machine;

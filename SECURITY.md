@@ -121,7 +121,7 @@ configuration from callers.
   through this adapter. Callers must still avoid placing secrets in the derived
   values they send.
 - Jev outputs are advisory. They cannot authorize tools, bypass `Policy`,
-  execute MCP calls, claim verification passed, or transition a task to
+  execute tool calls, claim verification passed, or transition a task to
   completed. A Jev `Pass` never substitutes for a real verifier exit code.
 
 These controls limit the harness's intended data flows. They do not provide
@@ -133,13 +133,15 @@ controls.
 
 The M8 orchestrator owns task state, budgets, context, transitions, and terminal
 outcomes. System 2 and Jev remain untrusted advisory components: neither can
-authorize a tool, bypass `Policy`, execute an MCP call directly, or declare a
+authorize a tool, bypass `Policy`, execute a tool call directly, or declare a
 task complete.
 
-- The only normal completion path is `Learn -> Plan -> Act -> Verify -> Review
-  -> Compile -> Completed`. A mutation invalidates prior verification and forces
+- Change mode's completion path is `Learn -> Plan -> Act -> Verify -> Review ->
+  Compile -> Completed`. A mutation invalidates prior verification and forces
   another `Verify`. Missing, failed, or unusable verification blocks
   completion.
+- Investigate mode uses `Learn -> Review -> Compile -> Completed`; Plan, Act, and
+  Verify are unavailable, so no mutation can be approved or dispatched.
 - Tool calls are parsed into canonical `AgentTool` values before dispatch.
   Malformed arguments are returned to the model as bounded teaching feedback and
   are not sent to the dispatcher.
@@ -178,16 +180,18 @@ resolve into `.ai-wiki/` or outside the repository are rejected.
 - The audit file is local evidence, not prompt context. Retention, backup, and
   rotation are operator responsibilities; do not edit evidence in place.
 
-The TUI and the `--headless` startup check use the same MCP lifecycle. The TUI
-also validates and creates the audit parent directory before terminal setup, so
-a bad audit path fails before a task can start.
+The TUI and the `--headless` startup check use the same script-runtime
+composition. Both validate the canonical project root, reviewed script root,
+absolute interpreter, audit path, and script inventory before a task can start;
+neither starts MCP in the normal workflow. The script executor and audit sink are
+injected into the orchestrator as shared runtime dependencies.
 
 ## TUI boundary
 
 The Ratatui/crossterm UI is a presentation and input layer, not an
 authorization surface.
 
-- The UI never executes tools, dispatches MCP calls, calls the model or Jev
+- The UI never executes tools, dispatches tool calls, calls the model or Jev
   directly, changes `Policy`, or marks a task complete.
 - Approval prompts may request an explicit user decision, but approval cannot
   authorize a policy bypass, skip verification, or widen the fixed capability
@@ -230,11 +234,13 @@ authorization surface.
   panic. A second Ctrl-C after the visible grace period may exit only after
   orderly cleanup begins.
 
-## MCP process boundary
+## Frozen MCP process boundary
 
-MCP child binaries and any external sandbox wrapper are an untrusted process
-and supply-chain boundary. Enabled servers require `external-wrapper` or
-`bubblewrap` by default; startup rejects `none` unless
+The normal TUI and `--headless` workflows do not start MCP. The following
+controls apply only if the frozen MCP reference adapter or its tests/demo are
+invoked explicitly. MCP child binaries and any external sandbox wrapper are an
+untrusted process and supply-chain boundary. Enabled servers require
+`external-wrapper` or `bubblewrap` by default; startup rejects `none` unless
 `HARNESS_MCP_ALLOW_UNSANDBOXED=true` is set explicitly for development or
 testing. In that unsandboxed mode the harness starts the configured server
 directly, without a shell, using an absolute executable path. That configured
@@ -266,11 +272,14 @@ paths read-only, and exposes only the controlled `HOME` and workspace (read-only
 for `read_only`, writable for `workspace_mutation`). It is a defense-in-depth
 control, not a substitute for a reviewed server and host policy.
 
-### Runtime MCP configuration and lifecycle
+### Frozen MCP configuration and lifecycle
 
-Static MCP configuration and lifecycle wiring are implemented for exactly three
-fixed slots: `filesystem`, `git`, and `shell`. There is no server discovery,
-arbitrary alias map, package download, install-on-demand, or model-selected
+This adapter is reference/optional work, not part of the active P0 execution
+path. The TUI and headless preflight do not parse MCP settings, start MCP
+servers, or require MCP executables, profiles, digests, or Bubblewrap. Static MCP
+configuration and lifecycle wiring remain implemented for exactly three fixed
+slots: `filesystem`, `git`, and `shell`. There is no server discovery, arbitrary
+alias map, package download, install-on-demand, or model-selected
 executable/argument/environment/cwd.
 
 - `HARNESS_MCP_PROFILE=none` starts no servers and leaves tool capabilities
@@ -323,10 +332,10 @@ An empty object denies every enabled server. The audit metadata records the
 resolved executable path, digest, and reported version for local review; it is
 not part of prompt context or model-facing events.
 
-The TUI and the `--headless` startup check use this same lifecycle. `--headless`
-validates configuration, starts and validates the enabled servers, prints the
-profile/server summary and warnings, shuts them down, and exits without opening
-the TUI or running a task.
+Only explicit MCP tests or the reference demo use this lifecycle. `--headless`
+instead validates the active script runtime: canonical roots, interpreter, audit
+path, action mappings, and Change availability. It does not open the TUI or run
+a task.
 
 Most end-to-end lifecycle tests use fake tool executors and fake model/Jev
 adapters for orchestration. They prove the orchestration, policy, verification,
@@ -366,23 +375,25 @@ uses a scripted model for determinism and does not certify live model quality.
 - On the target, build and test with `cargo build --offline` and
   `cargo test --offline`. Do not rely on ambient registry access, automatic
   dependency updates, or an implicit online fallback.
-- Pin and checksum-verify model files and MCP binaries through the same offline
-  supply-chain process as Cargo dependencies.
+- Pin and checksum-verify model files and reviewed helper scripts through the
+  same offline supply-chain process as Cargo dependencies. Pin optional frozen
+  MCP binaries only if that reference adapter is intentionally enabled.
 - Offline Cargo is not a runtime network sandbox. It does not prevent the
   harness from contacting configured model/Jev endpoints, verifier commands from
-  using the network, or MCP children from opening sockets.
+  using the network, or helper scripts and optional MCP children from opening
+  sockets.
 - For a strict air gap, deny egress with the host firewall, network namespace,
   container policy, or equivalent OS control, and allow only the explicitly
   required loopback services.
 - Before a real run, validate endpoint configuration, confirm the model and Jev
   services are bound only where intended, run the full test/Clippy matrix, verify
-  MCP executable paths and versions, confirm their sandbox policy, and start
-  with a throwaway repository.
+  the script root/interpreter and reviewed script digests, and start with a
+  throwaway repository.
 
 ## Deterministic verification boundary
 
 Verification commands are selected by harness code from repository signals. The
-model, Jev, Wiki status, assistant finish reason, and MCP results cannot add,
+model, Jev, Wiki status, assistant finish reason, and tool results cannot add,
 remove, or declare verification passed.
 
 - Commands are represented as `program + args`, never as shell strings, and
@@ -410,20 +421,23 @@ remove, or declare verification passed.
   policy.
 - Allow only the specific loopback ports needed by the local model and routing
   services. Do not allow general loopback access to unrelated services.
-- Run MCP servers in a network namespace, container, or bubblewrap sandbox with
-  networking disabled. For the built-in Linux option, set the slot's
-  `_SANDBOX_MODE=bubblewrap` and point `_SANDBOX_EXECUTABLE` at a vetted
-  bubblewrap binary.
-- Keep MCP binaries at fixed absolute paths, pin their SHA-256 digests with
-  `HARNESS_MCP_APPROVED_DIGESTS`, and review the recorded path/version/digest
-  audit metadata after upgrades.
+- Run reviewed helper scripts from a fixed root outside the repository with an
+  absolute interpreter. Do not use PATH lookup or model-selected scripts.
+- If the frozen MCP adapter is intentionally enabled, run its servers in a
+  network namespace, container, or bubblewrap sandbox with networking disabled.
+  For the built-in Linux option, set the slot's `_SANDBOX_MODE=bubblewrap` and
+  point `_SANDBOX_EXECUTABLE` at a vetted bubblewrap binary.
+- Keep optional MCP binaries at fixed absolute paths, pin their SHA-256 digests
+  with `HARNESS_MCP_APPROVED_DIGESTS`, and review the recorded
+  path/version/digest audit metadata after upgrades.
 - Use the local-first production profile in `README.md`: local LLM/Jev
-  endpoints, sandboxed MCP slots, no remote profile, and no
+  endpoints, reviewed script root/interpreter, no remote profile, and no
   `HARNESS_MCP_ALLOW_UNSANDBOXED`. Activate remote/work access only as a
   separate administrative decision.
-- Mount the repository read-only where possible and give mutation-capable
-  servers only their required paths.
-- Do not inject proxy variables into the harness or MCP children.
+- Mount the repository read-only where possible and keep helper scripts outside
+  the project root.
+- Do not inject proxy variables into the harness, helper scripts, or optional
+  MCP children.
 - Keep model and service binaries vetted, pinned, and updated only through an
   approved offline process.
 - Review the `remote` feature and explicit endpoint configuration as a data

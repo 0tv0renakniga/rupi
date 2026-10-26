@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::approval::{ApprovalResolveError, InteractiveApprovalGate};
 use crate::events::{AgentEvent, Command, EventLevel};
 use crate::orchestrator::{EventSink, Orchestrator, TaskRequest};
-use crate::state_machine::TaskBudget;
+use crate::state_machine::{TaskBudget, TaskMode};
 
 /// Bounded command queue. The UI uses `try_send` so a stalled worker can never
 /// block rendering or terminal restoration indefinitely.
@@ -64,6 +64,7 @@ pub fn spawn(
     repo_root: PathBuf,
     budget: TaskBudget,
     approvals: InteractiveApprovalGate,
+    change_available: bool,
 ) -> Worker {
     let (commands, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (event_tx, events) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
@@ -72,11 +73,15 @@ pub fn spawn(
 
     let orchestrator = Arc::new(orchestrator.with_event_sink(Arc::new(sink.clone())));
     let worker_cancel = cancel.clone();
+    let settings = WorkerSettings {
+        repo_root,
+        budget,
+        change_available,
+    };
     let join = tokio::spawn(async move {
         run_worker(
             orchestrator,
-            repo_root,
-            budget,
+            settings,
             sink,
             approvals,
             command_rx,
@@ -93,10 +98,15 @@ pub fn spawn(
     }
 }
 
-async fn run_worker(
-    orchestrator: Arc<Orchestrator>,
+struct WorkerSettings {
     repo_root: PathBuf,
     budget: TaskBudget,
+    change_available: bool,
+}
+
+async fn run_worker(
+    orchestrator: Arc<Orchestrator>,
+    settings: WorkerSettings,
     sink: TuiEventSink,
     approvals: InteractiveApprovalGate,
     mut commands: mpsc::Receiver<Command>,
@@ -112,9 +122,18 @@ async fn run_worker(
         };
 
         match command {
-            Command::Submit(objective) => {
+            Command::Submit { objective, mode } => {
                 if cancel.is_cancelled() {
                     break;
+                }
+                if mode == TaskMode::Change && !settings.change_available {
+                    let _ = sink
+                        .send_critical(AgentEvent::Failed {
+                            reason: "Change mode is gated until reviewed write and verifier scripts are installed"
+                                .into(),
+                        })
+                        .await;
+                    continue;
                 }
 
                 let task_cancel = cancel.child_token();
@@ -128,8 +147,9 @@ async fn run_worker(
                     break;
                 }
 
-                let request =
-                    TaskRequest::new(objective, repo_root.clone()).with_budget(budget.clone());
+                let request = TaskRequest::new(objective, settings.repo_root.clone())
+                    .with_mode(mode)
+                    .with_budget(settings.budget.clone());
                 let run = orchestrator.run(request, task_cancel.clone());
                 tokio::pin!(run);
 
@@ -152,7 +172,7 @@ async fn run_worker(
                                     approvals.resolve(&approval_id, approved),
                                 );
                             }
-                            Some(Command::Submit(_)) => {
+                            Some(Command::Submit { .. }) => {
                                 sink.notice(
                                     EventLevel::Warning,
                                     "a task is already running; wait for it or cancel it",

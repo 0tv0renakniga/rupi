@@ -6,22 +6,32 @@ not commit, push, install packages, or discover endpoints.
 
 ## Prerequisites
 
-- Linux with Bubblewrap (`bwrap`) installed and usable by the harness account.
+- A fixed Python 3 interpreter at an absolute path such as
+  `/usr/bin/python3`. PATH lookup is not used for helper execution.
+- Reviewed helper scripts installed at a canonical directory outside the
+  project root. The active read-only inventory is `read_file.py`,
+  `git_status.py`, and `git_diff.py`.
 - Rust toolchain, `cargo`, and the verifier tools required by the target
   repository (`rustfmt` for Rust projects).
 - A loopback OpenAI-compatible model server, normally `llama-server` on
   `http://127.0.0.1:8080`.
 - Optionally, a loopback Jev System 1 service. Jev is advisory; an unavailable
   Jev degrades to conservative routing and does not authorize anything.
-- Fixed, reviewed MCP executables for the `filesystem`, `git`, and `shell`
-  slots. Do not use PATH lookup, downloaded binaries, or model-selected paths.
+
+Bubblewrap and fixed MCP executables are only needed if you explicitly run the
+frozen MCP reference/demo path. The normal TUI and headless workflows do not
+start MCP and do not require MCP profiles, executables, digests, or sandbox
+startup.
 
 Build and test on the target or prepare an offline/vendored build as described
-in the main README. Keep `Cargo.lock`, MCP binaries, and model files pinned.
+in the main README. Keep `Cargo.lock`, reviewed helper scripts, and model files
+pinned.
 
 ## Minimal production-safe configuration
 
-Start with `read_only`, then enable mutation only when required.
+The default execution backend is the fixed script substrate. Investigate is the
+first enabled workflow; Change is gated until reviewed `write_file.py` and
+`run_verifier.py` scripts are installed.
 
 ```sh
 export HARNESS_ROOT=/srv/harness/workspace
@@ -30,24 +40,19 @@ export HARNESS_LLM_BASE=http://127.0.0.1:8080
 export HARNESS_MODEL=local-model
 export HARNESS_JEV_BASE=http://127.0.0.1:9090
 
-export HARNESS_MCP_PROFILE=read_only
-export HARNESS_MCP_FS_EXECUTABLE=/opt/harness/bin/filesystem-mcp
-export HARNESS_MCP_FS_SANDBOX_MODE=bubblewrap
-export HARNESS_MCP_FS_SANDBOX_EXECUTABLE=/usr/bin/bwrap
-export HARNESS_MCP_GIT_EXECUTABLE=/opt/harness/bin/git-mcp
-export HARNESS_MCP_GIT_SANDBOX_MODE=bubblewrap
-export HARNESS_MCP_GIT_SANDBOX_EXECUTABLE=/usr/bin/bwrap
-
-# Pin the reviewed executable digests. Compute them from the canonical files.
-export HARNESS_MCP_APPROVED_DIGESTS='{"filesystem":"<64-hex>","git":"<64-hex>"}'
+export HARNESS_SCRIPT_ROOT=/opt/harness/scripts
+export HARNESS_SCRIPT_INTERPRETER=/usr/bin/python3
+# Optional; default is 60 seconds and the maximum is 3600.
+# export HARNESS_SCRIPT_TIMEOUT_SECS=60
 
 # Default is <root>/.harness-audit/audit.jsonl.
 # export HARNESS_AUDIT_PATH=/var/lib/harness/audit.jsonl
 ```
 
-Do not set `HARNESS_MCP_ALLOW_UNSANDBOXED=true` in production. It is a visibly
-unsafe development/testing exception and is rejected for enabled servers unless
-explicitly present.
+If `HARNESS_SCRIPT_ROOT` is omitted, the harness looks for `scripts/` beside the
+executable, in the installed share directory, then in the working directory.
+Startup still canonicalizes the selected directory and requires it to remain
+outside the project root. No MCP configuration is required.
 
 Useful bounds:
 
@@ -71,24 +76,25 @@ local operator evidence rather than model context. Symlinks that resolve into
 
 ## Preflight and first run
 
-Validate configuration and the full MCP startup/shutdown path before opening the
-terminal UI:
+Validate configuration and the active script-runtime composition before opening
+the terminal UI:
 
 ```sh
 cargo run -- --headless
 ```
 
-Expected output includes the profile, number of started servers, Bubblewrap
-warnings, and any configuration error. A failure here means no task was
-accepted. Then start the TUI:
+Expected output includes the canonical project root, script root, interpreter,
+audit path, each resolved script mapping, and whether Change is available or
+gated. A failure here means no task was accepted. This preflight never starts
+MCP. Then start the TUI:
 
 ```sh
 cargo run
 ```
 
-Use a disposable repository for the first live task. Start with a read-only
-inspection task. Confirm the audit file exists before enabling
-`workspace_mutation`.
+Use a disposable repository for the first live task. Investigate is selected by
+default when Change is gated. Confirm the audit file and evidence brief exist
+before installing write/verifier scripts.
 
 ## Path policy
 
@@ -209,10 +215,42 @@ the task or mutate repository content. Model-visible tool errors include
 teaching errors for malformed action arguments, policy denials, and bounded
 helper failures.
 
-The interactive TUI still starts through the configured MCP runtime. Selection
-of the read-only script catalog by an operator-facing task mode is introduced
-in the next workflow milestone; until then the catalog and script executor are
-an orchestrator library boundary exercised by integration tests.
+## Investigate mode
+
+The operator selects `Investigate` before submitting a task. In the TUI, press
+`F2` while the task-entry field is focused to toggle between `change` and
+`investigate`; the header and prompt show the selected mode. A mode is fixed for
+the lifetime of the task and cannot be changed by the model.
+
+Investigate tasks use the read-only transition path `Learn -> Review ->
+Compile`. Plan, Act, and Verify are unavailable, so no mutation can be approved
+or dispatched. The model sees only `read_file`, `git_status`, and `git_diff`.
+
+Completion requires a durable, bounded, redacted evidence brief at:
+
+```text
+$HARNESS_ROOT/.ai-wiki/evidence/<task-id>.md
+```
+
+The brief separates harness-confirmed facts (successful read-only actions,
+inspected files, and observed Git state) from model hypotheses, records missing
+evidence and uncertainty, and includes a recommended next action. If model
+findings are unavailable or the model call fails, the deterministic compiler
+fallback still writes the brief from the recorded action trace. Cancellation
+before compilation leaves no brief and produces a cancelled terminal state, not
+completion.
+
+The TUI and `--headless` both construct the same script runtime: canonical path
+policy, audit sink, fixed `ScriptRunner`, and `ScriptToolExecutor` injected into
+the orchestrator as a `ToolExecutor`. Investigate tasks dispatch through that
+script runner; no MCP runtime, server, profile, digest, or Bubblewrap startup is
+required.
+
+The TUI shows Change as gated when `write_file.py` or `run_verifier.py` is not
+installed. The worker also rejects a Change submission defensively. MCP is never
+selected as an automatic fallback. The script inventory and installed location
+are resolved at startup; release packaging and checksum verification remain
+separate release work.
 
 ## Audit evidence
 
@@ -223,12 +261,13 @@ $HARNESS_ROOT/.harness-audit/audit.jsonl
 ```
 
 Each record is bounded to 16 KiB. Records include task/phase transitions, plan
-summary, tool classification, script action outcomes, approval decisions,
-verification outcomes, Wiki compilation, and local MCP provenance (canonical
-executable path, SHA-256, and reported version). Raw tool payloads, file
-contents, prompts, hidden reasoning, credentials, and complete HTTP/MCP bodies
-are not recorded in tool audit records. Verification output is bounded and
-redacted, but it is still local evidence and should be treated as sensitive.
+summary, tool classification, fixed script identity and action outcomes,
+approval decisions, verification outcomes, Wiki compilation, and evidence brief
+compilation. Raw tool payloads, file contents, prompts, hidden reasoning, and
+credentials are not recorded in tool audit records. The frozen MCP adapter, if
+run explicitly, would also record local executable provenance; it is not part of
+the normal startup path. Verification output is bounded and redacted, but it is
+still local evidence and should be treated as sensitive.
 
 Inspect evidence with:
 
@@ -244,10 +283,10 @@ file in place.
 
 ## Repeatable demonstration
 
-The deterministic production-safe demo runs real Bubblewrap-contained MCP
-processes using the repository's mock MCP test binary in real-filesystem mode,
-plus approvals, Cargo verification, audit, and Wiki compilation against temporary
-fixtures:
+The deterministic reference demo exercises the frozen MCP adapter with real
+Bubblewrap-contained processes, approvals, Cargo verification, audit, and Wiki
+compilation against temporary fixtures. It is not the active P0 execution path;
+use `--headless` and the TUI to validate the script substrate:
 
 ```sh
 ./demo/run.sh
@@ -280,17 +319,18 @@ host failure can still leave the terminal in a bad state.
 - Cancellation never converts into completion. Review the audit terminal
   record before restarting.
 
-### Orphaned MCP processes
+### Orphaned helper-script processes
 
-The harness uses `kill_on_drop` and bounded shutdown, but a host crash can leave
-children behind. Inspect only the expected executables:
+The script runner uses `kill_on_drop`, hard timeouts, and explicit reaping, but a
+host crash can leave a helper behind. Inspect only the expected script names:
 
 ```sh
-pgrep -af 'filesystem-mcp|git-mcp|shell-mcp'
+pgrep -af 'read_file.py|git_status.py|git_diff.py'
 ```
 
-Terminate only the specific orphaned processes after confirming they belong to
-the harness. Do not use a broad `pkill` pattern on a shared host.
+Terminate only specific orphaned processes after confirming they belong to the
+harness. Do not use a broad `pkill` pattern on a shared host. If you explicitly
+run the frozen MCP demo, inspect only its documented mock server executable.
 
 ### Audit write failure
 
@@ -312,9 +352,9 @@ failed verification returns the task to `Act` only within the retry budget; when
 the budget is exhausted the task becomes `Blocked`. Do not claim completion
 manually. Inspect the workspace diff, fix the cause, and start a new task.
 
-Verification commands run as the harness account, outside the MCP sandbox. Run
-the harness under a dedicated account or container with the same filesystem and
-network policy you intend for verifier commands.
+Verification commands run as the harness account, outside the helper-script
+boundary. Run the harness under a dedicated account or container with the same
+filesystem and network policy you intend for verifier commands.
 
 ### Wiki load or compile failure
 
@@ -355,7 +395,8 @@ git restore -- <path>
 - The demo's model is scripted; it proves harness wiring, not live model quality.
 - Audit retention and rotation are operator responsibilities.
 - The harness enforces one task at a time, but it is not a multi-tenant service.
-- Bubblewrap contains MCP children; verifier commands and the harness itself run
-  outside that sandbox.
+- The active script path does not use Bubblewrap; helper scripts are constrained
+  by the fixed inventory and path policy, not an OS sandbox. Verifier commands
+  and the harness itself run outside the helper-script boundary.
 - Remote/work activation is a separate administrative decision and is not part
   of the local-first profile.

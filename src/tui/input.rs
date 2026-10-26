@@ -1,6 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::events::Command;
+use crate::state_machine::TaskMode;
 use crate::tui::app::{AppState, InputMode, MAX_TASK_INPUT_BYTES, TaskStatus, TranscriptKind};
 
 /// Translate one key press into an optional worker command. All other changes
@@ -129,6 +130,24 @@ fn handle_quit(app: &mut AppState) -> Option<Command> {
 fn handle_task_entry(app: &mut AppState, key: KeyEvent, ctrl: bool, alt: bool) -> Option<Command> {
     match key.code {
         KeyCode::Enter => submit_task(app),
+        KeyCode::F(2) => {
+            app.selected_mode = match app.selected_mode {
+                TaskMode::Change => TaskMode::Investigate,
+                TaskMode::Investigate if app.change_available => TaskMode::Change,
+                TaskMode::Investigate => {
+                    app.push_notice(
+                        TranscriptKind::Warning,
+                        "Change mode is gated until reviewed write and verifier scripts are installed",
+                    );
+                    return None;
+                }
+            };
+            app.push_notice(
+                TranscriptKind::Info,
+                &format!("task mode selected: {}", app.selected_mode.as_str()),
+            );
+            None
+        }
         KeyCode::Backspace => {
             app.task_input.pop();
             None
@@ -179,6 +198,13 @@ fn submit_task(app: &mut AppState) -> Option<Command> {
     if objective.is_empty() {
         return None;
     }
+    if app.selected_mode == TaskMode::Change && !app.change_available {
+        app.push_notice(
+            TranscriptKind::Warning,
+            "Change mode is gated until reviewed write and verifier scripts are installed",
+        );
+        return None;
+    }
 
     app.task_input.clear();
     app.task_status = TaskStatus::Running;
@@ -195,9 +221,15 @@ fn submit_task(app: &mut AppState) -> Option<Command> {
     app.detail = "Submitting task...".into();
     app.push_entry(
         TranscriptKind::Task,
-        format!("submitting task: {objective}"),
+        format!(
+            "submitting {} task: {objective}",
+            app.selected_mode.as_str()
+        ),
     );
-    Some(Command::Submit(objective))
+    Some(Command::Submit {
+        objective,
+        mode: app.selected_mode,
+    })
 }
 
 fn resolve_approval(app: &mut AppState, approved: bool) -> Option<Command> {

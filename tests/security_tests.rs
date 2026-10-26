@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use local_agent_harness::approval::ApprovalPolicy;
-use local_agent_harness::config::{Config, EndpointConfig, McpRuntimeConfig};
+use local_agent_harness::config::{Config, EndpointConfig, ScriptConfig};
 use local_agent_harness::error::AgentError;
 use local_agent_harness::jev::{JevClient, Route};
 use local_agent_harness::llm::LlmBackend;
@@ -93,7 +93,7 @@ fn config_with(llm_base: &str, jev_base: &str) -> Config {
         min_route_conf: 0.85,
         budget: TaskBudget::default(),
         approval: ApprovalPolicy::default(),
-        mcp: McpRuntimeConfig::default(),
+        scripts: ScriptConfig::default(),
     }
 }
 

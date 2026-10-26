@@ -1,11 +1,8 @@
 #![forbid(unsafe_code)]
 
-use std::time::Duration;
-
 use local_agent_harness::config::{Config, log_safe_endpoint};
-use local_agent_harness::error::{AgentError, Result};
-use local_agent_harness::mcp::McpRuntime;
-use local_agent_harness::policy::Policy;
+use local_agent_harness::error::Result;
+use local_agent_harness::runtime;
 use local_agent_harness::tui;
 use tracing_subscriber::EnvFilter;
 
@@ -32,27 +29,26 @@ async fn main() -> Result<()> {
 }
 
 async fn run_headless(config: Config) -> Result<()> {
-    let policy = Policy::new(config.root.clone()).map_err(|error| {
-        AgentError::Config(format!("repository path policy is invalid: {error}"))
-    })?;
-    let runtime = McpRuntime::start(
-        &config.mcp,
-        &config.root,
-        policy,
-        config.budget.max_tool_output_bytes,
-    )
-    .await?;
-
-    for warning in runtime.warnings() {
-        println!("{warning}");
-    }
+    let preflight = runtime::preflight(&config)?;
     println!(
-        "mcp startup ok: profile={} servers={}",
-        runtime.profile().as_str(),
-        runtime.started_servers().len()
+        "script runtime ok: project_root={} script_root={} interpreter={} audit={}",
+        preflight.project_root.display(),
+        preflight.script_root.display(),
+        preflight.interpreter.display(),
+        preflight.audit_path.display()
     );
-
-    runtime.shutdown(Duration::from_secs(2)).await
+    for (action, script) in &preflight.mappings {
+        println!("script action: {} -> {}", action.as_str(), script.display());
+    }
+    if preflight.capabilities.change_ready() {
+        println!("change mode: available");
+    } else {
+        println!(
+            "change mode: gated; missing {}",
+            preflight.capabilities.missing_file_names().join(", ")
+        );
+    }
+    Ok(())
 }
 
 fn init_tracing() {
