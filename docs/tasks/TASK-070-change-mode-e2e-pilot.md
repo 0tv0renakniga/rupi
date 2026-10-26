@@ -1,6 +1,7 @@
 # TASK-070 — Change-Mode End-to-End Disposable-Repository Pilot
 
 **Initial status:** Blocked  
+**Status:** Awaiting review  
 **Depends on:** TASK-040, TASK-041, and TASK-061 accepted
 
 ## Goal

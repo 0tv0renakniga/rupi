@@ -330,6 +330,44 @@ SHA-256 digest, and, for replacement, the previous digest. Audit
 successful write marks prior verification stale and the orchestrator must run
 harness-selected verification before review and completion.
 
+## Change-mode disposable-repository pilot
+
+Use a throwaway repository for the end-to-end Change-mode drill. The automated
+pilot covers approval, a deliberate verification failure, recovery, diff review,
+audit persistence, real local Wiki compilation, and the absence of MCP startup:
+
+```sh
+cargo test --test change_mode_pilot_tests
+```
+
+The test repository provides a tiny `.venv/bin/python` fixture verifier, so it
+does not install packages or call an external test runner. The production
+workflow still uses the verifier profile detected from the target repository.
+
+For an operator pilot with the TUI:
+
+1. Copy or clone a disposable repository, confirm `git status` is clean, and
+   choose a single target file and an objective that is easy to verify.
+2. Start the TUI with the fixed script substrate and loopback model. Do not
+   configure or start MCP for this drill.
+3. Submit a Change objective. Review the advisory plan, then approve only the
+   expected target path when prompted.
+4. If verification fails, confirm the task returns to Act with a bounded
+   `VERIFICATION FAILED` message. Correct the target and approve the new write;
+   the task must not reach Completed before a passing verifier record.
+5. After completion, confirm only the intended path changed:
+   `git status --porcelain` and `git diff -- <path>`.
+6. Inspect the audit evidence for the approval, write, failed verification,
+   passing verification, and final completed task. Confirm no raw file content,
+   secrets, or MCP activity appears in the records.
+7. Inspect `.ai-wiki/state-of-the-world.md` and
+   `.ai-wiki/sessions/session-log.jsonl`. The compiled state must show the
+   changed file and a passing `How to verify` command; the session record must
+   retain the final verification evidence and diff observation.
+8. Repeat with a fresh disposable copy and deny the approval. The task should
+   become Blocked, the target must remain unchanged, no write script record
+   should exist, and no verification should run.
+
 ## Audit evidence
 
 Audit records are append-only JSON Lines. The default location is:
