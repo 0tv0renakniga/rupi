@@ -111,6 +111,26 @@ looping, or otherwise unresolvable symlink paths fail closed with
 `PATH_SYMLINK_ESCAPE`; resolved sensitive aliases fail with `PATH_SENSITIVE`.
 Policy errors use stable `PATH_*` codes and bound the echoed path to 256 bytes.
 
+## Read-file helper
+
+`scripts/read_file.py` reads a repository-relative path and accepts optional
+1-based inclusive `line_start` and `line_end` parameters. It only returns
+selected content that decodes as UTF-8; invalid selected content fails with
+`READ_NOT_UTF8`. Path authorization, sensitive-name denial, and symlink-escape
+rejection use the shared policy before the target is opened. Directories and
+other non-regular targets fail with `READ_NOT_FILE`. The helper never mutates
+the file.
+
+Successful protocol data has a stable shape: `path`, `content`, `line_start`,
+`line_end`, `next_line`, `truncated`, and `partial_line`. `line_start` and
+`line_end` identify the first and last source lines present in `content`, or are
+`null` when no lines were selected. Content is capped at 64 KiB. When the cap
+interrupts a larger selection, `truncated` is `true` and `next_line` is the next
+source line to request. Content normally ends at a line boundary; if one selected
+source line is larger than the cap, a UTF-8-safe prefix is returned with
+`partial_line` set. The unreturned remainder of that line is not addressable by
+line range.
+
 ## Script runtime boundary
 
 The fixed helper-script runner is the only script execution path. It launches a
