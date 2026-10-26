@@ -131,6 +131,21 @@ source line is larger than the cap, a UTF-8-safe prefix is returned with
 `partial_line` set. The unreturned remainder of that line is not addressable by
 line range.
 
+## Git status helper
+
+`scripts/git_status.py` runs only a fixed `git status --porcelain=v1
+--untracked-files=normal -- .` command in the configured root. It disables the
+pager, sets `GIT_OPTIONAL_LOCKS=0`, ignores system and global Git configuration,
+disables terminal prompts, and passes a minimal environment. Repository paths
+are quoted by Git, and control characters are replaced before output. The helper
+does not refresh the index or mutate the worktree, index, refs, remotes, or Git
+configuration.
+
+Successful protocol data contains `clean`, `status`, and `truncated`. Status is
+capped at 64 KiB and a capped result is marked `truncated`. Clean repositories
+return an empty `status` with `clean: true`. A root that is not inside a Git
+repository returns the helper error `NOT_A_GIT_REPOSITORY`.
+
 ## Script runtime boundary
 
 The fixed helper-script runner is the only script execution path. It launches a
