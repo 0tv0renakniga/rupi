@@ -4,24 +4,25 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 
 use crate::tui::app::{
-    AppState, DetailPane, InputMode, StreamState, TaskStatus, TranscriptEntry, TranscriptKind,
+    AppState, FocusPane, InputMode, MAX_DISPLAY_TEXT_BYTES, MainTab, StreamState, TaskStatus,
+    TranscriptEntry, TranscriptKind, bounded_display_text,
 };
 
 /// Render the complete UI from presentation state only. This function performs
 /// no network, filesystem, or tool I/O.
 pub fn draw(frame: &mut Frame, app: &AppState) {
     let area = frame.area();
-    if area.width == 0 || area.height == 0 {
+    if area.width < 8 || area.height < 5 {
         return;
     }
 
-    if area.width < 72 || area.height < 14 {
-        draw_compact(frame, area, app);
-    } else {
+    if area.width >= 72 && area.height >= 14 {
         draw_wide(frame, area, app);
+    } else {
+        draw_compact(frame, area, app);
     }
 
     if app.show_help {
@@ -34,6 +35,8 @@ fn draw_wide(frame: &mut Frame, area: Rect, app: &AppState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(3),
             Constraint::Min(3),
             Constraint::Length(3),
             Constraint::Length(1),
@@ -41,15 +44,17 @@ fn draw_wide(frame: &mut Frame, area: Rect, app: &AppState) {
         .split(area);
 
     draw_header(frame, rows[0], app);
+    draw_header_details(frame, rows[1], app);
+    draw_tabs(frame, rows[2], app, true);
 
     let body = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
-        .split(rows[1]);
-    draw_transcript(frame, body[0], app);
-    draw_detail(frame, body[1], app);
-    draw_input(frame, rows[2], app);
-    draw_footer(frame, rows[3], app);
+        .constraints([Constraint::Percentage(72), Constraint::Percentage(28)])
+        .split(rows[3]);
+    draw_content(frame, body[0], app);
+    draw_explorer(frame, body[1], app);
+    draw_input(frame, rows[4], app);
+    draw_footer(frame, rows[5], app);
 }
 
 fn draw_compact(frame: &mut Frame, area: Rect, app: &AppState) {
@@ -57,16 +62,29 @@ fn draw_compact(frame: &mut Frame, area: Rect, app: &AppState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Min(2),
+            Constraint::Length(3),
             Constraint::Length(1),
         ])
         .split(area);
 
-    draw_header(frame, rows[0], app);
-    draw_transcript(frame, rows[1], app);
-    draw_input(frame, rows[2], app);
-    draw_footer(frame, rows[3], app);
+    draw_header_compact(frame, rows[0], app);
+    draw_tabs(frame, rows[1], app, false);
+
+    let explorer_width = area
+        .width
+        .saturating_div(3)
+        .clamp(10, 24)
+        .min(area.width.saturating_sub(1));
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(1), Constraint::Length(explorer_width)])
+        .split(rows[2]);
+    draw_content(frame, body[0], app);
+    draw_explorer(frame, body[1], app);
+    draw_input(frame, rows[3], app);
+    draw_footer(frame, rows[4], app);
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &AppState) {
@@ -90,26 +108,23 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &AppState) {
         Span::styled(status, Style::default().fg(status_color(app.task_status))),
         Span::raw(" | "),
         Span::raw(elapsed),
-        Span::raw(" | mode "),
-        Span::raw(app.selected_mode.as_str()),
-        Span::raw(" | tools "),
-        Span::raw(app.tool_count.to_string()),
     ];
+    push_field(
+        &mut spans,
+        "endpoint",
+        bounded_display_text(&app.endpoint_mode, 64),
+    );
+    push_field(&mut spans, "mode", app.selected_mode.as_str().to_owned());
+    push_field(
+        &mut spans,
+        "tools",
+        format!(
+            "{} ({})",
+            bounded_display_text(&app.tool_indicator, 64),
+            app.tool_count
+        ),
+    );
 
-    if !app.model.is_empty() {
-        spans.push(Span::raw(" | model "));
-        spans.push(Span::raw(crate::tui::app::bounded_display_text(
-            &app.model, 128,
-        )));
-    }
-    if !app.endpoint_mode.is_empty() {
-        spans.push(Span::raw(" | "));
-        spans.push(Span::raw(app.endpoint_mode.clone()));
-    }
-    if !app.budget_summary.is_empty() {
-        spans.push(Span::raw(" | "));
-        spans.push(Span::raw(app.budget_summary.clone()));
-    }
     if app.stream_truncated || app.transcript_truncated {
         spans.push(Span::styled(
             " | TRUNCATED",
@@ -128,8 +143,121 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &AppState) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_transcript(frame: &mut Frame, area: Rect, app: &AppState) {
-    let focused = app.selected_detail == DetailPane::Transcript;
+fn draw_header_details(frame: &mut Frame, area: Rect, app: &AppState) {
+    let mut spans = Vec::new();
+    push_field(
+        &mut spans,
+        "project",
+        bounded_display_text(&app.project, MAX_DISPLAY_TEXT_BYTES),
+    );
+    push_field(&mut spans, "model", bounded_display_text(&app.model, 128));
+    push_field(
+        &mut spans,
+        "ctx",
+        bounded_display_text(&app.context_summary, 64),
+    );
+    push_field(
+        &mut spans,
+        "session",
+        bounded_display_text(&app.session, 64),
+    );
+    push_field(&mut spans, "focus", app.focus.label().to_owned());
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn draw_header_compact(frame: &mut Frame, area: Rect, app: &AppState) {
+    let status = task_status_text(app);
+    let mut spans = vec![
+        Span::styled(
+            " Local Agent Harness ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" | "),
+        Span::styled(
+            format!("{:?}", app.phase),
+            Style::default()
+                .fg(phase_color(app.phase))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" | "),
+        Span::styled(status, Style::default().fg(status_color(app.task_status))),
+    ];
+    push_field(
+        &mut spans,
+        "project",
+        bounded_display_text(&app.project, 128),
+    );
+    push_field(&mut spans, "mode", app.selected_mode.as_str().to_owned());
+    push_field(
+        &mut spans,
+        "tools",
+        bounded_display_text(&app.tool_indicator, 64),
+    );
+    push_field(
+        &mut spans,
+        "ctx",
+        bounded_display_text(&app.context_summary, 64),
+    );
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn push_field(spans: &mut Vec<Span<'static>>, label: &str, value: String) {
+    if !spans.is_empty() {
+        spans.push(Span::raw(" | "));
+    }
+    spans.push(Span::styled(
+        format!("{label}: "),
+        Style::default().fg(Color::DarkGray),
+    ));
+    spans.push(Span::raw(value));
+}
+
+fn draw_tabs(frame: &mut Frame, area: Rect, app: &AppState, framed: bool) {
+    let titles = MainTab::ALL
+        .iter()
+        .map(|tab| {
+            let style = if *tab == app.active_tab {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            Line::from(Span::styled(format!(" {} ", tab.label()), style))
+        })
+        .collect::<Vec<_>>();
+    let highlight = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let selected = app.active_tab.index();
+    let tabs = Tabs::new(titles)
+        .select(selected)
+        .divider(Span::raw("|"))
+        .highlight_style(highlight);
+
+    if framed {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(if app.focus == FocusPane::Tabs {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            })
+            .title(" Tabs ");
+        frame.render_widget(tabs.block(block), area);
+    } else {
+        frame.render_widget(tabs, area);
+    }
+}
+
+fn draw_content(frame: &mut Frame, area: Rect, app: &AppState) {
+    let focused = app.focus == FocusPane::Content;
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(if focused {
@@ -137,24 +265,60 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &AppState) {
         } else {
             Style::default().fg(Color::DarkGray)
         })
-        .title(" Activity ");
+        .title(format!(" {} ", app.active_tab.label()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let lines = transcript_lines(app);
+    let lines = content_lines(app);
     let height = inner.height as usize;
     if height == 0 {
         return;
     }
     let total = lines.len();
-    let start = total.saturating_sub(height.saturating_add(app.scroll_offset));
+    let scroll = if app.active_tab == MainTab::Chat {
+        app.scroll_offset
+    } else {
+        app.content_scroll
+    };
+    let start = total.saturating_sub(height.saturating_add(scroll));
     let end = start.saturating_add(height).min(total);
     let visible = lines[start..end].to_vec();
     frame.render_widget(Paragraph::new(visible).wrap(Wrap { trim: true }), inner);
 }
 
-fn draw_detail(frame: &mut Frame, area: Rect, app: &AppState) {
-    let focused = app.selected_detail == DetailPane::Detail;
+fn content_lines(app: &AppState) -> Vec<Line<'static>> {
+    match app.active_tab {
+        MainTab::Chat if !app.transcript.is_empty() => transcript_lines(app),
+        MainTab::Output => {
+            let mut lines = fixture_lines(app.active_tab_lines());
+            if !app.detail.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![
+                    Span::styled("live: ", Style::default().fg(Color::Cyan)),
+                    Span::raw(bounded_display_text(&app.detail, MAX_DISPLAY_TEXT_BYTES)),
+                ]));
+            }
+            lines
+        }
+        _ => fixture_lines(app.active_tab_lines()),
+    }
+}
+
+fn fixture_lines(lines: &[String]) -> Vec<Line<'static>> {
+    if lines.is_empty() {
+        return vec![Line::from(Span::styled(
+            "No fixture content.",
+            Style::default().fg(Color::DarkGray),
+        ))];
+    }
+    lines
+        .iter()
+        .map(|line| Line::from(bounded_display_text(line, MAX_DISPLAY_TEXT_BYTES)))
+        .collect()
+}
+
+fn draw_explorer(frame: &mut Frame, area: Rect, app: &AppState) {
+    let focused = app.focus == FocusPane::Explorer;
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(if focused {
@@ -162,29 +326,39 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &AppState) {
         } else {
             Style::default().fg(Color::DarkGray)
         })
-        .title(" Detail ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let text = if app.detail.is_empty() {
-        "Detail appears here. Tab switches focus.".to_owned()
+        .title("Explorer");
+    let items = app
+        .fixtures
+        .explorer
+        .iter()
+        .map(|line| {
+            ListItem::new(Line::from(bounded_display_text(
+                line,
+                MAX_DISPLAY_TEXT_BYTES,
+            )))
+        })
+        .collect::<Vec<_>>();
+    let selected = if items.is_empty() {
+        None
     } else {
-        app.detail.clone()
+        Some(app.explorer_selected.min(items.len() - 1))
     };
-    let style = if app.last_error.is_some() && app.task_status == TaskStatus::Failed {
-        Style::default().fg(Color::Red)
-    } else {
-        Style::default().fg(Color::Gray)
-    };
-    frame.render_widget(
-        Paragraph::new(text).style(style).wrap(Wrap { trim: true }),
-        inner,
-    );
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("> ");
+    let mut state = ListState::default();
+    state.select(selected);
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn draw_input(frame: &mut Frame, area: Rect, app: &AppState) {
     let title = match app.input_mode {
-        InputMode::TaskEntry => " Task ",
+        InputMode::TaskEntry => " Prompt ",
         InputMode::Running => " Running ",
         InputMode::Approval => " Approval ",
         InputMode::Blocked => " Blocked ",
@@ -192,9 +366,14 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &AppState) {
         InputMode::Cancelled => " Cancelled ",
         InputMode::Failed => " Failed ",
     };
+    let border = if app.focus == FocusPane::Prompt {
+        input_color(app.input_mode)
+    } else {
+        Color::DarkGray
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(input_color(app.input_mode)))
+        .border_style(Style::default().fg(border))
         .title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -208,15 +387,30 @@ fn draw_input(frame: &mut Frame, area: Rect, app: &AppState) {
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState) {
     let text = if app.show_help {
-        "Esc/? close help | Ctrl-C cancel | q quit"
+        format!(
+            "Esc/? close help | focus: {} | tab: {} | Ctrl-C cancel | q quit",
+            app.focus.label(),
+            app.active_tab.label()
+        )
+    } else if app.focus == FocusPane::Tabs {
+        format!(
+            "focus: tabs | Left/Right select {} | Tab next | Shift-Tab previous | ? help",
+            app.active_tab.label()
+        )
+    } else if app.focus == FocusPane::Content {
+        "focus: content | Up/Down scroll | PgUp/PgDn page | Tab next | ? help".to_owned()
+    } else if app.focus == FocusPane::Explorer {
+        "focus: explorer | Up/Down select | PgUp/PgDn page | Tab next | ? help".to_owned()
     } else if app.input_mode == InputMode::TaskEntry {
-        "Enter submit | F2 cycle mode | F1 help | Ctrl-C quit | Up/Down scroll | Tab pane"
+        "focus: prompt | Enter submit | F2 cycle mode | Tab focus | F1 help | Ctrl-C quit"
+            .to_owned()
     } else if app.input_mode == InputMode::Approval {
-        "y/Enter approve | n/Esc deny | Ctrl-C cancel | ? help"
+        "y/Enter approve | n/Esc deny | Ctrl-C cancel | Tab focus | ? help".to_owned()
     } else if app.input_mode.is_terminal() {
-        "q quit | Ctrl-C quit | Up/Down scroll | Tab pane | ? help"
+        "q quit | Ctrl-C quit | Up/Down scroll | Tab focus | ? help".to_owned()
     } else {
-        "Ctrl-C cancel | Esc interrupt (unsupported) | Up/Down scroll | Tab pane | ? help | q cancel"
+        "Ctrl-C cancel | Esc interrupt (unsupported) | Up/Down scroll | Tab focus | ? help | q cancel"
+            .to_owned()
     };
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
@@ -241,13 +435,16 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &AppState) {
         Line::from("Esc          deny approval; close help; interrupt is unsupported"),
         Line::from("Ctrl-C       cancel active task; quit when idle"),
         Line::from("q            quit; requests cancellation first while active"),
-        Line::from("Up/Down      scroll activity one line"),
-        Line::from("PgUp/PgDn    scroll activity ten lines"),
-        Line::from("Tab          switch focused pane"),
+        Line::from("Tab          cycle focus: prompt, tabs, content, explorer"),
+        Line::from("Shift-Tab    cycle focus in reverse"),
+        Line::from("Left/Right   switch tabs when the tab bar has focus"),
+        Line::from("Up/Down      scroll content or move the Explorer selection"),
+        Line::from("PgUp/PgDn    page the focused content or Explorer"),
         Line::from("? / F1       toggle this help"),
         Line::from(""),
+        Line::from("The shell renders bounded fixtures and typed presentation state."),
+        Line::from("Drawing never performs network, filesystem, or tool I/O."),
         Line::from("The TUI only observes the orchestrator and sends typed commands."),
-        Line::from("It never executes tools, calls endpoints, or marks a task complete."),
     ];
     frame.render_widget(
         Paragraph::new(text)

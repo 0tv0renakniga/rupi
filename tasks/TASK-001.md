@@ -3,7 +3,7 @@
 
 **Version:** v1
 **Depends on:** TASK-000
-**Status:** Not started
+**Status:** Done
 
 ## Objective
 Create the static TUI shell that establishes layout, navigation, focus, and fixture-driven rendering before any live model, filesystem, or tool I/O is connected.

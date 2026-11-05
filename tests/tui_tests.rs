@@ -5,7 +5,9 @@ use local_agent_harness::state_machine::{LoopState, TaskMode};
 use local_agent_harness::tui::app::{MAX_TRANSCRIPT_ENTRIES, StreamState};
 use local_agent_harness::tui::input::{handle_key, handle_paste};
 use local_agent_harness::tui::render;
-use local_agent_harness::tui::{AppState, InputMode, TaskStatus, TranscriptKind};
+use local_agent_harness::tui::{
+    AppState, FocusPane, InputMode, MainTab, TaskStatus, TranscriptKind, UiCommand,
+};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
@@ -603,10 +605,13 @@ fn narrow_terminal_renders_without_panic() {
 }
 
 #[test]
-fn wide_terminal_renders_header_and_activity() {
+fn wide_terminal_renders_header_tabs_and_explorer() {
     let mut app = AppState::default();
+    app.project = "/srv/harness/workspace".into();
     app.model = "local-model".into();
-    app.endpoint_mode = "air-gapped".into();
+    app.endpoint_mode = "local".into();
+    app.context_summary = "57% / 16k".into();
+    app.session = "12ab".into();
     app.budget_summary = "acts 40/tools 120/verify 3/wall 3600s".into();
     start(&mut app);
 
@@ -618,8 +623,138 @@ fn wide_terminal_renders_header_and_activity() {
 
     let text = buffer_text(&mut terminal);
     assert!(text.contains("Local Agent Harness"));
-    assert!(text.contains("Activity"));
-    assert!(text.contains("Detail"));
+    assert!(text.contains("project:"));
+    assert!(text.contains("/srv/harness/workspace"));
+    assert!(text.contains("model:"));
+    assert!(text.contains("local-model"));
+    assert!(text.contains("ctx:"));
+    assert!(text.contains("session:"));
+    assert!(text.contains("endpoint:"));
+    assert!(text.contains("tools:"));
+    for label in ["Chat", "Context", "Diff", "Output", "Session"] {
+        assert!(text.contains(label), "missing tab {label}: {text}");
+    }
+    assert!(text.contains("Explorer"));
+    assert!(text.contains("Read-only placeholder"));
+}
+
+#[test]
+fn all_tabs_render_static_fixture_content() {
+    for (tab, needle) in [
+        (MainTab::Chat, "Chat transcript (fixture)"),
+        (MainTab::Context, "Global context (fixture)"),
+        (MainTab::Diff, "No session changes yet."),
+        (MainTab::Output, "Diagnostics (fixture)"),
+        (MainTab::Session, "Session metadata (fixture)"),
+    ] {
+        let mut app = AppState::default();
+        app.active_tab = tab;
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render::draw(frame, &app))
+            .expect("fixture tab should render");
+
+        let text = buffer_text(&mut terminal);
+        assert!(
+            text.contains(needle),
+            "tab {tab:?} did not render {needle:?}: {text}"
+        );
+    }
+}
+
+#[test]
+fn explorer_is_persistent_across_responsive_layouts() {
+    for (width, height) in [(120, 40), (80, 24), (40, 12), (20, 8)] {
+        let app = AppState::default();
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render::draw(frame, &app))
+            .expect("responsive layout should render");
+
+        let text = buffer_text(&mut terminal);
+        assert!(
+            text.contains("Explorer"),
+            "Explorer missing at {width}x{height}: {text}"
+        );
+    }
+}
+
+#[test]
+fn focus_cycles_through_typed_ui_commands_and_tab_key() {
+    let mut app = AppState::default();
+    assert_eq!(app.focus, FocusPane::Prompt);
+
+    app.apply_ui_command(UiCommand::FocusNext);
+    assert_eq!(app.focus, FocusPane::Tabs);
+    app.apply_ui_command(UiCommand::FocusNext);
+    assert_eq!(app.focus, FocusPane::Content);
+    app.apply_ui_command(UiCommand::FocusNext);
+    assert_eq!(app.focus, FocusPane::Explorer);
+    app.apply_ui_command(UiCommand::FocusNext);
+    assert_eq!(app.focus, FocusPane::Prompt);
+
+    handle_key(&mut app, key(KeyCode::Tab));
+    assert_eq!(app.focus, FocusPane::Tabs);
+    handle_key(&mut app, key(KeyCode::BackTab));
+    assert_eq!(app.focus, FocusPane::Prompt);
+}
+
+#[test]
+fn focused_tabs_switch_with_arrow_keys_and_typed_commands() {
+    let mut app = AppState::default();
+    handle_key(&mut app, key(KeyCode::Tab));
+    assert_eq!(app.focus, FocusPane::Tabs);
+    assert_eq!(app.active_tab, MainTab::Chat);
+
+    handle_key(&mut app, key(KeyCode::Right));
+    assert_eq!(app.active_tab, MainTab::Context);
+    handle_key(&mut app, key(KeyCode::Left));
+    assert_eq!(app.active_tab, MainTab::Chat);
+
+    app.apply_ui_command(UiCommand::NextTab);
+    assert_eq!(app.active_tab, MainTab::Context);
+    app.apply_ui_command(UiCommand::PreviousTab);
+    assert_eq!(app.active_tab, MainTab::Chat);
+    app.apply_ui_command(UiCommand::SelectTab(MainTab::Output));
+    assert_eq!(app.active_tab, MainTab::Output);
+    assert_eq!(app.focus, FocusPane::Tabs);
+}
+
+#[test]
+fn explorer_focus_moves_selection_within_bounds() {
+    let mut app = AppState::default();
+    app.focus = FocusPane::Explorer;
+    assert_eq!(app.explorer_selected, 0);
+
+    handle_key(&mut app, key(KeyCode::Down));
+    assert_eq!(app.explorer_selected, 1);
+    handle_key(&mut app, key(KeyCode::Up));
+    assert_eq!(app.explorer_selected, 0);
+    handle_key(&mut app, key(KeyCode::Up));
+    assert_eq!(app.explorer_selected, 0);
+    handle_key(&mut app, key(KeyCode::PageDown));
+    assert_eq!(
+        app.explorer_selected,
+        app.fixtures.explorer.len().saturating_sub(1)
+    );
+}
+
+#[test]
+fn non_prompt_focus_does_not_type_or_submit() {
+    let mut app = AppState::default();
+    handle_key(&mut app, key(KeyCode::Tab));
+    assert_eq!(app.focus, FocusPane::Tabs);
+
+    handle_key(&mut app, key(KeyCode::Char('x')));
+    handle_key(&mut app, key(KeyCode::Enter));
+    assert!(app.task_input.is_empty());
+    assert_eq!(app.input_mode, InputMode::TaskEntry);
+
+    handle_paste(&mut app, "ignored");
+    assert!(app.task_input.is_empty());
 }
 
 #[test]

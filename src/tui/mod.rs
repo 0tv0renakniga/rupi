@@ -4,8 +4,8 @@ pub mod render;
 pub mod worker;
 
 pub use app::{
-    AppState, ApprovalPrompt, DetailPane, InputMode, StreamState, TaskStatus, TranscriptEntry,
-    TranscriptKind, VerificationView,
+    AppState, ApprovalPrompt, DetailPane, FocusPane, InputMode, MainTab, ShellFixtures,
+    StreamState, TaskStatus, TranscriptEntry, TranscriptKind, UiCommand, VerificationView,
 };
 
 use std::io::Stdout;
@@ -85,6 +85,10 @@ async fn prepare(config: &Config) -> Result<PreparedApp> {
     );
     app.endpoint_mode = config.endpoint.profile.as_str().to_owned();
     app.model = config.model.clone();
+    app.project = config.root.display().to_string();
+    app.context_summary = format!("0% / {}", config.limits.effective_context_cap_tokens());
+    app.session = "preview".into();
+    app.tool_indicator = "read-only".into();
 
     let runtime = runtime::build(config)?;
     app.change_available = runtime.capabilities.change_ready();

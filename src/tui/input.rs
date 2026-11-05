@@ -2,7 +2,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::events::Command;
 use crate::state_machine::TaskMode;
-use crate::tui::app::{AppState, InputMode, MAX_TASK_INPUT_BYTES, TaskStatus, TranscriptKind};
+use crate::tui::app::{
+    AppState, FocusPane, InputMode, MAX_TASK_INPUT_BYTES, TaskStatus, TranscriptKind,
+};
 
 /// Translate one key press into an optional worker command. All other changes
 /// are local presentation state; this function never performs I/O.
@@ -22,14 +24,102 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> Option<Command> {
         match key.code {
             KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('?') => {
                 app.show_help = false;
-                return None;
             }
             _ => {}
         }
+        return None;
     }
 
     if key.code == KeyCode::F(1) {
-        app.show_help = !app.show_help;
+        app.show_help = true;
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            app.cycle_focus_previous();
+            return None;
+        }
+        KeyCode::Tab => {
+            app.cycle_focus();
+            return None;
+        }
+        KeyCode::BackTab => {
+            app.cycle_focus_previous();
+            return None;
+        }
+        _ => {}
+    }
+
+    match app.focus {
+        FocusPane::Tabs => match key.code {
+            KeyCode::Left | KeyCode::Up => {
+                app.previous_tab();
+                return None;
+            }
+            KeyCode::Right | KeyCode::Down => {
+                app.next_tab();
+                return None;
+            }
+            _ => {}
+        },
+        FocusPane::Explorer => match key.code {
+            KeyCode::Up => {
+                app.move_explorer_selection(-1);
+                return None;
+            }
+            KeyCode::Down => {
+                app.move_explorer_selection(1);
+                return None;
+            }
+            KeyCode::PageUp => {
+                app.move_explorer_selection(-10);
+                return None;
+            }
+            KeyCode::PageDown => {
+                app.move_explorer_selection(10);
+                return None;
+            }
+            _ => {}
+        },
+        FocusPane::Content => match key.code {
+            KeyCode::Up => {
+                app.scroll_content(1);
+                return None;
+            }
+            KeyCode::Down => {
+                app.scroll_content(-1);
+                return None;
+            }
+            KeyCode::PageUp => {
+                app.scroll_content(10);
+                return None;
+            }
+            KeyCode::PageDown => {
+                app.scroll_content(-10);
+                return None;
+            }
+            _ => {}
+        },
+        FocusPane::Prompt => {}
+    }
+
+    if key.code == KeyCode::Char('?')
+        && (app.focus != FocusPane::Prompt || app.input_mode != InputMode::TaskEntry)
+    {
+        app.show_help = true;
+        return None;
+    }
+
+    if key.code == KeyCode::Char('q')
+        && !ctrl
+        && !alt
+        && (app.focus != FocusPane::Prompt || app.input_mode != InputMode::TaskEntry)
+    {
+        return handle_quit(app);
+    }
+
+    if app.focus != FocusPane::Prompt {
         return None;
     }
 
@@ -56,27 +146,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> Option<Command> {
             app.scroll_offset = app.scroll_offset.saturating_sub(10);
             return None;
         }
-        KeyCode::Tab => {
-            app.selected_detail = match app.selected_detail {
-                crate::tui::app::DetailPane::Transcript => crate::tui::app::DetailPane::Detail,
-                crate::tui::app::DetailPane::Detail => crate::tui::app::DetailPane::Transcript,
-            };
-            return None;
-        }
         _ => {}
-    }
-
-    if app.show_help {
-        return None;
-    }
-
-    if key.code == KeyCode::Char('?') && app.input_mode != InputMode::TaskEntry {
-        app.show_help = true;
-        return None;
-    }
-
-    if key.code == KeyCode::Char('q') && !ctrl && !alt && app.input_mode != InputMode::TaskEntry {
-        return handle_quit(app);
     }
 
     match app.input_mode {
@@ -93,9 +163,9 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent) -> Option<Command> {
     }
 }
 
-/// Append a bracketed-paste payload in task-entry mode only.
+/// Append a bracketed-paste payload in focused prompt-entry mode only.
 pub fn handle_paste(app: &mut AppState, text: &str) {
-    if app.input_mode != InputMode::TaskEntry || app.show_help {
+    if app.focus != FocusPane::Prompt || app.input_mode != InputMode::TaskEntry || app.show_help {
         return;
     }
     append_input(app, text);

@@ -77,6 +77,186 @@ pub enum DetailPane {
     Detail,
 }
 
+/// Main workspace tabs in the static shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MainTab {
+    #[default]
+    Chat,
+    Context,
+    Diff,
+    Output,
+    Session,
+}
+
+impl MainTab {
+    pub const ALL: [Self; 5] = [
+        Self::Chat,
+        Self::Context,
+        Self::Diff,
+        Self::Output,
+        Self::Session,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Chat => "Chat",
+            Self::Context => "Context",
+            Self::Diff => "Diff",
+            Self::Output => "Output",
+            Self::Session => "Session",
+        }
+    }
+
+    pub fn index(self) -> usize {
+        match self {
+            Self::Chat => 0,
+            Self::Context => 1,
+            Self::Diff => 2,
+            Self::Output => 3,
+            Self::Session => 4,
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Chat => Self::Context,
+            Self::Context => Self::Diff,
+            Self::Diff => Self::Output,
+            Self::Output => Self::Session,
+            Self::Session => Self::Chat,
+        }
+    }
+
+    pub fn previous(self) -> Self {
+        match self {
+            Self::Chat => Self::Session,
+            Self::Context => Self::Chat,
+            Self::Diff => Self::Context,
+            Self::Output => Self::Diff,
+            Self::Session => Self::Output,
+        }
+    }
+}
+
+/// Keyboard focus for the static shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FocusPane {
+    Tabs,
+    Content,
+    Explorer,
+    #[default]
+    Prompt,
+}
+
+impl FocusPane {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tabs => "tabs",
+            Self::Content => "content",
+            Self::Explorer => "explorer",
+            Self::Prompt => "prompt",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Prompt => Self::Tabs,
+            Self::Tabs => Self::Content,
+            Self::Content => Self::Explorer,
+            Self::Explorer => Self::Prompt,
+        }
+    }
+
+    pub fn previous(self) -> Self {
+        match self {
+            Self::Prompt => Self::Explorer,
+            Self::Tabs => Self::Prompt,
+            Self::Content => Self::Tabs,
+            Self::Explorer => Self::Content,
+        }
+    }
+}
+
+/// Typed presentation-only commands used by the shell and tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiCommand {
+    FocusNext,
+    FocusPrevious,
+    NextTab,
+    PreviousTab,
+    SelectTab(MainTab),
+}
+
+/// Static, I/O-free content used by the initial shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellFixtures {
+    pub chat: Vec<String>,
+    pub context: Vec<String>,
+    pub diff: Vec<String>,
+    pub output: Vec<String>,
+    pub session: Vec<String>,
+    pub explorer: Vec<String>,
+}
+
+impl ShellFixtures {
+    pub fn lines_for(&self, tab: MainTab) -> &[String] {
+        match tab {
+            MainTab::Chat => &self.chat,
+            MainTab::Context => &self.context,
+            MainTab::Diff => &self.diff,
+            MainTab::Output => &self.output,
+            MainTab::Session => &self.session,
+        }
+    }
+}
+
+impl Default for ShellFixtures {
+    fn default() -> Self {
+        Self {
+            chat: vec![
+                "Chat transcript (fixture)".into(),
+                "Operator: inspect the request pipeline".into(),
+                "Assistant: fixture response; live streaming is not connected".into(),
+                "Status: idle".into(),
+            ],
+            context: vec![
+                "Global context (fixture)".into(),
+                "AGENTS.md: not loaded".into(),
+                "Project context: not loaded".into(),
+                "Token estimate: 0 / 12,288".into(),
+            ],
+            diff: vec![
+                "Session write log (fixture)".into(),
+                "No session changes yet.".into(),
+                "Git diff: not loaded".into(),
+            ],
+            output: vec![
+                "Diagnostics (fixture)".into(),
+                "No tool output yet.".into(),
+                "Verifier output: not loaded".into(),
+            ],
+            session: vec![
+                "Session metadata (fixture)".into(),
+                "Session: preview".into(),
+                "Persistence: not enabled".into(),
+                "Resume: unavailable".into(),
+            ],
+            explorer: vec![
+                "Read-only placeholder".into(),
+                "Project tree".into(),
+                "  src/".into(),
+                "  tasks/".into(),
+                "Permitted paths".into(),
+                "  src/**".into(),
+                "Changed paths".into(),
+                "  (none)".into(),
+                "Wiki artifacts".into(),
+                "  not loaded".into(),
+            ],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptKind {
     Task,
@@ -173,6 +353,15 @@ pub struct AppState {
     pub transcript_bytes: usize,
     pub transcript_truncated: bool,
     pub selected_detail: DetailPane,
+    pub active_tab: MainTab,
+    pub focus: FocusPane,
+    pub explorer_selected: usize,
+    pub content_scroll: usize,
+    pub fixtures: ShellFixtures,
+    pub project: String,
+    pub context_summary: String,
+    pub session: String,
+    pub tool_indicator: String,
     pub detail: String,
     pub approval: Option<ApprovalPrompt>,
     pub verification: Option<VerificationView>,
@@ -209,6 +398,15 @@ impl Default for AppState {
             transcript_bytes: 0,
             transcript_truncated: false,
             selected_detail: DetailPane::Transcript,
+            active_tab: MainTab::Chat,
+            focus: FocusPane::Prompt,
+            explorer_selected: 0,
+            content_scroll: 0,
+            fixtures: ShellFixtures::default(),
+            project: "workspace".into(),
+            context_summary: "0% / 16k".into(),
+            session: "preview".into(),
+            tool_indicator: "read-only".into(),
             detail: String::new(),
             approval: None,
             verification: None,
@@ -237,6 +435,74 @@ impl Default for AppState {
 impl AppState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn active_tab_lines(&self) -> &[String] {
+        self.fixtures.lines_for(self.active_tab)
+    }
+
+    pub fn select_tab(&mut self, tab: MainTab) {
+        if self.active_tab != tab {
+            self.active_tab = tab;
+            self.content_scroll = 0;
+        }
+    }
+
+    pub fn next_tab(&mut self) {
+        self.select_tab(self.active_tab.next());
+    }
+
+    pub fn previous_tab(&mut self) {
+        self.select_tab(self.active_tab.previous());
+    }
+
+    pub fn cycle_focus(&mut self) {
+        self.focus = self.focus.next();
+    }
+
+    pub fn cycle_focus_previous(&mut self) {
+        self.focus = self.focus.previous();
+    }
+
+    pub fn move_explorer_selection(&mut self, delta: isize) {
+        let max = self.fixtures.explorer.len().saturating_sub(1);
+        self.explorer_selected = if delta.is_negative() {
+            self.explorer_selected.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.explorer_selected
+                .saturating_add(delta as usize)
+                .min(max)
+        };
+    }
+
+    pub fn scroll_content(&mut self, delta: isize) {
+        if self.active_tab == MainTab::Chat {
+            let max = self.transcript.len().max(self.active_tab_lines().len());
+            self.scroll_offset = adjusted_scroll(self.scroll_offset, delta, max);
+        } else {
+            let max = self.active_tab_lines().len();
+            self.content_scroll = adjusted_scroll(self.content_scroll, delta, max);
+        }
+    }
+
+    /// Apply a typed presentation command. No command performs I/O.
+    pub fn apply_ui_command(&mut self, command: UiCommand) {
+        match command {
+            UiCommand::FocusNext => self.cycle_focus(),
+            UiCommand::FocusPrevious => self.cycle_focus_previous(),
+            UiCommand::NextTab => {
+                self.focus = FocusPane::Tabs;
+                self.next_tab();
+            }
+            UiCommand::PreviousTab => {
+                self.focus = FocusPane::Tabs;
+                self.previous_tab();
+            }
+            UiCommand::SelectTab(tab) => {
+                self.focus = FocusPane::Tabs;
+                self.select_tab(tab);
+            }
+        }
     }
 
     /// Request cancellation of the active task. Returns true when this is the
@@ -356,6 +622,7 @@ impl AppState {
                     summary: summary.clone(),
                 });
                 self.input_mode = InputMode::Approval;
+                self.focus = FocusPane::Prompt;
                 self.detail = format!("Approval required: {summary}");
                 self.push_entry(
                     TranscriptKind::Approval,
@@ -682,6 +949,14 @@ impl AppState {
             self.transcript_bytes = self.transcript_bytes.saturating_sub(removed.text.len());
             self.transcript_truncated = true;
         }
+    }
+}
+
+fn adjusted_scroll(current: usize, delta: isize, max: usize) -> usize {
+    if delta.is_negative() {
+        current.saturating_sub(delta.unsigned_abs())
+    } else {
+        current.saturating_add(delta as usize).min(max)
     }
 }
 
