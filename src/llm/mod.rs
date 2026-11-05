@@ -1,7 +1,9 @@
 pub mod openai_compat;
 pub mod prompts;
+pub mod visible;
 
 pub use openai_compat::{LlmLimits, OpenAiCompatClient};
+pub use visible::{VisibleChatEvent, VisibleStreamNormalizer, normalize_sse, normalize_sse_bytes};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;

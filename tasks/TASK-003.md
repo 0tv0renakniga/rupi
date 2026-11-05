@@ -3,7 +3,7 @@
 
 **Version:** v1
 **Depends on:** TASK-000
-**Status:** Not started
+**Status:** Done
 
 ## Objective
 Isolate provider and model quirks in a compatibility layer that converts raw SSE bytes into normalized visible chat events while excluding hidden reasoning from all user-visible and persisted paths.
