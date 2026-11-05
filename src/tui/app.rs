@@ -260,6 +260,7 @@ impl Default for ShellFixtures {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptKind {
     Task,
+    Operator,
     Info,
     Assistant,
     Phase,
@@ -287,6 +288,7 @@ impl TranscriptKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::Task => "TASK",
+            Self::Operator => "YOU",
             Self::Info => "INFO",
             Self::Assistant => "ASSIST",
             Self::Phase => "PHASE",
@@ -492,6 +494,7 @@ pub struct VerificationView {
 pub struct AppState {
     pub phase: LoopState,
     pub task_status: TaskStatus,
+    pub chat_active: bool,
     pub input_mode: InputMode,
     pub selected_mode: TaskMode,
     pub change_available: bool,
@@ -529,6 +532,7 @@ pub struct AppState {
     pub last_error: Option<String>,
     task_started_at: Option<Instant>,
     cancel_requested_at: Option<Instant>,
+    chat_visible_received: bool,
     next_sequence: u64,
 }
 
@@ -537,6 +541,7 @@ impl Default for AppState {
         Self {
             phase: LoopState::Boot,
             task_status: TaskStatus::Idle,
+            chat_active: false,
             input_mode: InputMode::TaskEntry,
             selected_mode: TaskMode::default(),
             change_available: true,
@@ -574,6 +579,7 @@ impl Default for AppState {
             last_error: None,
             task_started_at: None,
             cancel_requested_at: None,
+            chat_visible_received: false,
             next_sequence: 0,
         }
     }
@@ -677,8 +683,8 @@ impl AppState {
         }
     }
 
-    /// Request cancellation of the active task. Returns true when this is the
-    /// first request for the current task.
+    /// Request cancellation of the active task or Chat turn. Returns true when
+    /// this is the first request for the current run.
     pub fn request_cancel(&mut self) -> bool {
         if !self.task_status.is_active() || self.task_status == TaskStatus::Cancelling {
             return false;
@@ -769,6 +775,65 @@ impl AppState {
                 self.elapsed = Duration::ZERO;
                 self.detail = "Waiting for the orchestrator...".into();
                 self.push_entry(TranscriptKind::Task, &summary);
+            }
+            AgentEvent::ChatTurnStarted { prompt } => {
+                let prompt = bounded_multiline_display_text(&prompt, MAX_DISPLAY_TEXT_BYTES);
+                self.chat_active = true;
+                self.task_status = TaskStatus::Running;
+                self.input_mode = InputMode::Running;
+                self.phase = LoopState::Boot;
+                self.task_started_at = Some(Instant::now());
+                self.elapsed = Duration::ZERO;
+                self.approval = None;
+                self.verification = None;
+                self.stream_state = StreamState::Idle;
+                self.stream_truncated = false;
+                self.chat_visible_received = false;
+                self.cancel_requested_at = None;
+                self.cancel_grace_elapsed = false;
+                self.completion_summary = None;
+                self.last_error = None;
+                self.show_help = false;
+                self.scroll_offset = 0;
+                self.detail = "Waiting for the local model...".into();
+                self.push_entry(TranscriptKind::Operator, prompt);
+            }
+            AgentEvent::ChatTurnFinished {
+                finish_reason,
+                empty_visible_response,
+            } => {
+                let finish_reason = bounded_display_text(&finish_reason, 128);
+                let empty = empty_visible_response || !self.chat_visible_received;
+                if empty {
+                    self.remove_empty_chat_assistant();
+                    self.detail = "Chat completed without a visible response.".into();
+                    self.push_entry(
+                        TranscriptKind::EmptyResponse,
+                        "visible output = 0; no assistant message was stored",
+                    );
+                } else {
+                    self.detail = format!("Chat response complete (finish: {finish_reason}).");
+                }
+                self.finish_chat_run();
+            }
+            AgentEvent::ChatTurnCancelled { reason } => {
+                let reason = bounded_display_text(&reason, MAX_DISPLAY_TEXT_BYTES);
+                self.detail = format!("Chat turn cancelled: {reason}");
+                self.push_entry(
+                    TranscriptKind::Cancelled,
+                    format!("chat turn cancelled: {reason}"),
+                );
+                self.finish_chat_run();
+            }
+            AgentEvent::ChatTurnFailed { message } => {
+                let message = bounded_display_text(&message, MAX_DISPLAY_TEXT_BYTES);
+                self.last_error = Some(message.clone());
+                self.detail = format!("Chat turn failed: {message}");
+                self.push_entry(
+                    TranscriptKind::Error,
+                    format!("chat turn failed: {message}"),
+                );
+                self.finish_chat_run();
             }
             AgentEvent::StreamDelta { text } => self.push_stream_delta(&text),
             AgentEvent::StreamTruncated { dropped } => {
@@ -1025,6 +1090,8 @@ impl AppState {
     }
 
     fn reset_for_task(&mut self) {
+        self.chat_active = false;
+        self.chat_visible_received = false;
         self.transcript.clear();
         self.transcript_bytes = 0;
         self.transcript_truncated = false;
@@ -1060,11 +1127,37 @@ impl AppState {
         summary: &str,
         kind: TranscriptKind,
     ) {
+        self.chat_active = false;
+        self.chat_visible_received = false;
         let summary = bounded_display_text(summary, MAX_DISPLAY_TEXT_BYTES);
         self.enter_terminal(status, phase, mode);
         self.completion_summary = Some(summary.clone());
         self.detail = summary.clone();
         self.push_entry(kind, &summary);
+    }
+
+    fn finish_chat_run(&mut self) {
+        self.chat_active = false;
+        self.chat_visible_received = false;
+        self.task_status = TaskStatus::Idle;
+        self.input_mode = InputMode::TaskEntry;
+        self.phase = LoopState::Boot;
+        self.approval = None;
+        self.verification = None;
+        self.stream_state = StreamState::Idle;
+        self.cancel_requested_at = None;
+        self.cancel_grace_elapsed = false;
+        self.freeze_elapsed();
+    }
+
+    fn remove_empty_chat_assistant(&mut self) {
+        while self.transcript.back().is_some_and(|entry| {
+            entry.kind == TranscriptKind::Assistant && entry.text.trim().is_empty()
+        }) {
+            if let Some(removed) = self.transcript.pop_back() {
+                self.transcript_bytes = self.transcript_bytes.saturating_sub(removed.text.len());
+            }
+        }
     }
 
     fn freeze_elapsed(&mut self) {
@@ -1074,12 +1167,22 @@ impl AppState {
     }
 
     fn push_stream_delta(&mut self, text: &str) {
-        let text = bounded_multiline_display_text(text, MAX_DISPLAY_TEXT_BYTES);
+        let text = bounded_stream_text(text, MAX_DISPLAY_TEXT_BYTES);
         if text.is_empty() {
+            return;
+        }
+        let starts_entry = self
+            .transcript
+            .back()
+            .is_none_or(|entry| entry.kind != TranscriptKind::Assistant);
+        if starts_entry && text.trim().is_empty() {
             return;
         }
         if self.stream_state != StreamState::Truncated {
             self.stream_state = StreamState::Streaming;
+        }
+        if self.chat_active && text.chars().any(|ch| !ch.is_whitespace()) {
+            self.chat_visible_received = true;
         }
 
         if let Some(last) = self.transcript.back_mut()
@@ -1092,11 +1195,15 @@ impl AppState {
             return;
         }
 
-        self.push_entry(TranscriptKind::Assistant, &text);
+        self.push_entry_raw(TranscriptKind::Assistant, text);
     }
 
     pub(crate) fn push_entry(&mut self, kind: TranscriptKind, text: impl AsRef<str>) {
         let text = bounded_multiline_display_text(text.as_ref(), MAX_DISPLAY_TEXT_BYTES);
+        self.push_entry_raw(kind, text);
+    }
+
+    fn push_entry_raw(&mut self, kind: TranscriptKind, text: String) {
         if text.is_empty() {
             return;
         }
@@ -1166,6 +1273,12 @@ pub fn bounded_multiline_display_text(input: &str, cap: usize) -> String {
     let redacted = redact(input).unwrap_or_else(|_| "[redaction unavailable]".to_owned());
     let normalized = redacted.replace("\r\n", "\n").replace('\r', "\n");
     truncate_utf8(normalized.trim_end(), cap, "\n...[truncated]")
+}
+
+fn bounded_stream_text(input: &str, cap: usize) -> String {
+    let redacted = redact(input).unwrap_or_else(|_| "[redaction unavailable]".to_owned());
+    let normalized = redacted.replace("\r\n", "\n").replace('\r', "\n");
+    truncate_utf8(&normalized, cap, "\n...[truncated]")
 }
 
 fn truncate_utf8(text: &str, cap: usize, marker: &str) -> String {

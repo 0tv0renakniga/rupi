@@ -3,7 +3,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::events::Command;
 use crate::state_machine::TaskMode;
 use crate::tui::app::{
-    AppState, FocusPane, InputMode, MAX_TASK_INPUT_BYTES, TaskStatus, TranscriptKind,
+    AppState, FocusPane, InputMode, MAX_TASK_INPUT_BYTES, MainTab, StreamState, TaskStatus,
+    TranscriptKind,
 };
 
 /// Translate one key press into an optional worker command. All other changes
@@ -199,6 +200,7 @@ fn handle_quit(app: &mut AppState) -> Option<Command> {
 
 fn handle_task_entry(app: &mut AppState, key: KeyEvent, ctrl: bool, alt: bool) -> Option<Command> {
     match key.code {
+        KeyCode::Enter if app.active_tab == MainTab::Chat => submit_chat(app),
         KeyCode::Enter => submit_task(app),
         KeyCode::F(2) => {
             app.selected_mode = match app.selected_mode {
@@ -241,11 +243,8 @@ fn handle_approval(app: &mut AppState, key: KeyEvent, ctrl: bool, alt: bool) -> 
 }
 
 fn handle_running(app: &mut AppState, key: KeyEvent) -> Option<Command> {
-    if key.code == KeyCode::Esc {
-        app.push_notice(
-            TranscriptKind::Warning,
-            "interrupting a model turn is not supported in this build; use Ctrl-C to cancel the task",
-        );
+    if key.code == KeyCode::Esc && app.request_cancel() {
+        return Some(Command::Cancel);
     }
     None
 }
@@ -301,6 +300,32 @@ fn submit_task(app: &mut AppState) -> Option<Command> {
         objective,
         mode: app.selected_mode,
     })
+}
+
+fn submit_chat(app: &mut AppState) -> Option<Command> {
+    if app.task_status.is_active() {
+        return None;
+    }
+    let prompt = app.task_input.trim().to_owned();
+    if prompt.is_empty() {
+        return None;
+    }
+
+    app.task_input.clear();
+    app.chat_active = true;
+    app.task_status = TaskStatus::Running;
+    app.input_mode = InputMode::Running;
+    app.elapsed = std::time::Duration::ZERO;
+    app.completion_summary = None;
+    app.last_error = None;
+    app.approval = None;
+    app.verification = None;
+    app.stream_state = StreamState::Idle;
+    app.stream_truncated = false;
+    app.worker_closed = false;
+    app.scroll_offset = 0;
+    app.detail = "Submitting chat prompt...".into();
+    Some(Command::Chat { prompt })
 }
 
 fn resolve_approval(app: &mut AppState, approved: bool) -> Option<Command> {

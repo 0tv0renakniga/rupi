@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::approval::{ApprovalResolveError, InteractiveApprovalGate};
 use crate::events::{AgentEvent, Command, EventLevel};
+use crate::llm::{ChatMessage, ChatRequest, VisibleChatBackend, VisibleChatEvent};
 use crate::orchestrator::{EventSink, Orchestrator, TaskRequest};
 use crate::state_machine::{TaskBudget, TaskMode};
 
@@ -20,6 +21,11 @@ pub const COMMAND_CHANNEL_CAPACITY: usize = 16;
 /// best-effort stream deltas are dropped and explicitly marked truncated.
 pub const EVENT_CHANNEL_CAPACITY: usize = 256;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+const CHAT_SYSTEM_PROMPT: &str = "You are the local coding assistant in a terminal harness. \
+Reply with concise visible text only. Do not reveal hidden reasoning. Do not claim to run \
+tools or modify files in this text-only chat.";
+const MAX_CHAT_HISTORY_MESSAGES: usize = 120;
+const MAX_CHAT_HISTORY_BYTES: usize = 256 * 1024;
 
 /// Owns the worker task and the two bounded channel endpoints used by the TUI.
 pub struct Worker {
@@ -66,6 +72,27 @@ pub fn spawn(
     approvals: InteractiveApprovalGate,
     change_available: bool,
 ) -> Worker {
+    spawn_with_chat(
+        orchestrator,
+        repo_root,
+        budget,
+        approvals,
+        change_available,
+        None,
+    )
+}
+
+/// Start the worker with an optional visible Chat backend. Task execution and
+/// reusable Chat turns share one command/event queue and remain mutually
+/// exclusive.
+pub fn spawn_with_chat(
+    orchestrator: Orchestrator,
+    repo_root: PathBuf,
+    budget: TaskBudget,
+    approvals: InteractiveApprovalGate,
+    change_available: bool,
+    chat: Option<Arc<dyn VisibleChatBackend>>,
+) -> Worker {
     let (commands, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (event_tx, events) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let cancel = CancellationToken::new();
@@ -84,6 +111,7 @@ pub fn spawn(
             settings,
             sink,
             approvals,
+            chat,
             command_rx,
             worker_cancel,
         )
@@ -109,9 +137,12 @@ async fn run_worker(
     settings: WorkerSettings,
     sink: TuiEventSink,
     approvals: InteractiveApprovalGate,
+    chat: Option<Arc<dyn VisibleChatBackend>>,
     mut commands: mpsc::Receiver<Command>,
     cancel: CancellationToken,
 ) {
+    let mut chat_history = vec![ChatMessage::system(CHAT_SYSTEM_PROMPT)];
+
     loop {
         let command = match commands.recv().await {
             Some(command) => command,
@@ -178,6 +209,12 @@ async fn run_worker(
                                     "a task is already running; wait for it or cancel it",
                                 );
                             }
+                            Some(Command::Chat { .. }) => {
+                                sink.notice(
+                                    EventLevel::Warning,
+                                    "a task is already running; finish or cancel it before chatting",
+                                );
+                            }
                             None => {
                                 task_cancel.cancel();
                                 cancel.cancel();
@@ -201,8 +238,33 @@ async fn run_worker(
                     break;
                 }
             }
+            Command::Chat { prompt } => {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                let Some(backend) = chat.as_ref().cloned() else {
+                    let _ = sink
+                        .send_critical(AgentEvent::ChatTurnFailed {
+                            message: "chat backend is not configured".into(),
+                        })
+                        .await;
+                    continue;
+                };
+                if !run_chat_turn(
+                    backend,
+                    &sink,
+                    &mut chat_history,
+                    prompt,
+                    &mut commands,
+                    &cancel,
+                )
+                .await
+                {
+                    break;
+                }
+            }
             Command::Cancel => {
-                sink.notice(EventLevel::Info, "no active task to cancel");
+                sink.notice(EventLevel::Info, "no active task or chat turn to cancel");
             }
             Command::Quit => {
                 cancel.cancel();
@@ -216,6 +278,170 @@ async fn run_worker(
             }
         }
     }
+}
+
+async fn run_chat_turn(
+    backend: Arc<dyn VisibleChatBackend>,
+    sink: &TuiEventSink,
+    history: &mut Vec<ChatMessage>,
+    prompt: String,
+    commands: &mut mpsc::Receiver<Command>,
+    cancel: &CancellationToken,
+) -> bool {
+    if !sink
+        .send_critical(AgentEvent::ChatTurnStarted {
+            prompt: prompt.clone(),
+        })
+        .await
+    {
+        cancel.cancel();
+        return false;
+    }
+
+    let mut messages = history.clone();
+    messages.push(ChatMessage::user(prompt.clone()));
+    let request = ChatRequest::new(messages);
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let call = backend.stream_visible_chat(request, Some(&event_tx));
+    tokio::pin!(call);
+
+    let mut assistant = String::new();
+    let mut failure_sent = false;
+    let mut events_open = true;
+
+    let result = loop {
+        tokio::select! {
+            biased;
+            command = commands.recv() => match command {
+                Some(Command::Cancel) => {
+                    let _ = sink
+                        .send_critical(AgentEvent::ChatTurnCancelled {
+                            reason: "operator cancelled the active turn".into(),
+                        })
+                        .await;
+                    return true;
+                }
+                Some(Command::Quit) => {
+                    cancel.cancel();
+                    return false;
+                }
+                Some(Command::Submit { .. }) | Some(Command::Chat { .. }) => {
+                    sink.notice(
+                        EventLevel::Warning,
+                        "a chat turn is already running; cancel it before starting another run",
+                    );
+                }
+                Some(Command::ResolveApproval { .. }) => {
+                    sink.notice(EventLevel::Warning, "no approval gate is active");
+                }
+                None => {
+                    cancel.cancel();
+                    return false;
+                }
+            },
+            event = event_rx.recv(), if events_open => match event {
+                Some(event) => {
+                    handle_visible_event(sink, event, &mut assistant, &mut failure_sent).await;
+                }
+                None => events_open = false,
+            },
+            result = &mut call => {
+                while let Ok(event) = event_rx.try_recv() {
+                    handle_visible_event(sink, event, &mut assistant, &mut failure_sent).await;
+                }
+                break result;
+            }
+        }
+    };
+
+    match result {
+        Ok(outcome) => {
+            if !outcome.empty_visible_response && !assistant.trim().is_empty() {
+                append_chat_history(history, prompt, assistant);
+            }
+            let _ = sink
+                .send_critical(AgentEvent::ChatTurnFinished {
+                    finish_reason: outcome.finish_reason,
+                    empty_visible_response: outcome.empty_visible_response,
+                })
+                .await;
+        }
+        Err(error) => {
+            if !failure_sent {
+                let _ = sink
+                    .send_critical(AgentEvent::ChatTurnFailed {
+                        message: error.to_string(),
+                    })
+                    .await;
+            }
+        }
+    }
+
+    if sink.is_closed() || cancel.is_cancelled() {
+        cancel.cancel();
+        return false;
+    }
+    true
+}
+
+async fn handle_visible_event(
+    sink: &TuiEventSink,
+    event: VisibleChatEvent,
+    assistant: &mut String,
+    failure_sent: &mut bool,
+) {
+    match event {
+        VisibleChatEvent::TextDelta(text) => {
+            if text.is_empty() {
+                return;
+            }
+            assistant.push_str(&text);
+            sink.emit(AgentEvent::StreamDelta { text });
+        }
+        VisibleChatEvent::Warning(message) => {
+            if message != "empty visible response" {
+                sink.notice(EventLevel::Warning, message);
+            }
+        }
+        VisibleChatEvent::Error(message) => {
+            if !*failure_sent {
+                *failure_sent = true;
+                let _ = sink
+                    .send_critical(AgentEvent::ChatTurnFailed { message })
+                    .await;
+            }
+        }
+        VisibleChatEvent::Finish { .. } => {}
+    }
+}
+
+fn append_chat_history(history: &mut Vec<ChatMessage>, prompt: String, assistant: String) {
+    history.push(ChatMessage::user(prompt));
+    history.push(ChatMessage::assistant(assistant));
+
+    while history.len() > 1 && chat_history_bytes(history) > MAX_CHAT_HISTORY_BYTES {
+        remove_oldest_chat_pair(history);
+    }
+    while history.len() > MAX_CHAT_HISTORY_MESSAGES {
+        remove_oldest_chat_pair(history);
+    }
+}
+
+fn remove_oldest_chat_pair(history: &mut Vec<ChatMessage>) {
+    if history.len() <= 1 {
+        return;
+    }
+    history.remove(1);
+    if history.len() > 1 {
+        history.remove(1);
+    }
+}
+
+fn chat_history_bytes(history: &[ChatMessage]) -> usize {
+    history
+        .iter()
+        .map(|message| message.content.as_deref().map_or(0, str::len))
+        .sum()
 }
 
 fn notify_approval_resolution(
@@ -249,7 +475,10 @@ impl TuiEventSink {
     }
 
     async fn send_critical(&self, event: AgentEvent) -> bool {
-        if matches!(&event, AgentEvent::TaskStarted { .. }) {
+        if matches!(
+            &event,
+            AgentEvent::TaskStarted { .. } | AgentEvent::ChatTurnStarted { .. }
+        ) {
             self.stream_truncated.store(false, Ordering::Relaxed);
         }
         self.tx.send(event).await.is_ok()
@@ -298,6 +527,64 @@ fn spawn_send(tx: mpsc::Sender<AgentEvent>, event: AgentEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::AgentError;
+    use crate::llm::VisibleChatOutcome;
+
+    struct FakeChatBackend {
+        events: Vec<VisibleChatEvent>,
+        outcome: Option<VisibleChatOutcome>,
+        error: Option<String>,
+        pending: bool,
+    }
+
+    impl FakeChatBackend {
+        fn new(events: Vec<VisibleChatEvent>, outcome: VisibleChatOutcome) -> Self {
+            Self {
+                events,
+                outcome: Some(outcome),
+                error: None,
+                pending: false,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VisibleChatBackend for FakeChatBackend {
+        async fn stream_visible_chat(
+            &self,
+            _request: ChatRequest,
+            event_tx: Option<&mpsc::UnboundedSender<VisibleChatEvent>>,
+        ) -> crate::error::Result<VisibleChatOutcome> {
+            if self.pending {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+            if let Some(event_tx) = event_tx {
+                for event in &self.events {
+                    let _ = event_tx.send(event.clone());
+                }
+            }
+            if let Some(error) = &self.error {
+                return Err(AgentError::Llm(error.clone()));
+            }
+            Ok(self.outcome.clone().expect("fake outcome"))
+        }
+    }
+
+    fn outcome(empty_visible_response: bool) -> VisibleChatOutcome {
+        VisibleChatOutcome {
+            finish_reason: "stop".into(),
+            empty_visible_response,
+            hidden_reasoning_observed: false,
+        }
+    }
+
+    fn drain_events(rx: &mut mpsc::Receiver<AgentEvent>) -> Vec<AgentEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
 
     #[tokio::test]
     async fn critical_events_are_retried_when_the_channel_is_full() {
@@ -376,5 +663,174 @@ mod tests {
             tx.try_send(Command::Quit),
             Err(TrySendError::Full(Command::Quit))
         ));
+    }
+    #[tokio::test]
+    async fn chat_turn_streams_visible_text_and_updates_history() {
+        let (tx, mut rx) = mpsc::channel(32);
+        let (command_tx, mut command_rx) = mpsc::channel(4);
+        let sink = TuiEventSink::new(tx);
+        let backend = Arc::new(FakeChatBackend::new(
+            vec![
+                VisibleChatEvent::TextDelta("Hello".into()),
+                VisibleChatEvent::Finish {
+                    reason: "stop".into(),
+                    empty_visible_response: false,
+                },
+            ],
+            outcome(false),
+        ));
+        let mut history = vec![ChatMessage::system("system")];
+
+        let keep_running = run_chat_turn(
+            backend,
+            &sink,
+            &mut history,
+            "hi".into(),
+            &mut command_rx,
+            &CancellationToken::new(),
+        )
+        .await;
+        drop(command_tx);
+
+        assert!(keep_running);
+        let events = drain_events(&mut rx);
+        assert_eq!(
+            events,
+            vec![
+                AgentEvent::ChatTurnStarted {
+                    prompt: "hi".into()
+                },
+                AgentEvent::StreamDelta {
+                    text: "Hello".into()
+                },
+                AgentEvent::ChatTurnFinished {
+                    finish_reason: "stop".into(),
+                    empty_visible_response: false,
+                },
+            ]
+        );
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[1].content.as_deref(), Some("hi"));
+        assert_eq!(history[2].content.as_deref(), Some("Hello"));
+    }
+
+    #[tokio::test]
+    async fn empty_chat_turn_does_not_add_assistant_history() {
+        let (tx, mut rx) = mpsc::channel(32);
+        let (command_tx, mut command_rx) = mpsc::channel(4);
+        let sink = TuiEventSink::new(tx);
+        let backend = Arc::new(FakeChatBackend::new(
+            vec![
+                VisibleChatEvent::Warning("empty visible response".into()),
+                VisibleChatEvent::Finish {
+                    reason: "stop".into(),
+                    empty_visible_response: true,
+                },
+            ],
+            outcome(true),
+        ));
+        let mut history = vec![ChatMessage::system("system")];
+
+        run_chat_turn(
+            backend,
+            &sink,
+            &mut history,
+            "hi".into(),
+            &mut command_rx,
+            &CancellationToken::new(),
+        )
+        .await;
+        drop(command_tx);
+
+        assert_eq!(history.len(), 1);
+        let events = drain_events(&mut rx);
+        assert!(events.contains(&AgentEvent::ChatTurnFinished {
+            finish_reason: "stop".into(),
+            empty_visible_response: true,
+        }));
+        assert!(!events.iter().any(|event| {
+            matches!(event, AgentEvent::Notice { message, .. } if message == "empty visible response")
+        }));
+    }
+
+    #[tokio::test]
+    async fn chat_failure_is_reported_once_and_not_added_to_history() {
+        let (tx, mut rx) = mpsc::channel(32);
+        let (command_tx, mut command_rx) = mpsc::channel(4);
+        let sink = TuiEventSink::new(tx);
+        let backend = Arc::new(FakeChatBackend {
+            events: vec![VisibleChatEvent::Error("stream broke".into())],
+            outcome: None,
+            error: Some("stream broke".into()),
+            pending: false,
+        });
+        let mut history = vec![ChatMessage::system("system")];
+
+        run_chat_turn(
+            backend,
+            &sink,
+            &mut history,
+            "hi".into(),
+            &mut command_rx,
+            &CancellationToken::new(),
+        )
+        .await;
+        drop(command_tx);
+
+        assert_eq!(history.len(), 1);
+        let failures = drain_events(&mut rx)
+            .into_iter()
+            .filter(|event| matches!(event, AgentEvent::ChatTurnFailed { .. }))
+            .count();
+        assert_eq!(failures, 1);
+    }
+
+    #[tokio::test]
+    async fn chat_cancel_command_stops_the_pending_turn() {
+        let (tx, mut rx) = mpsc::channel(32);
+        let (command_tx, mut command_rx) = mpsc::channel(4);
+        let sink = TuiEventSink::new(tx);
+        let backend = Arc::new(FakeChatBackend {
+            events: Vec::new(),
+            outcome: None,
+            error: None,
+            pending: true,
+        });
+        let mut history = vec![ChatMessage::system("system")];
+        let cancel = CancellationToken::new();
+
+        let keep_running = {
+            let turn = run_chat_turn(
+                backend,
+                &sink,
+                &mut history,
+                "hi".into(),
+                &mut command_rx,
+                &cancel,
+            );
+            tokio::pin!(turn);
+
+            let first = tokio::select! {
+                event = rx.recv() => event,
+                _ = &mut turn => panic!("turn ended before it started"),
+            };
+            assert_eq!(
+                first,
+                Some(AgentEvent::ChatTurnStarted {
+                    prompt: "hi".into()
+                })
+            );
+            command_tx.send(Command::Cancel).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), &mut turn)
+                .await
+                .expect("cancelled chat turn should stop promptly")
+        };
+        assert!(keep_running);
+        assert_eq!(history.len(), 1);
+        assert!(
+            drain_events(&mut rx).contains(&AgentEvent::ChatTurnCancelled {
+                reason: "operator cancelled the active turn".into(),
+            })
+        );
     }
 }

@@ -3,7 +3,10 @@ pub mod prompts;
 pub mod visible;
 
 pub use openai_compat::{LlmLimits, OpenAiCompatClient};
-pub use visible::{VisibleChatEvent, VisibleStreamNormalizer, normalize_sse, normalize_sse_bytes};
+pub use visible::{
+    VisibleChatBackend, VisibleChatEvent, VisibleChatOutcome, VisibleStreamNormalizer,
+    normalize_sse, normalize_sse_bytes,
+};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;

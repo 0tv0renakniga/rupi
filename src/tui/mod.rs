@@ -32,7 +32,7 @@ use crate::config::Config;
 use crate::error::{AgentError, Result};
 use crate::events::{AgentEvent, Command, EventLevel};
 use crate::jev::JevClient;
-use crate::llm::OpenAiCompatClient;
+use crate::llm::{OpenAiCompatClient, VisibleChatBackend};
 use crate::orchestrator::{LocalWikiStore, Orchestrator, OrchestratorLimits, ToolExecutor};
 use crate::runtime;
 use crate::script_runner::ScriptRunner;
@@ -46,6 +46,7 @@ struct PreparedApp {
     app: AppState,
     orchestrator: Orchestrator,
     approvals: InteractiveApprovalGate,
+    chat: Arc<dyn VisibleChatBackend>,
 }
 
 /// Launch the single-task TUI. Configuration must already be validated by the
@@ -55,16 +56,18 @@ pub async fn run(config: Config) -> Result<()> {
         mut app,
         orchestrator,
         approvals,
+        chat,
     } = prepare(&config).await?;
 
     let (mut terminal, guard) = setup_terminal()?;
     let change_available = app.change_available;
-    let mut worker = worker::spawn(
+    let mut worker = worker::spawn_with_chat(
         orchestrator,
         config.root.clone(),
         config.budget.clone(),
         approvals,
         change_available,
+        Some(chat),
     );
 
     let result = event_loop(&mut terminal, &mut app, &mut worker).await;
@@ -113,12 +116,22 @@ async fn prepare(config: &Config) -> Result<PreparedApp> {
         runtime.runner.clone(),
         approvals.clone(),
     )?;
+    let chat: Arc<dyn VisibleChatBackend> = Arc::new(build_llm(config)?);
 
     Ok(PreparedApp {
         app,
         orchestrator,
         approvals,
+        chat,
     })
+}
+
+fn build_llm(config: &Config) -> Result<OpenAiCompatClient> {
+    let mut llm = OpenAiCompatClient::new(config.llm_base.clone(), config.model.clone());
+    if let Some(credential) = config.llm_credential()? {
+        llm = llm.with_bearer_token(credential);
+    }
+    Ok(llm)
 }
 
 fn build_orchestrator(
@@ -128,11 +141,7 @@ fn build_orchestrator(
     runner: ScriptRunner,
     approvals: InteractiveApprovalGate,
 ) -> Result<Orchestrator> {
-    let mut llm = OpenAiCompatClient::new(config.llm_base.clone(), config.model.clone());
-    if let Some(credential) = config.llm_credential()? {
-        llm = llm.with_bearer_token(credential);
-    }
-    let llm = Arc::new(llm);
+    let llm = Arc::new(build_llm(config)?);
     let jev = Arc::new(JevClient::new(config.jev_base.clone()));
     let limits = OrchestratorLimits {
         min_choice_confidence: config.min_route_conf,
@@ -216,6 +225,10 @@ fn send_command(app: &mut AppState, worker: &worker::Worker, command: Command) {
             if matches!(command, Command::Submit { .. }) {
                 app.apply(AgentEvent::Failed {
                     reason: "command queue is full; task was not submitted".into(),
+                });
+            } else if matches!(command, Command::Chat { .. }) {
+                app.apply(AgentEvent::ChatTurnFailed {
+                    message: "command queue is full; chat prompt was not submitted".into(),
                 });
             } else {
                 app.apply(AgentEvent::Notice {

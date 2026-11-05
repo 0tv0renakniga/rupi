@@ -62,6 +62,7 @@ fn starts_in_task_entry_mode() {
 #[test]
 fn enter_submits_nonempty_task_and_ignores_empty_input() {
     let mut app = AppState::default();
+    app.active_tab = MainTab::Output;
     assert_eq!(handle_key(&mut app, key(KeyCode::Enter)), None);
     assert_eq!(app.input_mode, InputMode::TaskEntry);
 
@@ -79,8 +80,126 @@ fn enter_submits_nonempty_task_and_ignores_empty_input() {
 }
 
 #[test]
+fn chat_tab_enter_submits_a_reusable_chat_turn() {
+    let mut app = AppState::default();
+    app.task_input = "explain the parser".into();
+
+    assert_eq!(
+        handle_key(&mut app, key(KeyCode::Enter)),
+        Some(Command::Chat {
+            prompt: "explain the parser".into(),
+        })
+    );
+    assert_eq!(app.input_mode, InputMode::Running);
+    assert_eq!(app.task_status, TaskStatus::Running);
+    assert!(app.chat_active);
+    assert!(app.task_input.is_empty());
+}
+
+#[test]
+fn chat_turn_streams_and_returns_to_prompt_without_terminal_state() {
+    let mut app = AppState::default();
+    app.apply(AgentEvent::ChatTurnStarted {
+        prompt: "hello".into(),
+    });
+    app.apply(AgentEvent::StreamDelta {
+        text: "visible ".into(),
+    });
+    app.apply(AgentEvent::StreamDelta {
+        text: "answer".into(),
+    });
+    app.apply(AgentEvent::ChatTurnFinished {
+        finish_reason: "stop".into(),
+        empty_visible_response: false,
+    });
+
+    assert_eq!(app.task_status, TaskStatus::Idle);
+    assert_eq!(app.input_mode, InputMode::TaskEntry);
+    assert!(!app.chat_active);
+    assert!(
+        app.transcript.iter().any(|entry| {
+            entry.kind == TranscriptKind::Operator && entry.text.contains("hello")
+        })
+    );
+    assert!(app.transcript.iter().any(|entry| {
+        entry.kind == TranscriptKind::Assistant && entry.text == "visible answer"
+    }));
+    assert_eq!(app.detail, "Chat response complete (finish: stop).");
+}
+
+#[test]
+fn empty_chat_completion_stores_no_assistant_message() {
+    let mut app = AppState::default();
+    app.apply(AgentEvent::ChatTurnStarted {
+        prompt: "hello".into(),
+    });
+    app.apply(AgentEvent::StreamDelta { text: "   ".into() });
+    app.apply(AgentEvent::ChatTurnFinished {
+        finish_reason: "stop".into(),
+        empty_visible_response: true,
+    });
+
+    assert!(
+        !app.transcript
+            .iter()
+            .any(|entry| entry.kind == TranscriptKind::Assistant)
+    );
+    assert!(app.transcript.iter().any(|entry| {
+        entry.kind == TranscriptKind::EmptyResponse
+            && entry.text.contains("no assistant message was stored")
+    }));
+    assert_eq!(app.input_mode, InputMode::TaskEntry);
+}
+
+#[test]
+fn chat_failure_is_visible_and_returns_to_prompt() {
+    let mut app = AppState::default();
+    app.apply(AgentEvent::ChatTurnStarted {
+        prompt: "hello".into(),
+    });
+    app.apply(AgentEvent::ChatTurnFailed {
+        message: "llama-server could not connect".into(),
+    });
+
+    assert_eq!(app.task_status, TaskStatus::Idle);
+    assert_eq!(app.input_mode, InputMode::TaskEntry);
+    assert_eq!(
+        app.last_error.as_deref(),
+        Some("llama-server could not connect")
+    );
+    assert!(app.transcript.iter().any(|entry| {
+        entry.kind == TranscriptKind::Error && entry.text.contains("could not connect")
+    }));
+}
+
+#[test]
+fn esc_cancels_an_active_chat_turn() {
+    let mut app = AppState::default();
+    app.apply(AgentEvent::ChatTurnStarted {
+        prompt: "hello".into(),
+    });
+
+    assert_eq!(
+        handle_key(&mut app, key(KeyCode::Esc)),
+        Some(Command::Cancel)
+    );
+    assert_eq!(app.task_status, TaskStatus::Cancelling);
+
+    app.apply(AgentEvent::ChatTurnCancelled {
+        reason: "operator cancelled the active turn".into(),
+    });
+    assert_eq!(app.task_status, TaskStatus::Idle);
+    assert_eq!(app.input_mode, InputMode::TaskEntry);
+    assert!(!app.chat_active);
+    assert!(app.transcript.iter().any(|entry| {
+        entry.kind == TranscriptKind::Cancelled && entry.text.contains("chat turn cancelled")
+    }));
+}
+
+#[test]
 fn f2_toggles_mode_only_before_submission() {
     let mut app = AppState::default();
+    app.active_tab = MainTab::Output;
     assert_eq!(app.selected_mode, TaskMode::Change);
 
     assert_eq!(handle_key(&mut app, key(KeyCode::F(2))), None);
@@ -102,6 +221,7 @@ fn f2_toggles_mode_only_before_submission() {
 #[test]
 fn f2_cycles_through_plan_mode_before_submission() {
     let mut app = AppState::default();
+    app.active_tab = MainTab::Output;
     assert_eq!(app.selected_mode, TaskMode::Change);
 
     assert_eq!(handle_key(&mut app, key(KeyCode::F(2))), None);
@@ -123,6 +243,7 @@ fn f2_cycles_through_plan_mode_before_submission() {
 #[test]
 fn change_mode_is_gated_when_verifier_script_is_unavailable() {
     let mut app = AppState::default();
+    app.active_tab = MainTab::Output;
     app.change_available = false;
     app.selected_mode = TaskMode::Plan;
 
@@ -248,6 +369,22 @@ fn model_text_does_not_affect_control_flow() {
 #[test]
 fn reducer_handles_every_agent_event_variant() {
     let events = vec![
+        AgentEvent::ChatTurnStarted {
+            prompt: "chat".into(),
+        },
+        AgentEvent::StreamDelta {
+            text: "chat response".into(),
+        },
+        AgentEvent::ChatTurnFinished {
+            finish_reason: "stop".into(),
+            empty_visible_response: false,
+        },
+        AgentEvent::ChatTurnCancelled {
+            reason: "cancelled".into(),
+        },
+        AgentEvent::ChatTurnFailed {
+            message: "failed".into(),
+        },
         AgentEvent::TaskStarted {
             summary: "task".into(),
         },

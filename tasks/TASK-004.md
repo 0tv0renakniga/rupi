@@ -3,7 +3,7 @@
 
 **Version:** v1
 **Depends on:** TASK-001, TASK-002, TASK-003
-**Status:** Not started
+**Status:** Done
 
 ## Objective
 Connect the Chat tab to the normalized local-model stream so a user can send a prompt, watch visible output stream, cancel safely, and see clear empty-response or endpoint-failure states.

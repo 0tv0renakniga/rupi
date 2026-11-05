@@ -401,16 +401,17 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &AppState) {
         "focus: content | Up/Down scroll | PgUp/PgDn page | Tab next | ? help".to_owned()
     } else if app.focus == FocusPane::Explorer {
         "focus: explorer | Up/Down select | PgUp/PgDn page | Tab next | ? help".to_owned()
+    } else if app.input_mode == InputMode::TaskEntry && app.active_tab == MainTab::Chat {
+        "focus: prompt | Enter send chat | Tab focus | F1 help | Ctrl-C quit".to_owned()
     } else if app.input_mode == InputMode::TaskEntry {
-        "focus: prompt | Enter submit | F2 cycle mode | Tab focus | F1 help | Ctrl-C quit"
+        "focus: prompt | Enter submit task | F2 cycle mode | Tab focus | F1 help | Ctrl-C quit"
             .to_owned()
     } else if app.input_mode == InputMode::Approval {
         "y/Enter approve | n/Esc deny | Ctrl-C cancel | Tab focus | ? help".to_owned()
     } else if app.input_mode.is_terminal() {
         "q quit | Ctrl-C quit | Up/Down scroll | Tab focus | ? help".to_owned()
     } else {
-        "Ctrl-C cancel | Esc interrupt (unsupported) | Up/Down scroll | Tab focus | ? help | q cancel"
-            .to_owned()
+        "Esc/Ctrl-C cancel | Up/Down scroll | Tab focus | ? help | q cancel".to_owned()
     };
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
@@ -426,18 +427,18 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &AppState) {
         .border_style(Style::default().fg(Color::Cyan))
         .title(" Keys ");
     let text = vec![
-        Line::from("Enter        submit task; approve in approval mode"),
+        Line::from("Enter        send chat on the Chat tab; submit task elsewhere"),
         Line::from(if app.change_available {
             "F2           cycle Change/Investigate/Plan mode before submission"
         } else {
             "F2           cycle Investigate/Plan; Change is gated until the verifier script exists"
         }),
-        Line::from("Esc          deny approval; close help; interrupt is unsupported"),
+        Line::from("Esc          deny approval; cancel active turn; close help"),
         Line::from("Ctrl-C       cancel active task; quit when idle"),
         Line::from("q            quit; requests cancellation first while active"),
         Line::from("Tab          cycle focus: prompt, tabs, content, explorer"),
         Line::from("Shift-Tab    cycle focus in reverse"),
-        Line::from("Left/Right   switch tabs when the tab bar has focus"),
+        Line::from("Left/Right   switch tabs; task prompts run outside Chat"),
         Line::from("Up/Down      scroll content or move the Explorer selection"),
         Line::from("PgUp/PgDn    page the focused content or Explorer"),
         Line::from("? / F1       toggle this help"),
@@ -523,6 +524,9 @@ fn transcript_style(kind: TranscriptKind) -> Style {
         TranscriptKind::Task => Style::default()
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
+        TranscriptKind::Operator => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
         TranscriptKind::Info => Style::default().fg(Color::Gray),
         TranscriptKind::Assistant => Style::default().fg(Color::White),
         TranscriptKind::Phase => Style::default().fg(Color::Cyan),
@@ -564,19 +568,24 @@ fn transcript_style(kind: TranscriptKind) -> Style {
 fn input_text(app: &AppState) -> (String, Style) {
     match app.input_mode {
         InputMode::TaskEntry => {
+            let mode = if app.active_tab == MainTab::Chat {
+                "chat".to_owned()
+            } else {
+                app.selected_mode.as_str().to_owned()
+            };
             if app.task_input.is_empty() {
                 (
-                    format!(
-                        "> [{}] Describe a task and press Enter",
-                        app.selected_mode.as_str()
-                    ),
+                    if app.active_tab == MainTab::Chat {
+                        "> Ask the local model and press Enter".to_owned()
+                    } else {
+                        format!("> [{mode}] Describe a task and press Enter")
+                    },
                     Style::default().fg(Color::DarkGray),
                 )
             } else {
                 (
                     format!(
-                        "> [{}] {}",
-                        app.selected_mode.as_str(),
+                        "> [{mode}] {}",
                         crate::tui::app::bounded_display_text(
                             &app.task_input,
                             crate::tui::app::MAX_DISPLAY_TEXT_BYTES
@@ -596,9 +605,13 @@ fn input_text(app: &AppState) -> (String, Style) {
                 ""
             };
             (
-                format!(
-                    "{spinner} Task running{suffix}. Ctrl-C cancels; q also requests cancellation."
-                ),
+                if app.chat_active {
+                    format!("{spinner} Chat response streaming{suffix}. Esc or Ctrl-C cancels.")
+                } else {
+                    format!(
+                        "{spinner} Task running{suffix}. Esc or Ctrl-C cancels; q also requests cancellation."
+                    )
+                },
                 Style::default().fg(Color::Cyan),
             )
         }

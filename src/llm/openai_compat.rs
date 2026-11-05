@@ -10,6 +10,7 @@ use crate::config::{log_safe_endpoint, validate_endpoint};
 use crate::error::{AgentError, Result};
 use crate::llm::{
     AssistantTurn, ChatMessage, ChatRequest, FnCall, LlmBackend, LlmStreamEvent, ToolCall,
+    VisibleChatBackend, VisibleChatEvent, VisibleChatOutcome, VisibleStreamNormalizer,
 };
 
 const DEFAULT_TEMPERATURE: f32 = 0.2;
@@ -289,6 +290,28 @@ impl OpenAiCompatClient {
         Ok(())
     }
 
+    async fn streaming_response(&self, request: &ChatRequest) -> Result<reqwest::Response> {
+        let body = self.build_body(request, true)?;
+        let endpoint = self.endpoint()?;
+        let client = self.http_client()?;
+        let response = self
+            .authorized(client.post(endpoint))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .body(body)
+            .send()
+            .await
+            .map_err(transport_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(AgentError::Llm(format!(
+                "llama-server returned HTTP status {}",
+                status.as_u16()
+            )));
+        }
+        Ok(response)
+    }
+
     async fn read_body(&self, response: reqwest::Response) -> Result<Vec<u8>> {
         let mut stream = response.bytes_stream();
         let mut body = Vec::new();
@@ -302,6 +325,74 @@ impl OpenAiCompatClient {
             body.extend_from_slice(&chunk);
         }
         Ok(body)
+    }
+
+    pub async fn stream_visible_chat(
+        &self,
+        request: ChatRequest,
+        event_tx: Option<&UnboundedSender<VisibleChatEvent>>,
+    ) -> Result<VisibleChatOutcome> {
+        let response = self.streaming_response(&request).await?;
+        self.consume_visible_sse(response, event_tx).await
+    }
+
+    async fn consume_visible_sse(
+        &self,
+        response: reqwest::Response,
+        event_tx: Option<&UnboundedSender<VisibleChatEvent>>,
+    ) -> Result<VisibleChatOutcome> {
+        let mut stream = response.bytes_stream();
+        let mut normalizer = VisibleStreamNormalizer::with_limits(self.limits.clone());
+        let mut outcome = None;
+        let mut failure = None;
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(transport_error)?;
+            for event in normalizer.push_chunk(&chunk) {
+                if let VisibleChatEvent::Finish {
+                    reason,
+                    empty_visible_response,
+                } = &event
+                {
+                    outcome = Some((reason.clone(), *empty_visible_response));
+                }
+                if let VisibleChatEvent::Error(message) = &event {
+                    failure = Some(message.clone());
+                }
+                send_visible_event(event_tx, event);
+            }
+            if normalizer.is_done() || normalizer.is_failed() {
+                break;
+            }
+        }
+
+        if !normalizer.is_done() && !normalizer.is_failed() {
+            for event in normalizer.finish() {
+                if let VisibleChatEvent::Finish {
+                    reason,
+                    empty_visible_response,
+                } = &event
+                {
+                    outcome = Some((reason.clone(), *empty_visible_response));
+                }
+                if let VisibleChatEvent::Error(message) = &event {
+                    failure = Some(message.clone());
+                }
+                send_visible_event(event_tx, event);
+            }
+        }
+
+        if let Some(message) = failure {
+            return Err(AgentError::Llm(message));
+        }
+        let Some((finish_reason, empty_visible_response)) = outcome else {
+            return Err(AgentError::Llm("stream ended before [DONE]".into()));
+        };
+        Ok(VisibleChatOutcome {
+            finish_reason,
+            empty_visible_response,
+            hidden_reasoning_observed: normalizer.hidden_reasoning_observed(),
+        })
     }
 
     async fn consume_sse(
@@ -591,24 +682,7 @@ impl LlmBackend for OpenAiCompatClient {
         request: ChatRequest,
         event_tx: Option<&UnboundedSender<LlmStreamEvent>>,
     ) -> Result<AssistantTurn> {
-        let body = self.build_body(&request, true)?;
-        let endpoint = self.endpoint()?;
-        let client = self.http_client()?;
-        let response = self
-            .authorized(client.post(endpoint))
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::ACCEPT, "text/event-stream")
-            .body(body)
-            .send()
-            .await
-            .map_err(transport_error)?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(AgentError::Llm(format!(
-                "llama-server returned HTTP status {}",
-                status.as_u16()
-            )));
-        }
+        let response = self.streaming_response(&request).await?;
         self.consume_sse(response, event_tx).await
     }
 
@@ -664,6 +738,17 @@ impl LlmBackend for OpenAiCompatClient {
     }
 }
 
+#[async_trait::async_trait]
+impl VisibleChatBackend for OpenAiCompatClient {
+    async fn stream_visible_chat(
+        &self,
+        request: ChatRequest,
+        event_tx: Option<&UnboundedSender<VisibleChatEvent>>,
+    ) -> Result<VisibleChatOutcome> {
+        OpenAiCompatClient::stream_visible_chat(self, request, event_tx).await
+    }
+}
+
 fn transport_error(error: reqwest::Error) -> AgentError {
     let kind = if error.is_timeout() {
         "request timed out"
@@ -676,6 +761,15 @@ fn transport_error(error: reqwest::Error) -> AgentError {
 }
 
 fn send_event(event_tx: Option<&UnboundedSender<LlmStreamEvent>>, event: LlmStreamEvent) {
+    if let Some(event_tx) = event_tx {
+        let _ = event_tx.send(event);
+    }
+}
+
+fn send_visible_event(
+    event_tx: Option<&UnboundedSender<VisibleChatEvent>>,
+    event: VisibleChatEvent,
+) {
     if let Some(event_tx) = event_tx {
         let _ = event_tx.send(event);
     }

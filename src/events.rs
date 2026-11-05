@@ -18,6 +18,23 @@ pub enum AgentEvent {
     TaskStarted {
         summary: String,
     },
+    /// A reusable Chat turn was accepted by the worker.
+    ChatTurnStarted {
+        prompt: String,
+    },
+    /// A Chat turn completed without entering a terminal task state.
+    ChatTurnFinished {
+        finish_reason: String,
+        empty_visible_response: bool,
+    },
+    /// A Chat turn was cancelled by the operator.
+    ChatTurnCancelled {
+        reason: String,
+    },
+    /// A Chat turn failed before producing a complete response.
+    ChatTurnFailed {
+        message: String,
+    },
     /// Best-effort assistant text delta. The TUI may coalesce or drop these
     /// under backpressure, but must surface truncation when it does.
     StreamDelta {
@@ -143,6 +160,7 @@ pub enum UiEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Submit { objective: String, mode: TaskMode },
+    Chat { prompt: String },
     ResolveApproval { approval_id: String, approved: bool },
     Cancel,
     Quit,

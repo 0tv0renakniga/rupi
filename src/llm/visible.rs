@@ -1,7 +1,9 @@
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::sync::mpsc::UnboundedSender;
 
-use crate::llm::openai_compat::LlmLimits;
+use crate::error::Result;
+use crate::llm::{ChatRequest, openai_compat::LlmLimits};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VisibleChatEvent {
@@ -12,6 +14,22 @@ pub enum VisibleChatEvent {
     },
     Warning(String),
     Error(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisibleChatOutcome {
+    pub finish_reason: String,
+    pub empty_visible_response: bool,
+    pub hidden_reasoning_observed: bool,
+}
+
+#[async_trait::async_trait]
+pub trait VisibleChatBackend: Send + Sync {
+    async fn stream_visible_chat(
+        &self,
+        request: ChatRequest,
+        event_tx: Option<&UnboundedSender<VisibleChatEvent>>,
+    ) -> Result<VisibleChatOutcome>;
 }
 
 #[derive(Debug, Clone)]

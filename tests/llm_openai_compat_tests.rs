@@ -5,7 +5,7 @@ use std::time::Duration;
 use local_agent_harness::error::AgentError;
 use local_agent_harness::llm::openai_compat::{LlmLimits, OpenAiCompatClient};
 use local_agent_harness::llm::{
-    ChatMessage, ChatRequest, FnCall, LlmBackend, LlmStreamEvent, ToolCall,
+    ChatMessage, ChatRequest, FnCall, LlmBackend, LlmStreamEvent, ToolCall, VisibleChatEvent,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -501,6 +501,80 @@ async fn rejects_duplicate_final_tool_call_ids() {
         .expect_err("duplicate ids must be rejected");
 
     assert!(matches!(error, AgentError::Llm(message) if message.contains("duplicate")));
+}
+
+#[tokio::test]
+async fn visible_chat_ignores_reasoning_and_reports_visible_outcome() {
+    let body = [
+        data(r#"{"choices":[{"delta":{"reasoning_content":"private chain","content":"Hello"}}]}"#),
+        data(r#"{"choices":[{"delta":{"thinking":"still private","content":" world"}}]}"#),
+        data(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#),
+        done(),
+    ]
+    .concat();
+    let server = TestServer::start(move |_| TestResponse::sse(body.clone())).await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+
+    let outcome = server
+        .client()
+        .stream_visible_chat(user_request("visible"), Some(&tx))
+        .await
+        .expect("visible stream should succeed");
+    drop(tx);
+
+    assert_eq!(outcome.finish_reason, "stop");
+    assert!(!outcome.empty_visible_response);
+    assert!(outcome.hidden_reasoning_observed);
+
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+    assert_eq!(
+        events,
+        vec![
+            VisibleChatEvent::TextDelta("Hello".into()),
+            VisibleChatEvent::TextDelta(" world".into()),
+            VisibleChatEvent::Finish {
+                reason: "stop".into(),
+                empty_visible_response: false,
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn visible_chat_reports_empty_visible_completion() {
+    let body = [
+        data(r#"{"choices":[{"delta":{"reasoning_content":"private"}}]}"#),
+        data(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#),
+        done(),
+    ]
+    .concat();
+    let server = TestServer::start(move |_| TestResponse::sse(body.clone())).await;
+
+    let outcome = server
+        .client()
+        .stream_visible_chat(user_request("empty"), None)
+        .await
+        .expect("empty visible response is a normal completion");
+
+    assert!(outcome.empty_visible_response);
+    assert!(outcome.hidden_reasoning_observed);
+    assert_eq!(outcome.finish_reason, "stop");
+}
+
+#[tokio::test]
+async fn visible_chat_fails_on_http_error_before_streaming() {
+    let server =
+        TestServer::start(|_| TestResponse::status(503, "Service Unavailable", "down")).await;
+
+    let error = server
+        .client()
+        .stream_visible_chat(user_request("fail"), None)
+        .await
+        .expect_err("HTTP failures must not become empty responses");
+    assert!(matches!(error, AgentError::Llm(message) if message.contains("503")));
 }
 
 #[tokio::test]
