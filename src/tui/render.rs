@@ -156,6 +156,7 @@ fn draw_header_details(frame: &mut Frame, area: Rect, app: &AppState) {
         "ctx",
         bounded_display_text(&app.context_summary, 64),
     );
+    push_chat_telemetry_fields(&mut spans, app);
     push_field(
         &mut spans,
         "session",
@@ -201,8 +202,41 @@ fn draw_header_compact(frame: &mut Frame, area: Rect, app: &AppState) {
         "ctx",
         bounded_display_text(&app.context_summary, 64),
     );
+    push_chat_telemetry_fields(&mut spans, app);
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn push_chat_telemetry_fields(spans: &mut Vec<Span<'static>>, app: &AppState) {
+    let Some(telemetry) = &app.last_chat_telemetry else {
+        return;
+    };
+    push_field(
+        spans,
+        "ttft",
+        format_time_to_first_token(telemetry.time_to_first_token_ms),
+    );
+    push_field(spans, "out", telemetry.visible_output_tokens.to_string());
+    push_field(
+        spans,
+        "finish",
+        telemetry
+            .finish_reason
+            .as_deref()
+            .map(|reason| bounded_display_text(reason, 128))
+            .unwrap_or_else(|| "-".into()),
+    );
+    if let Some(category) = &telemetry.transport_error_category {
+        push_field(spans, "transport", bounded_display_text(category, 32));
+    }
+}
+
+fn format_time_to_first_token(milliseconds: Option<u64>) -> String {
+    match milliseconds {
+        None => "-".into(),
+        Some(milliseconds) if milliseconds < 1_000 => format!("{milliseconds} ms"),
+        Some(milliseconds) => format!("{:.1} s", milliseconds as f64 / 1_000.0),
+    }
 }
 
 fn push_field(spans: &mut Vec<Span<'static>>, label: &str, value: String) {

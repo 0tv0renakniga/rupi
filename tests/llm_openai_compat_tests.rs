@@ -5,7 +5,8 @@ use std::time::Duration;
 use local_agent_harness::error::AgentError;
 use local_agent_harness::llm::openai_compat::{LlmLimits, OpenAiCompatClient};
 use local_agent_harness::llm::{
-    ChatMessage, ChatRequest, FnCall, LlmBackend, LlmStreamEvent, ToolCall, VisibleChatEvent,
+    ChatMessage, ChatRequest, ContextAdmission, FnCall, LlmBackend, LlmStreamEvent, ToolCall,
+    VisibleChatEvent,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -501,6 +502,26 @@ async fn rejects_duplicate_final_tool_call_ids() {
         .expect_err("duplicate ids must be rejected");
 
     assert!(matches!(error, AgentError::Llm(message) if message.contains("duplicate")));
+}
+
+#[tokio::test]
+async fn context_admission_blocks_an_oversized_request_before_network() {
+    let server = TestServer::start(|_| TestResponse::sse(done())).await;
+    let client = server
+        .client()
+        .with_context_admission(ContextAdmission::new(128, 32, 16));
+
+    let error = client
+        .stream_visible_chat(user_request(&"x".repeat(1_000)), None)
+        .await
+        .expect_err("oversized prompt must be rejected");
+    assert!(
+        matches!(error, AgentError::Llm(message) if message.contains("context admission rejected"))
+    );
+    assert!(
+        server.requests().is_empty(),
+        "admission rejection must happen before any HTTP request"
+    );
 }
 
 #[tokio::test]

@@ -6,11 +6,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::config::{log_safe_endpoint, validate_endpoint};
+use crate::config::{Limits, log_safe_endpoint, validate_endpoint};
 use crate::error::{AgentError, Result};
 use crate::llm::{
-    AssistantTurn, ChatMessage, ChatRequest, FnCall, LlmBackend, LlmStreamEvent, ToolCall,
-    VisibleChatBackend, VisibleChatEvent, VisibleChatOutcome, VisibleStreamNormalizer,
+    AssistantTurn, ChatMessage, ChatRequest, ContextAdmission, FnCall, LlmBackend, LlmStreamEvent,
+    ToolCall, VisibleChatBackend, VisibleChatEvent, VisibleChatOutcome, VisibleStreamNormalizer,
 };
 
 const DEFAULT_TEMPERATURE: f32 = 0.2;
@@ -67,6 +67,7 @@ pub struct OpenAiCompatClient {
     pub max_tokens: u32,
     pub temperature: f32,
     pub limits: LlmLimits,
+    context_admission: Option<ContextAdmission>,
     bearer_token: Option<String>,
 }
 
@@ -79,6 +80,7 @@ impl std::fmt::Debug for OpenAiCompatClient {
             .field("max_tokens", &self.max_tokens)
             .field("temperature", &self.temperature)
             .field("limits", &self.limits)
+            .field("context_admission", &self.context_admission)
             .field("credential_configured", &self.bearer_token.is_some())
             .finish()
     }
@@ -92,6 +94,7 @@ impl OpenAiCompatClient {
             max_tokens: 4_096,
             temperature: DEFAULT_TEMPERATURE,
             limits: LlmLimits::default(),
+            context_admission: Some(ContextAdmission::from_limits(&Limits::default())),
             bearer_token: None,
         }
     }
@@ -99,6 +102,15 @@ impl OpenAiCompatClient {
     pub fn with_limits(mut self, limits: LlmLimits) -> Self {
         self.limits = limits;
         self
+    }
+
+    pub fn with_context_admission(mut self, admission: ContextAdmission) -> Self {
+        self.context_admission = Some(admission);
+        self
+    }
+
+    pub fn context_admission(&self) -> Option<ContextAdmission> {
+        self.context_admission
     }
 
     /// Attach a bearer credential resolved from an explicit configuration
@@ -195,6 +207,11 @@ impl OpenAiCompatClient {
                     "a tool definition exceeded the size limit".into(),
                 ));
             }
+        }
+        if let Some(admission) = self.context_admission {
+            admission
+                .admit(&request.messages, &request.tools)
+                .map_err(|rejection| AgentError::Llm(rejection.message()))?;
         }
 
         let wire = WireRequest {
@@ -740,6 +757,10 @@ impl LlmBackend for OpenAiCompatClient {
 
 #[async_trait::async_trait]
 impl VisibleChatBackend for OpenAiCompatClient {
+    fn context_admission(&self) -> Option<ContextAdmission> {
+        self.context_admission
+    }
+
     async fn stream_visible_chat(
         &self,
         request: ChatRequest,

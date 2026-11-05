@@ -1,7 +1,11 @@
+pub mod admission;
 pub mod openai_compat;
 pub mod prompts;
 pub mod visible;
 
+pub use admission::{
+    ContextAdmission, ContextPlan, ContextRejection, estimate_prompt_tokens, estimate_text_tokens,
+};
 pub use openai_compat::{LlmLimits, OpenAiCompatClient};
 pub use visible::{
     VisibleChatBackend, VisibleChatEvent, VisibleChatOutcome, VisibleStreamNormalizer,

@@ -32,7 +32,7 @@ use crate::config::Config;
 use crate::error::{AgentError, Result};
 use crate::events::{AgentEvent, Command, EventLevel};
 use crate::jev::JevClient;
-use crate::llm::{OpenAiCompatClient, VisibleChatBackend};
+use crate::llm::{ContextAdmission, OpenAiCompatClient, VisibleChatBackend};
 use crate::orchestrator::{LocalWikiStore, Orchestrator, OrchestratorLimits, ToolExecutor};
 use crate::runtime;
 use crate::script_runner::ScriptRunner;
@@ -90,7 +90,8 @@ async fn prepare(config: &Config) -> Result<PreparedApp> {
     app.endpoint_mode = config.endpoint.profile.as_str().to_owned();
     app.model = config.model.clone();
     app.project = config.root.display().to_string();
-    app.context_summary = format!("0% / {}", config.limits.effective_context_cap_tokens());
+    app.context_summary =
+        crate::tui::app::context_summary(0, config.limits.effective_context_cap_tokens());
     app.session = "preview".into();
     app.tool_indicator = "read-only".into();
 
@@ -127,7 +128,9 @@ async fn prepare(config: &Config) -> Result<PreparedApp> {
 }
 
 fn build_llm(config: &Config) -> Result<OpenAiCompatClient> {
-    let mut llm = OpenAiCompatClient::new(config.llm_base.clone(), config.model.clone());
+    let mut llm = OpenAiCompatClient::new(config.llm_base.clone(), config.model.clone())
+        .with_context_admission(ContextAdmission::from_limits(&config.limits));
+    llm.max_tokens = config.limits.reserved_output_tokens;
     if let Some(credential) = config.llm_credential()? {
         llm = llm.with_bearer_token(credential);
     }

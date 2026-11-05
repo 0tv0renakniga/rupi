@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use local_agent_harness::approval::{ApprovalAction, ApprovalRequest};
-use local_agent_harness::events::{AgentEvent, Command, EventLevel};
+use local_agent_harness::events::{AgentEvent, ChatTurnTelemetry, Command, EventLevel};
 use local_agent_harness::state_machine::{LoopState, TaskMode};
 use local_agent_harness::tui::app::{MAX_TRANSCRIPT_ENTRIES, StreamState};
 use local_agent_harness::tui::input::{handle_key, handle_paste};
@@ -170,6 +170,71 @@ fn chat_failure_is_visible_and_returns_to_prompt() {
     assert!(app.transcript.iter().any(|entry| {
         entry.kind == TranscriptKind::Error && entry.text.contains("could not connect")
     }));
+}
+
+#[test]
+fn chat_telemetry_updates_context_and_header_fields() {
+    let mut app = AppState::default();
+    app.apply(AgentEvent::ChatTurnStarted {
+        prompt: "hello".into(),
+    });
+    app.apply(AgentEvent::ChatTelemetry {
+        telemetry: ChatTurnTelemetry {
+            estimated_prompt_tokens: 2_200,
+            reserved_output_tokens: 4_096,
+            effective_context_cap_tokens: 16_384,
+            safety_margin_tokens: 512,
+            context_utilization_percent: 13,
+            time_to_first_token_ms: Some(1_840),
+            visible_output_chars: 50,
+            visible_output_tokens: 17,
+            finish_reason: Some("stop".into()),
+            empty_visible_response: false,
+            transport_error_category: None,
+            admission_rejected: false,
+        },
+    });
+
+    assert_eq!(app.context_summary, "13% / 16k");
+    let telemetry = app.last_chat_telemetry.as_ref().expect("telemetry stored");
+    assert_eq!(telemetry.estimated_prompt_tokens, 2_200);
+    assert_eq!(telemetry.time_to_first_token_ms, Some(1_840));
+    assert_eq!(telemetry.visible_output_tokens, 17);
+
+    app.apply(AgentEvent::ChatTurnFinished {
+        finish_reason: "stop".into(),
+        empty_visible_response: false,
+    });
+
+    let backend = TestBackend::new(140, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|frame| render::draw(frame, &app))
+        .expect("telemetry header should render");
+    let text = buffer_text(&mut terminal);
+    assert!(text.contains("ctx: 13% / 16k"), "missing context: {text}");
+    assert!(text.contains("ttft: 1.8 s"), "missing TTFT: {text}");
+    assert!(text.contains("out: 17"), "missing output estimate: {text}");
+    assert!(
+        text.contains("finish: stop"),
+        "missing finish reason: {text}"
+    );
+}
+
+#[test]
+fn chat_telemetry_strings_are_bounded() {
+    let mut app = AppState::default();
+    app.apply(AgentEvent::ChatTelemetry {
+        telemetry: ChatTurnTelemetry {
+            finish_reason: Some("f".repeat(1_000)),
+            transport_error_category: Some("t".repeat(1_000)),
+            ..ChatTurnTelemetry::default()
+        },
+    });
+
+    let telemetry = app.last_chat_telemetry.as_ref().expect("telemetry stored");
+    assert!(telemetry.finish_reason.as_ref().unwrap().len() <= 128 + 14);
+    assert!(telemetry.transport_error_category.as_ref().unwrap().len() <= 32 + 14);
 }
 
 #[test]
@@ -384,6 +449,9 @@ fn reducer_handles_every_agent_event_variant() {
         },
         AgentEvent::ChatTurnFailed {
             message: "failed".into(),
+        },
+        AgentEvent::ChatTelemetry {
+            telemetry: ChatTurnTelemetry::default(),
         },
         AgentEvent::TaskStarted {
             summary: "task".into(),

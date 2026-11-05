@@ -3,7 +3,7 @@ use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::error::Result;
-use crate::llm::{ChatRequest, openai_compat::LlmLimits};
+use crate::llm::{ChatRequest, ContextAdmission, openai_compat::LlmLimits};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VisibleChatEvent {
@@ -25,6 +25,12 @@ pub struct VisibleChatOutcome {
 
 #[async_trait::async_trait]
 pub trait VisibleChatBackend: Send + Sync {
+    fn context_admission(&self) -> Option<ContextAdmission> {
+        Some(ContextAdmission::from_limits(
+            &crate::config::Limits::default(),
+        ))
+    }
+
     async fn stream_visible_chat(
         &self,
         request: ChatRequest,

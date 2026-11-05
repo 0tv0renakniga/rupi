@@ -3,6 +3,22 @@ use crate::state_machine::{LoopState, TaskMode};
 
 /// Severity for user-facing notices. Display code must still bound and redact
 /// the message before rendering it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChatTurnTelemetry {
+    pub estimated_prompt_tokens: u32,
+    pub reserved_output_tokens: u32,
+    pub effective_context_cap_tokens: u32,
+    pub safety_margin_tokens: u32,
+    pub context_utilization_percent: u32,
+    pub time_to_first_token_ms: Option<u64>,
+    pub visible_output_chars: usize,
+    pub visible_output_tokens: u32,
+    pub finish_reason: Option<String>,
+    pub empty_visible_response: bool,
+    pub transport_error_category: Option<String>,
+    pub admission_rejected: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventLevel {
     Info,
@@ -34,6 +50,11 @@ pub enum AgentEvent {
     /// A Chat turn failed before producing a complete response.
     ChatTurnFailed {
         message: String,
+    },
+    /// Bounded per-turn context and response telemetry. This payload never
+    /// contains hidden reasoning, credentials, or unbounded model text.
+    ChatTelemetry {
+        telemetry: ChatTurnTelemetry,
     },
     /// Best-effort assistant text delta. The TUI may coalesce or drop these
     /// under backpressure, but must surface truncation when it does.

@@ -3,7 +3,7 @@
 
 **Version:** v1
 **Depends on:** TASK-000, TASK-004
-**Status:** Not started
+**Status:** Done
 
 ## Objective
 Prevent oversized model requests before network I/O and expose bounded per-turn operational telemetry so local-model stability can be measured and calibrated.

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
@@ -9,8 +9,11 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::approval::{ApprovalResolveError, InteractiveApprovalGate};
-use crate::events::{AgentEvent, Command, EventLevel};
-use crate::llm::{ChatMessage, ChatRequest, VisibleChatBackend, VisibleChatEvent};
+use crate::events::{AgentEvent, ChatTurnTelemetry, Command, EventLevel};
+use crate::llm::{
+    ChatMessage, ChatRequest, ContextPlan, VisibleChatBackend, VisibleChatEvent,
+    estimate_text_tokens,
+};
 use crate::orchestrator::{EventSink, Orchestrator, TaskRequest};
 use crate::state_machine::{TaskBudget, TaskMode};
 
@@ -301,6 +304,38 @@ async fn run_chat_turn(
     let mut messages = history.clone();
     messages.push(ChatMessage::user(prompt.clone()));
     let request = ChatRequest::new(messages);
+    let context_plan = match backend.context_admission() {
+        Some(admission) => match admission.admit(&request.messages, &request.tools) {
+            Ok(plan) => Some(plan),
+            Err(rejection) => {
+                let telemetry = build_chat_telemetry(
+                    Some(rejection.plan),
+                    None,
+                    "",
+                    Some("admission_rejected".into()),
+                    true,
+                    None,
+                    true,
+                );
+                let _ = sink
+                    .send_critical(AgentEvent::ChatTelemetry { telemetry })
+                    .await;
+                let _ = sink
+                    .send_critical(AgentEvent::ChatTurnFailed {
+                        message: rejection.message(),
+                    })
+                    .await;
+                if sink.is_closed() || cancel.is_cancelled() {
+                    cancel.cancel();
+                    return false;
+                }
+                return true;
+            }
+        },
+        None => None,
+    };
+    let started = Instant::now();
+    let mut first_token_at = None;
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let call = backend.stream_visible_chat(request, Some(&event_tx));
     tokio::pin!(call);
@@ -314,6 +349,18 @@ async fn run_chat_turn(
             biased;
             command = commands.recv() => match command {
                 Some(Command::Cancel) => {
+                    let telemetry = build_chat_telemetry(
+                        context_plan,
+                        ttft_ms(started, first_token_at),
+                        &assistant,
+                        Some("cancelled".into()),
+                        false,
+                        None,
+                        false,
+                    );
+                    let _ = sink
+                        .send_critical(AgentEvent::ChatTelemetry { telemetry })
+                        .await;
                     let _ = sink
                         .send_critical(AgentEvent::ChatTurnCancelled {
                             reason: "operator cancelled the active turn".into(),
@@ -341,13 +388,27 @@ async fn run_chat_turn(
             },
             event = event_rx.recv(), if events_open => match event {
                 Some(event) => {
-                    handle_visible_event(sink, event, &mut assistant, &mut failure_sent).await;
+                    handle_visible_event(
+                        sink,
+                        event,
+                        &mut assistant,
+                        &mut failure_sent,
+                        &mut first_token_at,
+                    )
+                    .await;
                 }
                 None => events_open = false,
             },
             result = &mut call => {
                 while let Ok(event) = event_rx.try_recv() {
-                    handle_visible_event(sink, event, &mut assistant, &mut failure_sent).await;
+                    handle_visible_event(
+                        sink,
+                        event,
+                        &mut assistant,
+                        &mut failure_sent,
+                        &mut first_token_at,
+                    )
+                    .await;
                 }
                 break result;
             }
@@ -357,8 +418,20 @@ async fn run_chat_turn(
     match result {
         Ok(outcome) => {
             if !outcome.empty_visible_response && !assistant.trim().is_empty() {
-                append_chat_history(history, prompt, assistant);
+                append_chat_history(history, prompt, assistant.clone());
             }
+            let telemetry = build_chat_telemetry(
+                context_plan,
+                ttft_ms(started, first_token_at),
+                &assistant,
+                Some(outcome.finish_reason.clone()),
+                outcome.empty_visible_response,
+                None,
+                false,
+            );
+            let _ = sink
+                .send_critical(AgentEvent::ChatTelemetry { telemetry })
+                .await;
             let _ = sink
                 .send_critical(AgentEvent::ChatTurnFinished {
                     finish_reason: outcome.finish_reason,
@@ -367,6 +440,18 @@ async fn run_chat_turn(
                 .await;
         }
         Err(error) => {
+            let telemetry = build_chat_telemetry(
+                context_plan,
+                ttft_ms(started, first_token_at),
+                &assistant,
+                None,
+                false,
+                transport_error_category(&error),
+                false,
+            );
+            let _ = sink
+                .send_critical(AgentEvent::ChatTelemetry { telemetry })
+                .await;
             if !failure_sent {
                 let _ = sink
                     .send_critical(AgentEvent::ChatTurnFailed {
@@ -384,16 +469,91 @@ async fn run_chat_turn(
     true
 }
 
+fn ttft_ms(started: Instant, first_token_at: Option<Instant>) -> Option<u64> {
+    first_token_at.map(|first| {
+        u64::try_from(first.saturating_duration_since(started).as_millis())
+            .unwrap_or(u64::MAX)
+            .min(600_000)
+    })
+}
+
+fn build_chat_telemetry(
+    plan: Option<ContextPlan>,
+    time_to_first_token_ms: Option<u64>,
+    assistant: &str,
+    finish_reason: Option<String>,
+    empty_visible_response: bool,
+    transport_error_category: Option<String>,
+    admission_rejected: bool,
+) -> ChatTurnTelemetry {
+    let (
+        estimated_prompt_tokens,
+        reserved_output_tokens,
+        effective_context_cap_tokens,
+        safety_margin_tokens,
+        context_utilization_percent,
+    ) = plan.map_or((0, 0, 0, 0, 0), |plan| {
+        (
+            plan.estimated_prompt_tokens,
+            plan.reserved_output_tokens,
+            plan.effective_context_cap_tokens,
+            plan.safety_margin_tokens,
+            plan.utilization_percent(),
+        )
+    });
+
+    ChatTurnTelemetry {
+        estimated_prompt_tokens,
+        reserved_output_tokens,
+        effective_context_cap_tokens,
+        safety_margin_tokens,
+        context_utilization_percent,
+        time_to_first_token_ms,
+        visible_output_chars: assistant.chars().count(),
+        visible_output_tokens: estimate_text_tokens(assistant),
+        finish_reason,
+        empty_visible_response,
+        transport_error_category,
+        admission_rejected,
+    }
+}
+
+fn transport_error_category(error: &crate::error::AgentError) -> Option<String> {
+    let crate::error::AgentError::Llm(message) = error else {
+        return Some("other".into());
+    };
+    let message = message.to_ascii_lowercase();
+    let category = if message.contains("timed out") {
+        "timeout"
+    } else if message.contains("could not connect") {
+        "connect"
+    } else if message.contains("http status") {
+        "http_status"
+    } else if message.contains("stream")
+        || message.contains("sse")
+        || message.contains("before [done]")
+    {
+        "stream"
+    } else {
+        "other"
+    };
+    Some(category.into())
+}
+
 async fn handle_visible_event(
     sink: &TuiEventSink,
     event: VisibleChatEvent,
     assistant: &mut String,
     failure_sent: &mut bool,
+    first_token_at: &mut Option<Instant>,
 ) {
     match event {
         VisibleChatEvent::TextDelta(text) => {
             if text.is_empty() {
                 return;
+            }
+            if first_token_at.is_none() {
+                *first_token_at = Some(Instant::now());
             }
             assistant.push_str(&text);
             sink.emit(AgentEvent::StreamDelta { text });
@@ -535,6 +695,8 @@ mod tests {
         outcome: Option<VisibleChatOutcome>,
         error: Option<String>,
         pending: bool,
+        admission: Option<crate::llm::ContextAdmission>,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl FakeChatBackend {
@@ -544,17 +706,33 @@ mod tests {
                 outcome: Some(outcome),
                 error: None,
                 pending: false,
+                admission: None,
+                calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
+        }
+
+        fn with_admission(mut self, admission: crate::llm::ContextAdmission) -> Self {
+            self.admission = Some(admission);
+            self
         }
     }
 
     #[async_trait::async_trait]
     impl VisibleChatBackend for FakeChatBackend {
+        fn context_admission(&self) -> Option<crate::llm::ContextAdmission> {
+            self.admission
+                .or(Some(crate::llm::ContextAdmission::from_limits(
+                    &crate::config::Limits::default(),
+                )))
+        }
+
         async fn stream_visible_chat(
             &self,
             _request: ChatRequest,
             event_tx: Option<&mpsc::UnboundedSender<VisibleChatEvent>>,
         ) -> crate::error::Result<VisibleChatOutcome> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if self.pending {
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
@@ -694,20 +872,34 @@ mod tests {
 
         assert!(keep_running);
         let events = drain_events(&mut rx);
+        assert_eq!(events.len(), 4);
         assert_eq!(
-            events,
-            vec![
-                AgentEvent::ChatTurnStarted {
-                    prompt: "hi".into()
-                },
-                AgentEvent::StreamDelta {
-                    text: "Hello".into()
-                },
-                AgentEvent::ChatTurnFinished {
-                    finish_reason: "stop".into(),
-                    empty_visible_response: false,
-                },
-            ]
+            events[0],
+            AgentEvent::ChatTurnStarted {
+                prompt: "hi".into()
+            }
+        );
+        assert_eq!(
+            events[1],
+            AgentEvent::StreamDelta {
+                text: "Hello".into()
+            }
+        );
+        let AgentEvent::ChatTelemetry { telemetry } = &events[2] else {
+            panic!("expected chat telemetry, got {:?}", events[2]);
+        };
+        assert_eq!(telemetry.estimated_prompt_tokens, 22);
+        assert_eq!(telemetry.visible_output_chars, 5);
+        assert_eq!(telemetry.visible_output_tokens, 2);
+        assert!(telemetry.time_to_first_token_ms.is_some());
+        assert_eq!(telemetry.finish_reason.as_deref(), Some("stop"));
+        assert!(!telemetry.admission_rejected);
+        assert_eq!(
+            events[3],
+            AgentEvent::ChatTurnFinished {
+                finish_reason: "stop".into(),
+                empty_visible_response: false,
+            }
         );
         assert_eq!(history.len(), 3);
         assert_eq!(history[1].content.as_deref(), Some("hi"));
@@ -763,6 +955,8 @@ mod tests {
             outcome: None,
             error: Some("stream broke".into()),
             pending: false,
+            admission: None,
+            calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
         let mut history = vec![ChatMessage::system("system")];
 
@@ -778,11 +972,125 @@ mod tests {
         drop(command_tx);
 
         assert_eq!(history.len(), 1);
-        let failures = drain_events(&mut rx)
-            .into_iter()
+        let events = drain_events(&mut rx);
+        let failures = events
+            .iter()
             .filter(|event| matches!(event, AgentEvent::ChatTurnFailed { .. }))
             .count();
         assert_eq!(failures, 1);
+        let telemetry = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ChatTelemetry { telemetry } => Some(telemetry),
+                _ => None,
+            })
+            .expect("failed turn should report telemetry");
+        assert_eq!(
+            telemetry.transport_error_category.as_deref(),
+            Some("stream")
+        );
+        assert_eq!(telemetry.finish_reason, None);
+        assert!(!telemetry.admission_rejected);
+    }
+
+    #[tokio::test]
+    async fn chat_admission_rejects_before_backend_call_and_reports_telemetry() {
+        let (tx, mut rx) = mpsc::channel(32);
+        let (command_tx, mut command_rx) = mpsc::channel(4);
+        let sink = TuiEventSink::new(tx);
+        let backend = Arc::new(
+            FakeChatBackend::new(
+                vec![VisibleChatEvent::TextDelta("must not run".into())],
+                outcome(false),
+            )
+            .with_admission(crate::llm::ContextAdmission::new(128, 32, 16)),
+        );
+        let observed = Arc::clone(&backend);
+        let mut history = vec![ChatMessage::system("system")];
+
+        let keep_running = run_chat_turn(
+            backend,
+            &sink,
+            &mut history,
+            "x".repeat(1_000),
+            &mut command_rx,
+            &CancellationToken::new(),
+        )
+        .await;
+        drop(command_tx);
+
+        assert!(keep_running);
+        assert_eq!(
+            observed.calls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "admission must reject before invoking the backend"
+        );
+        assert_eq!(history.len(), 1);
+        let events = drain_events(&mut rx);
+        assert_eq!(
+            events[0],
+            AgentEvent::ChatTurnStarted {
+                prompt: "x".repeat(1_000)
+            }
+        );
+        let AgentEvent::ChatTelemetry { telemetry } = &events[1] else {
+            panic!("expected rejection telemetry");
+        };
+        assert!(telemetry.admission_rejected);
+        assert_eq!(telemetry.effective_context_cap_tokens, 128);
+        assert_eq!(telemetry.reserved_output_tokens, 32);
+        assert_eq!(telemetry.safety_margin_tokens, 16);
+        assert_eq!(
+            telemetry.finish_reason.as_deref(),
+            Some("admission_rejected")
+        );
+        assert_eq!(telemetry.context_utilization_percent, 100);
+        assert!(matches!(
+            &events[2],
+            AgentEvent::ChatTurnFailed { message } if message.contains("context admission rejected")
+        ));
+    }
+
+    #[tokio::test]
+    async fn chat_success_telemetry_uses_admission_plan() {
+        let (tx, mut rx) = mpsc::channel(32);
+        let (command_tx, mut command_rx) = mpsc::channel(4);
+        let sink = TuiEventSink::new(tx);
+        let backend = Arc::new(
+            FakeChatBackend::new(
+                vec![
+                    VisibleChatEvent::TextDelta("Hello".into()),
+                    VisibleChatEvent::Finish {
+                        reason: "stop".into(),
+                        empty_visible_response: false,
+                    },
+                ],
+                outcome(false),
+            )
+            .with_admission(crate::llm::ContextAdmission::new(1_000, 200, 100)),
+        );
+        let mut history = vec![ChatMessage::system("system")];
+
+        run_chat_turn(
+            backend,
+            &sink,
+            &mut history,
+            "hi".into(),
+            &mut command_rx,
+            &CancellationToken::new(),
+        )
+        .await;
+        drop(command_tx);
+
+        let events = drain_events(&mut rx);
+        let AgentEvent::ChatTelemetry { telemetry } = &events[2] else {
+            panic!("expected chat telemetry");
+        };
+        assert_eq!(telemetry.estimated_prompt_tokens, 22);
+        assert_eq!(telemetry.effective_context_cap_tokens, 1_000);
+        assert_eq!(telemetry.reserved_output_tokens, 200);
+        assert_eq!(telemetry.safety_margin_tokens, 100);
+        assert_eq!(telemetry.context_utilization_percent, 2);
     }
 
     #[tokio::test]
@@ -795,6 +1103,8 @@ mod tests {
             outcome: None,
             error: None,
             pending: true,
+            admission: None,
+            calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
         let mut history = vec![ChatMessage::system("system")];
         let cancel = CancellationToken::new();

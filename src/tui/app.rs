@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use crate::events::{AgentEvent, EventLevel};
+use crate::events::{AgentEvent, ChatTurnTelemetry, EventLevel};
 use crate::state_machine::{LoopState, TaskMode};
 use crate::wiki::redact::redact;
 
@@ -15,6 +15,25 @@ pub const MAX_DISPLAY_TEXT_BYTES: usize = 2 * 1024;
 pub const MAX_TASK_INPUT_BYTES: usize = 8 * 1024;
 /// Grace period before a second Ctrl-C may exit a cancelling task.
 pub const CANCEL_GRACE: Duration = Duration::from_secs(2);
+
+pub(crate) fn context_summary(
+    utilization_percent: u32,
+    effective_context_cap_tokens: u32,
+) -> String {
+    format!(
+        "{}% / {}",
+        utilization_percent.min(100),
+        format_context_cap(effective_context_cap_tokens)
+    )
+}
+
+pub(crate) fn format_context_cap(tokens: u32) -> String {
+    if tokens >= 1_000 {
+        format!("{}k", (u64::from(tokens) + 500) / 1_000)
+    } else {
+        tokens.to_string()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InputMode {
@@ -510,6 +529,7 @@ pub struct AppState {
     pub fixtures: ShellFixtures,
     pub project: String,
     pub context_summary: String,
+    pub last_chat_telemetry: Option<ChatTurnTelemetry>,
     pub session: String,
     pub tool_indicator: String,
     pub detail: String,
@@ -557,6 +577,7 @@ impl Default for AppState {
             fixtures: ShellFixtures::default(),
             project: "workspace".into(),
             context_summary: "0% / 16k".into(),
+            last_chat_telemetry: None,
             session: "preview".into(),
             tool_indicator: "read-only".into(),
             detail: String::new(),
@@ -789,6 +810,7 @@ impl AppState {
                 self.stream_state = StreamState::Idle;
                 self.stream_truncated = false;
                 self.chat_visible_received = false;
+                self.last_chat_telemetry = None;
                 self.cancel_requested_at = None;
                 self.cancel_grace_elapsed = false;
                 self.completion_summary = None;
@@ -797,6 +819,9 @@ impl AppState {
                 self.scroll_offset = 0;
                 self.detail = "Waiting for the local model...".into();
                 self.push_entry(TranscriptKind::Operator, prompt);
+            }
+            AgentEvent::ChatTelemetry { telemetry } => {
+                self.apply_chat_telemetry(telemetry);
             }
             AgentEvent::ChatTurnFinished {
                 finish_reason,
@@ -1089,9 +1114,24 @@ impl AppState {
         }
     }
 
+    fn apply_chat_telemetry(&mut self, mut telemetry: ChatTurnTelemetry) {
+        telemetry.finish_reason = telemetry
+            .finish_reason
+            .map(|reason| bounded_display_text(&reason, 128));
+        telemetry.transport_error_category = telemetry
+            .transport_error_category
+            .map(|category| bounded_display_text(&category, 32));
+        self.context_summary = context_summary(
+            telemetry.context_utilization_percent,
+            telemetry.effective_context_cap_tokens,
+        );
+        self.last_chat_telemetry = Some(telemetry);
+    }
+
     fn reset_for_task(&mut self) {
         self.chat_active = false;
         self.chat_visible_received = false;
+        self.last_chat_telemetry = None;
         self.transcript.clear();
         self.transcript_bytes = 0;
         self.transcript_truncated = false;
