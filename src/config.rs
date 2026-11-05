@@ -4,6 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use reqwest::Url;
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::approval::{ApprovalPolicy, DEFAULT_APPROVAL_TIMEOUT};
@@ -15,8 +16,14 @@ use crate::state_machine::TaskBudget;
 
 /// Runtime configuration.
 ///
-/// This milestone uses a deliberately small environment-variable source:
+/// Values come from built-in defaults, then an optional trusted
+/// `<config dir>/config.toml`, then environment variables. The config directory
+/// is `HARNESS_CONFIG_DIR`, else `$XDG_CONFIG_HOME/local-agent-harness`, else
+/// `~/.config/local-agent-harness`. A missing file is valid.
 ///
+/// Environment variables:
+///
+/// - `HARNESS_CONFIG_DIR` (trusted `config.toml` directory override)
 /// - `HARNESS_ROOT` (default: current directory)
 /// - `HARNESS_AUDIT_PATH` (default: `<root>/.harness-audit/audit.jsonl`)
 /// - `HARNESS_ENDPOINT_PROFILE` (default: `local`)
@@ -31,7 +38,12 @@ use crate::state_machine::TaskBudget;
 /// - `HARNESS_MAX_VERIFY_RETRIES` (default: `3`)
 /// - `HARNESS_MAX_SYSTEM2_CALLS` (default: `80`)
 /// - `HARNESS_MAX_WALL_SECS` (default: `3600`)
-/// - `HARNESS_MAX_TOOL_OUTPUT_BYTES` (default: `4000`)
+/// - `HARNESS_MAX_TOOL_OUTPUT_BYTES` (default: `4000`; also sets the limit)
+/// - `HARNESS_CONTEXT_CAP_TOKENS` (default: `16384`)
+/// - `HARNESS_RESERVED_OUTPUT_TOKENS` (default: `4096`)
+/// - `HARNESS_FILE_PREVIEW_BYTES` (default: `8192`)
+/// - `HARNESS_MAX_SEARCH_RESULTS` (default: `100`)
+/// - `HARNESS_MAX_SESSION_EVENT_BYTES` (default: `65536`)
 /// - `HARNESS_APPROVAL_MUTATIONS` (default: `true`)
 /// - `HARNESS_APPROVAL_RISKY_COMMANDS` (default: `false`)
 /// - `HARNESS_APPROVAL_RISKY_PROGRAMS` (default: `git,cargo,npm,pip,python3`)
@@ -53,6 +65,10 @@ use crate::state_machine::TaskBudget;
 /// Enabling the `remote` Cargo feature does not by itself select the remote
 /// profile, configure an endpoint, contact a service, or upload data.
 ///
+/// The harness-owned session data directory is resolved under
+/// `$XDG_DATA_HOME/local-agent-harness/sessions`, falling back to
+/// `~/.local/share/local-agent-harness/sessions`. Startup only resolves it.
+///
 /// The frozen MCP adapter still defines `HARNESS_MCP_*` settings and tests, but
 /// the normal TUI and headless paths use the fixed helper-script substrate and
 /// never start an MCP runtime. No server name, executable, argument, working
@@ -63,6 +79,92 @@ pub const MAX_ALLOWED_ORIGINS: usize = 16;
 pub const MAX_MODEL_NAME_BYTES: usize = 256;
 /// Maximum accepted credential-reference environment-variable name length.
 pub const MAX_CREDENTIAL_REF_BYTES: usize = 128;
+/// Conservative token margin reserved for tokenizer and protocol overhead.
+pub const CONTEXT_SAFETY_MARGIN_TOKENS: u32 = 512;
+
+/// Bounded runtime limits used by context admission and tool output handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Limits {
+    pub context_cap_tokens: u32,
+    pub reserved_output_tokens: u32,
+    pub file_preview_bytes: usize,
+    pub max_search_results: u16,
+    pub max_tool_output_bytes: usize,
+    pub max_session_event_bytes: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            context_cap_tokens: 16_384,
+            reserved_output_tokens: 4_096,
+            file_preview_bytes: 8_192,
+            max_search_results: 100,
+            max_tool_output_bytes: 4_000,
+            max_session_event_bytes: 65_536,
+        }
+    }
+}
+
+impl Limits {
+    pub fn effective_context_cap_tokens(&self) -> u32 {
+        self.context_cap_tokens
+    }
+
+    pub fn prompt_token_budget_tokens(&self) -> u32 {
+        self.context_cap_tokens
+            .saturating_sub(self.reserved_output_tokens)
+            .saturating_sub(CONTEXT_SAFETY_MARGIN_TOKENS)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let invalid = [
+            (
+                self.context_cap_tokens == 0,
+                "context_cap_tokens must be greater than zero",
+            ),
+            (
+                self.reserved_output_tokens == 0,
+                "reserved_output_tokens must be greater than zero",
+            ),
+            (
+                self.file_preview_bytes == 0,
+                "file_preview_bytes must be greater than zero",
+            ),
+            (
+                self.max_search_results == 0,
+                "max_search_results must be greater than zero",
+            ),
+            (
+                self.max_tool_output_bytes == 0,
+                "max_tool_output_bytes must be greater than zero",
+            ),
+            (
+                self.max_session_event_bytes == 0,
+                "max_session_event_bytes must be greater than zero",
+            ),
+        ];
+        for (is_invalid, message) in invalid {
+            if is_invalid {
+                return Err(AgentError::Config(message.into()));
+            }
+        }
+
+        let required = self
+            .reserved_output_tokens
+            .checked_add(CONTEXT_SAFETY_MARGIN_TOKENS)
+            .ok_or_else(|| {
+                AgentError::Config("reserved_output_tokens plus safety margin overflowed".into())
+            })?;
+        if self.context_cap_tokens <= required {
+            return Err(AgentError::Config(format!(
+                "context_cap_tokens must exceed reserved_output_tokens plus the {CONTEXT_SAFETY_MARGIN_TOKENS}-token safety margin"
+            )));
+        }
+        Ok(())
+    }
+}
 
 /// Mutually exclusive endpoint profiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -178,6 +280,69 @@ impl ScriptConfig {
     }
 }
 
+/// Optional trusted `config.toml` contents.
+///
+/// Missing fields inherit built-in defaults; environment variables override
+/// values from this file.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ConfigFile {
+    root: Option<PathBuf>,
+    llm_base: Option<String>,
+    model: Option<String>,
+    max_act_turns: Option<usize>,
+    max_verify_retries: Option<u8>,
+    limits: Option<Limits>,
+}
+
+/// Redacted configuration view safe for startup diagnostics and logs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigSummary {
+    pub root: PathBuf,
+    pub audit_path: PathBuf,
+    pub endpoint_profile: String,
+    pub llm_base: String,
+    pub jev_base: String,
+    pub model: String,
+    pub max_act_turns: usize,
+    pub max_verify_retries: u8,
+    pub context_cap_tokens: u32,
+    pub reserved_output_tokens: u32,
+    pub prompt_budget_tokens: u32,
+    pub file_preview_bytes: usize,
+    pub max_search_results: u16,
+    pub max_tool_output_bytes: usize,
+    pub max_session_event_bytes: usize,
+    pub trusted_config_dir: PathBuf,
+    pub session_data_dir: PathBuf,
+}
+
+impl std::fmt::Display for ConfigSummary {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "root={} audit_path={} endpoint_profile={} llm_base={} jev_base={} model={} max_act_turns={} max_verify_retries={} context_cap_tokens={} reserved_output_tokens={} prompt_budget_tokens={} file_preview_bytes={} max_search_results={} max_tool_output_bytes={} max_session_event_bytes={} trusted_config_dir={} session_data_dir={}",
+            self.root.display(),
+            self.audit_path.display(),
+            self.endpoint_profile,
+            self.llm_base,
+            self.jev_base,
+            self.model,
+            self.max_act_turns,
+            self.max_verify_retries,
+            self.context_cap_tokens,
+            self.reserved_output_tokens,
+            self.prompt_budget_tokens,
+            self.file_preview_bytes,
+            self.max_search_results,
+            self.max_tool_output_bytes,
+            self.max_session_event_bytes,
+            self.trusted_config_dir.display(),
+            self.session_data_dir.display(),
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub root: PathBuf,
@@ -189,16 +354,48 @@ pub struct Config {
     pub endpoint: EndpointConfig,
     pub min_route_conf: f32,
     pub budget: TaskBudget,
+    pub limits: Limits,
+    pub trusted_config_dir: PathBuf,
+    pub session_data_dir: PathBuf,
     pub approval: ApprovalPolicy,
     pub scripts: ScriptConfig,
 }
 
 impl Config {
+    /// Load runtime configuration from trusted operator configuration and the
+    /// environment. Environment values override `config.toml`.
+    pub fn load() -> Result<Self> {
+        let trusted_config_dir = trusted_config_dir()?;
+        let file = load_config_file(&trusted_config_dir)?;
+        Self::from_sources(file.unwrap_or_default(), trusted_config_dir)
+    }
+
+    /// Load environment-only configuration.
+    ///
+    /// This preserves the pre-`config.toml` behavior for callers and tests.
     pub fn from_env() -> Result<Self> {
+        let trusted_config_dir = trusted_config_dir()?;
+        Self::from_sources(ConfigFile::default(), trusted_config_dir)
+    }
+
+    fn from_sources(file: ConfigFile, trusted_config_dir: PathBuf) -> Result<Self> {
+        let ConfigFile {
+            root: file_root,
+            llm_base: file_llm_base,
+            model: file_model,
+            max_act_turns: file_max_act_turns,
+            max_verify_retries: file_max_verify_retries,
+            limits: file_limits,
+        } = file;
+        let file_limits = file_limits.unwrap_or_default();
+        let model_explicit = std::env::var("HARNESS_MODEL")
+            .is_ok_and(|value| !value.trim().is_empty())
+            || file_model.is_some();
+
         let root = std::env::var_os("HARNESS_ROOT")
             .map(PathBuf::from)
+            .or(file_root)
             .unwrap_or(std::env::current_dir()?);
-
         let audit_path = resolve_audit_path(
             &root,
             std::env::var_os("HARNESS_AUDIT_PATH")
@@ -206,13 +403,43 @@ impl Config {
                 .map(PathBuf::from),
         )?;
 
+        let max_tool_output_bytes = parse_env(
+            "HARNESS_MAX_TOOL_OUTPUT_BYTES",
+            file_limits.max_tool_output_bytes,
+        )?;
         let budget = TaskBudget {
-            max_act_turns: parse_env("HARNESS_MAX_ACT_TURNS", 40usize)?,
+            max_act_turns: parse_env("HARNESS_MAX_ACT_TURNS", file_max_act_turns.unwrap_or(40))?,
             max_tool_calls: parse_env("HARNESS_MAX_TOOL_CALLS", 120usize)?,
-            max_verify_retries: parse_env("HARNESS_MAX_VERIFY_RETRIES", 3u8)?,
+            max_verify_retries: parse_env(
+                "HARNESS_MAX_VERIFY_RETRIES",
+                file_max_verify_retries.unwrap_or(3),
+            )?,
             max_system2_calls: parse_env("HARNESS_MAX_SYSTEM2_CALLS", 80usize)?,
             max_wall_time: Duration::from_secs(parse_env("HARNESS_MAX_WALL_SECS", 3_600u64)?),
-            max_tool_output_bytes: parse_env("HARNESS_MAX_TOOL_OUTPUT_BYTES", 4_000usize)?,
+            max_tool_output_bytes,
+        };
+        let limits = Limits {
+            context_cap_tokens: parse_env(
+                "HARNESS_CONTEXT_CAP_TOKENS",
+                file_limits.context_cap_tokens,
+            )?,
+            reserved_output_tokens: parse_env(
+                "HARNESS_RESERVED_OUTPUT_TOKENS",
+                file_limits.reserved_output_tokens,
+            )?,
+            file_preview_bytes: parse_env(
+                "HARNESS_FILE_PREVIEW_BYTES",
+                file_limits.file_preview_bytes,
+            )?,
+            max_search_results: parse_env(
+                "HARNESS_MAX_SEARCH_RESULTS",
+                file_limits.max_search_results,
+            )?,
+            max_tool_output_bytes,
+            max_session_event_bytes: parse_env(
+                "HARNESS_MAX_SESSION_EVENT_BYTES",
+                file_limits.max_session_event_bytes,
+            )?,
         };
 
         let scripts = ScriptConfig::from_env()?;
@@ -220,8 +447,7 @@ impl Config {
             profile: EndpointProfile::parse(&env_or("HARNESS_ENDPOINT_PROFILE", "local"))?,
             allowed_origins: parse_origin_list("HARNESS_LLM_ALLOWED_ORIGINS")?,
             credential_env: optional_env_name("HARNESS_LLM_CREDENTIAL_ENV")?,
-            model_explicit: std::env::var("HARNESS_MODEL")
-                .is_ok_and(|value| !value.trim().is_empty()),
+            model_explicit,
         };
         let approval = ApprovalPolicy {
             require_for_mutations: parse_env("HARNESS_APPROVAL_MUTATIONS", true)?,
@@ -235,19 +461,58 @@ impl Config {
                 DEFAULT_APPROVAL_TIMEOUT.as_secs(),
             )?),
         };
+        let llm_base = std::env::var("HARNESS_LLM_BASE").unwrap_or_else(|_| {
+            file_llm_base.unwrap_or_else(|| "http://127.0.0.1:8080".to_owned())
+        });
+        let model = std::env::var("HARNESS_MODEL")
+            .unwrap_or_else(|_| file_model.unwrap_or_else(|| "local-model".to_owned()));
 
         Ok(Self {
             root,
             audit_path,
-            llm_base: env_or("HARNESS_LLM_BASE", "http://127.0.0.1:8080"),
-            model: env_or("HARNESS_MODEL", "local-model"),
+            llm_base,
+            model,
             jev_base: env_or("HARNESS_JEV_BASE", "http://127.0.0.1:9090"),
             endpoint,
             min_route_conf: parse_env("HARNESS_MIN_ROUTE_CONF", 0.85f32)?,
             budget,
+            limits,
+            trusted_config_dir,
+            session_data_dir: session_data_dir()?,
             approval,
             scripts,
         })
+    }
+
+    pub fn max_act_turns(&self) -> usize {
+        self.budget.max_act_turns
+    }
+
+    pub fn max_verify_retries(&self) -> u8 {
+        self.budget.max_verify_retries
+    }
+
+    /// Return a redacted view suitable for startup diagnostics.
+    pub fn safe_summary(&self) -> ConfigSummary {
+        ConfigSummary {
+            root: self.root.clone(),
+            audit_path: self.audit_path.clone(),
+            endpoint_profile: self.endpoint.profile.as_str().to_owned(),
+            llm_base: log_safe_endpoint(&self.llm_base),
+            jev_base: log_safe_endpoint(&self.jev_base),
+            model: self.model.clone(),
+            max_act_turns: self.max_act_turns(),
+            max_verify_retries: self.max_verify_retries(),
+            context_cap_tokens: self.limits.effective_context_cap_tokens(),
+            reserved_output_tokens: self.limits.reserved_output_tokens,
+            prompt_budget_tokens: self.limits.prompt_token_budget_tokens(),
+            file_preview_bytes: self.limits.file_preview_bytes,
+            max_search_results: self.limits.max_search_results,
+            max_tool_output_bytes: self.limits.max_tool_output_bytes,
+            max_session_event_bytes: self.limits.max_session_event_bytes,
+            trusted_config_dir: self.trusted_config_dir.clone(),
+            session_data_dir: self.session_data_dir.clone(),
+        }
     }
 
     /// Resolve the configured credential reference without exposing its value
@@ -285,11 +550,99 @@ impl Config {
         }
 
         validate_budget(&self.budget)?;
+        self.limits.validate()?;
         validate_audit_path(&self.root, &self.audit_path)?;
         validate_endpoint_profile(&self.endpoint, &self.llm_base, &self.model)?;
         validate_local_endpoint("jev_base", &self.jev_base)?;
         self.approval.validate()?;
         Ok(())
+    }
+}
+
+/// Resolve the operator-owned trusted configuration directory.
+///
+/// `HARNESS_CONFIG_DIR` is an explicit override used by operators and tests.
+/// Otherwise the XDG base is used, falling back to `~/.config`.
+pub fn trusted_config_dir() -> Result<PathBuf> {
+    let override_dir = std::env::var_os("HARNESS_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    resolve_trusted_config_dir(override_dir.as_deref(), xdg.as_deref(), home.as_deref())
+}
+
+fn resolve_trusted_config_dir(
+    override_dir: Option<&Path>,
+    xdg_config_home: Option<&Path>,
+    home: Option<&Path>,
+) -> Result<PathBuf> {
+    if let Some(dir) = override_dir {
+        return absolute_config_dir("HARNESS_CONFIG_DIR", dir);
+    }
+    let base = xdg_config_home
+        .filter(|path| path.is_absolute())
+        .map(Path::to_path_buf)
+        .or_else(|| home.map(|path| path.join(".config")))
+        .ok_or_else(|| {
+            AgentError::Config(
+                "cannot resolve the trusted configuration directory; set XDG_CONFIG_HOME or HOME"
+                    .into(),
+            )
+        })?;
+    absolute_config_dir(
+        "trusted configuration directory",
+        &base.join("local-agent-harness"),
+    )
+}
+
+/// Resolve the harness-owned session data directory.
+pub fn session_data_dir() -> Result<PathBuf> {
+    let xdg = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    resolve_session_data_dir(xdg.as_deref(), home.as_deref())
+}
+
+fn resolve_session_data_dir(xdg_data_home: Option<&Path>, home: Option<&Path>) -> Result<PathBuf> {
+    let base = xdg_data_home
+        .filter(|path| path.is_absolute())
+        .map(Path::to_path_buf)
+        .or_else(|| home.map(|path| path.join(".local").join("share")))
+        .ok_or_else(|| {
+            AgentError::Config(
+                "cannot resolve the session data directory; set XDG_DATA_HOME or HOME".into(),
+            )
+        })?;
+    absolute_config_dir(
+        "session data directory",
+        &base.join("local-agent-harness").join("sessions"),
+    )
+}
+
+fn absolute_config_dir(label: &str, path: &Path) -> Result<PathBuf> {
+    if path.as_os_str().is_empty() {
+        return Err(AgentError::Config(format!("{label} must not be empty")));
+    }
+    if !path.is_absolute() {
+        return Err(AgentError::Config(format!(
+            "{label} must be an absolute path: {}",
+            path.display()
+        )));
+    }
+    Ok(path.to_path_buf())
+}
+
+fn load_config_file(trusted_config_dir: &Path) -> Result<Option<ConfigFile>> {
+    let path = trusted_config_dir.join("config.toml");
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => toml::from_str(&raw).map(Some).map_err(|error| {
+            AgentError::Config(format!("{} is invalid TOML: {error}", path.display()))
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(AgentError::Config(format!(
+            "failed to read trusted configuration {}: {error}",
+            path.display()
+        ))),
     }
 }
 
@@ -1349,6 +1702,9 @@ mod tests {
             endpoint: EndpointConfig::default(),
             min_route_conf: 0.85,
             budget: TaskBudget::default(),
+            limits: Limits::default(),
+            trusted_config_dir: PathBuf::from("/tmp/local-agent-harness-config"),
+            session_data_dir: PathBuf::from("/tmp/local-agent-harness-sessions"),
             approval: ApprovalPolicy::default(),
             scripts: ScriptConfig::default(),
         }
@@ -1856,5 +2212,141 @@ mod tests {
         value.startup_timeout = DEFAULT_MCP_STARTUP_TIMEOUT;
         value.stderr_capacity_bytes = MAX_MCP_STDERR_BYTES + 1;
         assert!(value.validate(McpServerKind::Filesystem).is_err());
+    }
+
+    #[test]
+    fn limits_defaults_are_valid_and_reserve_a_prompt_budget() {
+        let limits = Limits::default();
+        limits.validate().expect("default limits are valid");
+        assert_eq!(
+            limits.effective_context_cap_tokens(),
+            limits.context_cap_tokens
+        );
+        assert_eq!(
+            limits.prompt_token_budget_tokens(),
+            limits.context_cap_tokens
+                - limits.reserved_output_tokens
+                - CONTEXT_SAFETY_MARGIN_TOKENS
+        );
+    }
+
+    #[test]
+    fn limits_reject_zero_values_and_insufficient_context_cap() {
+        let mut limits = Limits {
+            context_cap_tokens: 0,
+            ..Limits::default()
+        };
+        assert!(limits.validate().is_err());
+
+        limits = Limits::default();
+        limits.max_search_results = 0;
+        assert!(limits.validate().is_err());
+
+        limits = Limits::default();
+        limits.reserved_output_tokens = limits.context_cap_tokens;
+        assert!(limits.validate().is_err());
+
+        limits = Limits::default();
+        limits.context_cap_tokens = limits.reserved_output_tokens + CONTEXT_SAFETY_MARGIN_TOKENS;
+        assert!(limits.validate().is_err());
+    }
+
+    #[test]
+    fn trusted_and_session_directories_follow_xdg_rules() {
+        let home = Path::new("/home/operator");
+        let xdg = Path::new("/tmp/xdg");
+        assert_eq!(
+            resolve_trusted_config_dir(None, Some(xdg), Some(home)).unwrap(),
+            PathBuf::from("/tmp/xdg/local-agent-harness")
+        );
+        assert_eq!(
+            resolve_trusted_config_dir(None, None, Some(home)).unwrap(),
+            PathBuf::from("/home/operator/.config/local-agent-harness")
+        );
+        assert_eq!(
+            resolve_trusted_config_dir(None, Some(Path::new("relative")), Some(home)).unwrap(),
+            PathBuf::from("/home/operator/.config/local-agent-harness")
+        );
+        assert_eq!(
+            resolve_session_data_dir(Some(Path::new("/tmp/data")), Some(home)).unwrap(),
+            PathBuf::from("/tmp/data/local-agent-harness/sessions")
+        );
+        assert_eq!(
+            resolve_session_data_dir(None, Some(home)).unwrap(),
+            PathBuf::from("/home/operator/.local/share/local-agent-harness/sessions")
+        );
+        assert!(resolve_trusted_config_dir(Some(Path::new("relative")), None, None).is_err());
+    }
+
+    #[test]
+    fn config_file_parses_core_and_limit_fields() {
+        let dir =
+            std::env::temp_dir().join(format!("rupi-config-foundation-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp config dir");
+        std::fs::write(
+            dir.join("config.toml"),
+            r#"
+root = "/tmp/project"
+llm_base = "http://127.0.0.1:8080"
+model = "configured-model"
+max_act_turns = 12
+max_verify_retries = 2
+
+[limits]
+context_cap_tokens = 8192
+reserved_output_tokens = 1024
+file_preview_bytes = 2048
+max_search_results = 25
+max_tool_output_bytes = 4096
+max_session_event_bytes = 32768
+"#,
+        )
+        .expect("write config.toml");
+
+        let file = load_config_file(&dir)
+            .expect("load config file")
+            .expect("config file exists");
+        assert_eq!(file.root.as_deref(), Some(Path::new("/tmp/project")));
+        assert_eq!(file.model.as_deref(), Some("configured-model"));
+        assert_eq!(file.max_act_turns, Some(12));
+        assert_eq!(file.max_verify_retries, Some(2));
+        let limits = file.limits.expect("limits");
+        assert_eq!(limits.context_cap_tokens, 8_192);
+        assert_eq!(limits.max_search_results, 25);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn config_file_rejects_unknown_fields() {
+        let dir =
+            std::env::temp_dir().join(format!("rupi-config-unknown-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp config dir");
+        std::fs::write(dir.join("config.toml"), "unknown_setting = true\n")
+            .expect("write config.toml");
+
+        let error = load_config_file(&dir)
+            .expect_err("unknown fields are rejected")
+            .to_string();
+        assert!(error.contains("config.toml"), "{error}");
+        assert!(error.contains("invalid TOML"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn config_summary_redacts_credential_references() {
+        let mut config = config_with("http://127.0.0.1:8080", "http://127.0.0.1:9090");
+        let credential_reference = "HARNESS_TEST_SUPER_SECRET_REFERENCE";
+        config.endpoint.credential_env = Some(credential_reference.into());
+
+        let summary = config.safe_summary();
+        let rendered = summary.to_string();
+        assert!(rendered.contains("llm_base=http://127.0.0.1:8080"));
+        assert!(rendered.contains("context_cap_tokens="));
+        assert!(!rendered.contains(credential_reference));
+        assert!(
+            !format!("{config:?}").contains(credential_reference),
+            "Config Debug leaked a credential reference"
+        );
     }
 }

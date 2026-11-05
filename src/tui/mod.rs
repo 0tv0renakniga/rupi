@@ -301,6 +301,9 @@ mod tests {
                 endpoint: EndpointConfig::default(),
                 min_route_conf: 0.85,
                 budget: TaskBudget::default(),
+                limits: crate::config::Limits::default(),
+                trusted_config_dir: PathBuf::from("/tmp/local-agent-harness-config"),
+                session_data_dir: PathBuf::from("/tmp/local-agent-harness-sessions"),
                 approval: ApprovalPolicy::default(),
                 scripts: ScriptConfig {
                     root: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts"),

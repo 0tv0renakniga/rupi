@@ -204,6 +204,9 @@ fn config(project: &Path) -> Config {
             max_tool_output_bytes: 512,
             ..TaskBudget::default()
         },
+        limits: local_agent_harness::config::Limits::default(),
+        trusted_config_dir: PathBuf::from("/tmp/local-agent-harness-config"),
+        session_data_dir: PathBuf::from("/tmp/local-agent-harness-sessions"),
         approval: ApprovalPolicy::default(),
         scripts: ScriptConfig {
             root: scripts_dir(),

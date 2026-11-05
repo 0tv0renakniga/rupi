@@ -3,7 +3,7 @@
 
 **Version:** v1
 **Depends on:** None
-**Status:** Not started
+**Status:** Done
 
 ## Objective
 Establish the trusted runtime foundation so the harness can start with a validated local endpoint, conservative context limits, a harness-owned session-data path, and safe startup diagnostics.

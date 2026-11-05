@@ -92,6 +92,9 @@ fn config_with(llm_base: &str, jev_base: &str) -> Config {
         endpoint: local_endpoint(),
         min_route_conf: 0.85,
         budget: TaskBudget::default(),
+        limits: local_agent_harness::config::Limits::default(),
+        trusted_config_dir: PathBuf::from("/tmp/local-agent-harness-config"),
+        session_data_dir: PathBuf::from("/tmp/local-agent-harness-sessions"),
         approval: ApprovalPolicy::default(),
         scripts: ScriptConfig::default(),
     }

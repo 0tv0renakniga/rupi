@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use local_agent_harness::config::{Config, log_safe_endpoint};
+use local_agent_harness::config::Config;
 use local_agent_harness::error::Result;
 use local_agent_harness::runtime;
 use local_agent_harness::tui;
@@ -10,16 +10,11 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> Result<()> {
     init_tracing();
 
-    let config = Config::from_env()?;
+    let config = Config::load()?;
     config.validate()?;
 
-    tracing::info!(
-        root = %config.root.display(),
-        llm_base = %log_safe_endpoint(&config.llm_base),
-        model = %config.model,
-        jev_base = %log_safe_endpoint(&config.jev_base),
-        "configuration validated"
-    );
+    let summary = config.safe_summary();
+    tracing::info!(config = %summary, "configuration validated");
 
     if std::env::args().skip(1).any(|arg| arg == "--headless") {
         return run_headless(config).await;
@@ -29,6 +24,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run_headless(config: Config) -> Result<()> {
+    println!("config: {}", config.safe_summary());
     let preflight = runtime::preflight(&config)?;
     println!(
         "script runtime ok: project_root={} script_root={} interpreter={} audit={}",

@@ -30,6 +30,50 @@ Build and test on the target or prepare an offline/vendored build as described
 in the main README. Keep `Cargo.lock`, reviewed helper scripts, and model files
 pinned.
 
+## Trusted configuration file
+
+Operators may place an optional `config.toml` in the trusted configuration
+directory. The harness does not scan the repository or the current directory for
+this file.
+
+Resolution order for the directory:
+
+1. `HARNESS_CONFIG_DIR` when set to an absolute path.
+2. `$XDG_CONFIG_HOME/local-agent-harness` when `XDG_CONFIG_HOME` is absolute.
+3. `~/.config/local-agent-harness`.
+
+A missing file is valid. Unknown keys are rejected rather than ignored.
+
+```toml
+root = "/srv/harness/workspace"
+llm_base = "http://127.0.0.1:8080"
+model = "local-model"
+max_act_turns = 20
+max_verify_retries = 2
+
+[limits]
+context_cap_tokens = 16384
+reserved_output_tokens = 4096
+file_preview_bytes = 8192
+max_search_results = 100
+max_tool_output_bytes = 4000
+max_session_event_bytes = 65536
+```
+
+Configuration precedence is built-in defaults, then `config.toml`, then
+environment variables. For example, `HARNESS_MODEL` overrides the file's `model`.
+The prompt budget is derived as `context_cap_tokens - reserved_output_tokens -
+512`; the cap must leave a positive budget.
+
+The harness-owned session data directory is resolved as
+`$XDG_DATA_HOME/local-agent-harness/sessions`, falling back to
+`~/.local/share/local-agent-harness/sessions`. TASK-000 only resolves this path;
+it does not create or write session files.
+
+Startup diagnostics use a redacted summary. They show the endpoint profile and a
+credential-free endpoint URL, but never credential values or credential
+reference names.
+
 ## Minimal production-safe configuration
 
 The default execution backend is the fixed script substrate. Investigate and
@@ -64,10 +108,18 @@ export HARNESS_MAX_ACT_TURNS=20
 export HARNESS_MAX_TOOL_CALLS=60
 export HARNESS_MAX_VERIFY_RETRIES=2
 export HARNESS_MAX_WALL_SECS=1800
+export HARNESS_CONTEXT_CAP_TOKENS=16384
+export HARNESS_RESERVED_OUTPUT_TOKENS=4096
+export HARNESS_FILE_PREVIEW_BYTES=8192
+export HARNESS_MAX_SEARCH_RESULTS=100
 export HARNESS_MAX_TOOL_OUTPUT_BYTES=4000
+export HARNESS_MAX_SESSION_EVENT_BYTES=65536
 export HARNESS_APPROVAL_MUTATIONS=true
 export HARNESS_APPROVAL_TIMEOUT_SECS=120
 ```
+
+`HARNESS_MAX_TOOL_OUTPUT_BYTES` configures both the task budget and the
+tool-output limit so they cannot diverge.
 
 `HARNESS_AUDIT_PATH` must name a file, must not be the repository root, and must
 be outside `.ai-wiki/`. Relative paths are resolved under `HARNESS_ROOT` and
@@ -86,10 +138,10 @@ the terminal UI:
 cargo run -- --headless
 ```
 
-Expected output includes the canonical project root, script root, interpreter,
-audit path, each resolved script mapping, and whether Change is available or
-gated. A failure here means no task was accepted. This preflight never starts
-MCP. Then start the TUI:
+Expected output includes the redacted configuration summary, canonical project
+root, script root, interpreter, audit path, each resolved script mapping, and
+whether Change is available or gated. A failure here means no task was accepted.
+This preflight never starts MCP. Then start the TUI:
 
 ```sh
 cargo run

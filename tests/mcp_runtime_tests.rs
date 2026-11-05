@@ -472,6 +472,8 @@ fn headless_startup_checks_scripts_without_mcp_or_model_services() {
         .arg("--headless")
         .env_clear()
         .env("HARNESS_ROOT", &root)
+        .env("XDG_CONFIG_HOME", &root)
+        .env("XDG_DATA_HOME", &root)
         .env("HARNESS_SCRIPT_ROOT", &scripts)
         .env("HARNESS_SCRIPT_INTERPRETER", &python)
         .env("HARNESS_MCP_PROFILE", "not-a-real-profile")
