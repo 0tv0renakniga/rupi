@@ -5,7 +5,8 @@ pub mod worker;
 
 pub use app::{
     AppState, ApprovalPrompt, DetailPane, FocusPane, InputMode, MainTab, ShellFixtures,
-    StreamState, TaskStatus, TranscriptEntry, TranscriptKind, UiCommand, VerificationView,
+    StreamState, TaskStatus, TranscriptEntry, TranscriptFixture, TranscriptFixtureCase,
+    TranscriptKind, UiCommand, VerificationView,
 };
 
 use std::io::Stdout;

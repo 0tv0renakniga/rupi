@@ -283,7 +283,7 @@ fn draw_content(frame: &mut Frame, area: Rect, app: &AppState) {
     let start = total.saturating_sub(height.saturating_add(scroll));
     let end = start.saturating_add(height).min(total);
     let visible = lines[start..end].to_vec();
-    frame.render_widget(Paragraph::new(visible).wrap(Wrap { trim: true }), inner);
+    frame.render_widget(Paragraph::new(visible).wrap(Wrap { trim: false }), inner);
 }
 
 fn content_lines(app: &AppState) -> Vec<Line<'static>> {
@@ -456,22 +456,44 @@ fn draw_help(frame: &mut Frame, area: Rect, app: &AppState) {
 }
 
 fn transcript_lines(app: &AppState) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
     if app.transcript.is_empty() {
-        return vec![Line::from(Span::styled(
+        lines.push(Line::from(Span::styled(
             "No activity yet.",
             Style::default().fg(Color::DarkGray),
-        ))];
+        )));
+    } else {
+        for entry in &app.transcript {
+            append_transcript_entry(&mut lines, entry);
+        }
     }
 
-    app.transcript
-        .iter()
-        .map(|entry| transcript_line(entry))
-        .collect()
+    if app.transcript_truncated {
+        lines.push(Line::from(Span::styled(
+            "--- transcript truncated; earlier entries are omitted ---",
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    if app.stream_truncated {
+        lines.push(Line::from(Span::styled(
+            "--- stream output truncated; display is incomplete ---",
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+
+    lines
 }
 
-fn transcript_line(entry: &TranscriptEntry) -> Line<'static> {
+fn append_transcript_entry(lines: &mut Vec<Line<'static>>, entry: &TranscriptEntry) {
     let style = transcript_style(entry.kind);
-    Line::from(vec![
+    let text = if entry.kind == TranscriptKind::EmptyResponse && entry.text.trim().is_empty() {
+        "visible output = 0; no assistant message was stored"
+    } else {
+        entry.text.as_str()
+    };
+    let mut parts = text.split('\n');
+    let first = parts.next().unwrap_or_default();
+    lines.push(Line::from(vec![
         Span::styled(
             format!("{} ", entry.timestamp),
             Style::default().fg(Color::DarkGray),
@@ -480,8 +502,20 @@ fn transcript_line(entry: &TranscriptEntry) -> Line<'static> {
             format!("{:<9}", entry.kind.label()),
             style.add_modifier(Modifier::BOLD),
         ),
-        Span::styled(entry.text.clone(), style),
-    ])
+        Span::styled(first.to_owned(), style),
+    ]));
+
+    let continuation = " ".repeat(entry.timestamp.len().saturating_add(10));
+    for part in parts {
+        if part.is_empty() {
+            lines.push(Line::from(""));
+        } else {
+            lines.push(Line::from(vec![
+                Span::raw(continuation.clone()),
+                Span::styled(part.to_owned(), style),
+            ]));
+        }
+    }
 }
 
 fn transcript_style(kind: TranscriptKind) -> Style {
@@ -512,6 +546,9 @@ fn transcript_style(kind: TranscriptKind) -> Style {
             .add_modifier(Modifier::BOLD),
         TranscriptKind::Warning => Style::default().fg(Color::Yellow),
         TranscriptKind::Error => Style::default().fg(Color::Red),
+        TranscriptKind::EmptyResponse => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
         TranscriptKind::Approval => Style::default().fg(Color::Magenta),
         TranscriptKind::Completed => Style::default()
             .fg(Color::Green)

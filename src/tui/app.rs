@@ -9,7 +9,7 @@ use crate::wiki::redact::redact;
 pub const MAX_TRANSCRIPT_ENTRIES: usize = 500;
 /// Maximum aggregate bytes retained by the transcript.
 pub const MAX_TRANSCRIPT_BYTES: usize = 64 * 1024;
-/// Maximum bytes for one transcript line or detail summary.
+/// Maximum bytes for one transcript entry or detail summary.
 pub const MAX_DISPLAY_TEXT_BYTES: usize = 2 * 1024;
 /// Maximum bytes accepted for the task-entry buffer.
 pub const MAX_TASK_INPUT_BYTES: usize = 8 * 1024;
@@ -275,6 +275,7 @@ pub enum TranscriptKind {
     Evidence,
     Warning,
     Error,
+    EmptyResponse,
     Approval,
     Completed,
     Blocked,
@@ -301,6 +302,7 @@ impl TranscriptKind {
             Self::Evidence => "EVIDENCE",
             Self::Warning => "WARN",
             Self::Error => "ERROR",
+            Self::EmptyResponse => "EMPTY",
             Self::Approval => "APPROVAL",
             Self::Completed => "DONE",
             Self::Blocked => "BLOCKED",
@@ -327,6 +329,151 @@ pub struct TranscriptEntry {
     pub timestamp: String,
     pub kind: TranscriptKind,
     pub text: String,
+}
+
+/// Named, deterministic transcript scenarios used by renderer fixtures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptFixtureCase {
+    NormalText,
+    MultilineMarkdown,
+    CodeBlock,
+    Unicode,
+    BlankLines,
+    LongUnbrokenLine,
+    StreamingChunks,
+    ErrorStatus,
+    EmptyResponse,
+    TruncationIndicator,
+}
+
+impl TranscriptFixtureCase {
+    pub const ALL: [Self; 10] = [
+        Self::NormalText,
+        Self::MultilineMarkdown,
+        Self::CodeBlock,
+        Self::Unicode,
+        Self::BlankLines,
+        Self::LongUnbrokenLine,
+        Self::StreamingChunks,
+        Self::ErrorStatus,
+        Self::EmptyResponse,
+        Self::TruncationIndicator,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NormalText => "normal text",
+            Self::MultilineMarkdown => "multiline markdown",
+            Self::CodeBlock => "code block",
+            Self::Unicode => "unicode",
+            Self::BlankLines => "blank lines",
+            Self::LongUnbrokenLine => "long unbroken line",
+            Self::StreamingChunks => "streaming chunks",
+            Self::ErrorStatus => "error/status message",
+            Self::EmptyResponse => "empty response",
+            Self::TruncationIndicator => "truncation indicator",
+        }
+    }
+
+    pub fn fixture(self) -> TranscriptFixture {
+        match self {
+            Self::NormalText => TranscriptFixture::new([
+                (TranscriptKind::Info, "status: idle"),
+                (TranscriptKind::Assistant, "Normal assistant text."),
+            ]),
+            Self::MultilineMarkdown => TranscriptFixture::new([(
+                TranscriptKind::Assistant,
+                "## Summary\n\n- first item\n- second item\n\n**Done.**",
+            )]),
+            Self::CodeBlock => TranscriptFixture::new([(
+                TranscriptKind::Assistant,
+                "Patch:\n\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```",
+            )]),
+            Self::Unicode => TranscriptFixture::new([(
+                TranscriptKind::Assistant,
+                "Unicode: café, naïve, 東京, résumé, 🚀",
+            )]),
+            Self::BlankLines => {
+                TranscriptFixture::new([(TranscriptKind::Assistant, "Before.\n\nAfter.")])
+            }
+            Self::LongUnbrokenLine => TranscriptFixture::new(vec![
+                (
+                    TranscriptKind::Assistant,
+                    format!("start-{}-end", "x".repeat(400)),
+                ),
+                (TranscriptKind::Info, "after long line".to_owned()),
+            ]),
+            Self::StreamingChunks => {
+                TranscriptFixture::new([(TranscriptKind::Assistant, "Hello world\nsecond line")])
+                    .with_stream_state(StreamState::Streaming)
+            }
+            Self::ErrorStatus => TranscriptFixture::new([
+                (TranscriptKind::Info, "status: connected"),
+                (
+                    TranscriptKind::Error,
+                    "endpoint unavailable: connection refused",
+                ),
+            ]),
+            Self::EmptyResponse => TranscriptFixture::new([(
+                TranscriptKind::EmptyResponse,
+                "visible output = 0; no assistant message was stored",
+            )]),
+            Self::TruncationIndicator => TranscriptFixture::new([(
+                TranscriptKind::Assistant,
+                "visible text before truncation",
+            )])
+            .with_truncation(true, true),
+        }
+    }
+}
+
+/// Deterministic transcript state used by fixture-driven renderer tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptFixture {
+    pub entries: Vec<TranscriptEntry>,
+    pub transcript_truncated: bool,
+    pub stream_truncated: bool,
+    pub stream_state: StreamState,
+}
+
+impl TranscriptFixture {
+    pub fn new<I, S>(entries: I) -> Self
+    where
+        I: IntoIterator<Item = (TranscriptKind, S)>,
+        S: Into<String>,
+    {
+        let entries = entries
+            .into_iter()
+            .enumerate()
+            .map(|(index, (kind, text))| TranscriptEntry {
+                sequence: index as u64 + 1,
+                timestamp: format!("12:00:{:02}", index % 60),
+                kind,
+                text: bounded_multiline_display_text(&text.into(), MAX_DISPLAY_TEXT_BYTES),
+            })
+            .collect();
+        Self {
+            entries,
+            transcript_truncated: false,
+            stream_truncated: false,
+            stream_state: StreamState::Idle,
+        }
+    }
+
+    pub fn case(case: TranscriptFixtureCase) -> Self {
+        case.fixture()
+    }
+
+    pub fn with_truncation(mut self, transcript: bool, stream: bool) -> Self {
+        self.transcript_truncated = transcript;
+        self.stream_truncated = stream;
+        self
+    }
+
+    pub fn with_stream_state(mut self, stream_state: StreamState) -> Self {
+        self.stream_state = stream_state;
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -439,6 +586,31 @@ impl AppState {
 
     pub fn active_tab_lines(&self) -> &[String] {
         self.fixtures.lines_for(self.active_tab)
+    }
+
+    /// Replace presentation-only transcript state with a deterministic fixture.
+    pub fn load_transcript_fixture(&mut self, fixture: &TranscriptFixture) {
+        self.transcript.clear();
+        self.transcript_bytes = 0;
+        self.next_sequence = 0;
+        for entry in &fixture.entries {
+            self.transcript_bytes = self.transcript_bytes.saturating_add(entry.text.len());
+            self.next_sequence = self.next_sequence.max(entry.sequence);
+            self.transcript.push_back(TranscriptEntry {
+                sequence: entry.sequence,
+                timestamp: entry.timestamp.clone(),
+                kind: entry.kind,
+                text: entry.text.clone(),
+            });
+        }
+        self.transcript_truncated = false;
+        self.enforce_transcript_bounds();
+        self.transcript_truncated |= fixture.transcript_truncated;
+        self.stream_truncated = fixture.stream_truncated;
+        self.stream_state = fixture.stream_state;
+        self.scroll_offset = 0;
+        self.content_scroll = 0;
+        self.active_tab = MainTab::Chat;
     }
 
     pub fn select_tab(&mut self, tab: MainTab) {
@@ -902,7 +1074,7 @@ impl AppState {
     }
 
     fn push_stream_delta(&mut self, text: &str) {
-        let text = bounded_display_text(text, MAX_DISPLAY_TEXT_BYTES);
+        let text = bounded_multiline_display_text(text, MAX_DISPLAY_TEXT_BYTES);
         if text.is_empty() {
             return;
         }
@@ -924,7 +1096,7 @@ impl AppState {
     }
 
     pub(crate) fn push_entry(&mut self, kind: TranscriptKind, text: impl AsRef<str>) {
-        let text = bounded_display_text(text.as_ref(), MAX_DISPLAY_TEXT_BYTES);
+        let text = bounded_multiline_display_text(text.as_ref(), MAX_DISPLAY_TEXT_BYTES);
         if text.is_empty() {
             return;
         }
@@ -987,6 +1159,13 @@ pub fn bounded_display_text(input: &str, cap: usize) -> String {
     let redacted = redact(input).unwrap_or_else(|_| "[redaction unavailable]".to_owned());
     let single_line = redacted.replace("\r\n", " ").replace(['\r', '\n'], " ");
     truncate_utf8(single_line.trim(), cap, "...[truncated]")
+}
+
+/// Redact and normalize a display string while preserving line breaks.
+pub fn bounded_multiline_display_text(input: &str, cap: usize) -> String {
+    let redacted = redact(input).unwrap_or_else(|_| "[redaction unavailable]".to_owned());
+    let normalized = redacted.replace("\r\n", "\n").replace('\r', "\n");
+    truncate_utf8(normalized.trim_end(), cap, "\n...[truncated]")
 }
 
 fn truncate_utf8(text: &str, cap: usize, marker: &str) -> String {

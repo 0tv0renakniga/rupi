@@ -3,7 +3,7 @@
 
 **Version:** v1
 **Depends on:** TASK-001
-**Status:** Not started
+**Status:** Done
 
 ## Objective
 Make transcript formatting reproducible and testable with fixtures so Markdown, Unicode, streaming chunks, errors, and truncation can be debugged without a live model or task loop.
