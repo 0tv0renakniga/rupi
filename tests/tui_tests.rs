@@ -1,6 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use local_agent_harness::approval::{ApprovalAction, ApprovalRequest};
 use local_agent_harness::events::{AgentEvent, ChatTurnTelemetry, Command, EventLevel};
+use local_agent_harness::session::{SessionMessage, SessionRole};
 use local_agent_harness::state_machine::{LoopState, TaskMode};
 use local_agent_harness::tui::app::{MAX_TRANSCRIPT_ENTRIES, StreamState};
 use local_agent_harness::tui::input::{handle_key, handle_paste};
@@ -94,6 +95,74 @@ fn chat_tab_enter_submits_a_reusable_chat_turn() {
     assert_eq!(app.task_status, TaskStatus::Running);
     assert!(app.chat_active);
     assert!(app.task_input.is_empty());
+}
+
+#[test]
+fn chat_session_commands_are_typed_without_a_model_turn() {
+    let mut app = AppState::default();
+    app.task_input = "/new".into();
+    assert_eq!(
+        handle_key(&mut app, key(KeyCode::Enter)),
+        Some(Command::NewSession)
+    );
+    assert!(app.task_input.is_empty());
+    assert!(!app.chat_active);
+    assert_eq!(app.input_mode, InputMode::TaskEntry);
+
+    app.task_input = "/resume abc123".into();
+    assert_eq!(
+        handle_key(&mut app, key(KeyCode::Enter)),
+        Some(Command::ResumeSession {
+            session_id: Some("abc123".into())
+        })
+    );
+    assert!(app.task_input.is_empty());
+
+    app.task_input = "/resume".into();
+    assert_eq!(
+        handle_key(&mut app, key(KeyCode::Enter)),
+        Some(Command::ResumeSession { session_id: None })
+    );
+
+    app.task_input = "/unknown".into();
+    assert_eq!(handle_key(&mut app, key(KeyCode::Enter)), None);
+    assert!(app.task_input.is_empty());
+    assert!(app.transcript.iter().any(|entry| {
+        entry.kind == TranscriptKind::Warning && entry.text.contains("unknown slash command")
+    }));
+}
+
+#[test]
+fn restored_session_replaces_visible_chat_history() {
+    let mut app = AppState::default();
+    app.apply(AgentEvent::TaskStarted {
+        summary: "old task".into(),
+    });
+    app.apply(AgentEvent::SessionLoaded {
+        session_id: "abc123".into(),
+        messages: vec![
+            SessionMessage {
+                role: SessionRole::User,
+                text: "restored question".into(),
+                timestamp: "2026-11-05T12:00:00.000Z".into(),
+            },
+            SessionMessage {
+                role: SessionRole::Assistant,
+                text: "restored answer".into(),
+                timestamp: "2026-11-05T12:00:01.000Z".into(),
+            },
+        ],
+    });
+
+    assert_eq!(app.session, "abc123");
+    assert_eq!(app.task_status, TaskStatus::Idle);
+    assert_eq!(app.input_mode, InputMode::TaskEntry);
+    assert!(!app.chat_active);
+    assert_eq!(app.transcript.len(), 2);
+    assert_eq!(app.transcript[0].kind, TranscriptKind::Operator);
+    assert_eq!(app.transcript[0].text, "restored question");
+    assert_eq!(app.transcript[1].kind, TranscriptKind::Assistant);
+    assert_eq!(app.transcript[1].text, "restored answer");
 }
 
 #[test]

@@ -3,7 +3,7 @@
 
 **Version:** v1
 **Depends on:** TASK-004, TASK-005
-**Status:** Not started
+**Status:** Done
 
 ## Objective
 Persist visible conversation state in a bounded append-only session log so the harness can resume sessions safely after restart without storing hidden reasoning or unsafe payloads.

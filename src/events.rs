@@ -1,4 +1,5 @@
 use crate::approval::ApprovalRequest;
+use crate::session::SessionMessage;
 use crate::state_machine::{LoopState, TaskMode};
 
 /// Severity for user-facing notices. Display code must still bound and redact
@@ -37,6 +38,11 @@ pub enum AgentEvent {
     /// A reusable Chat turn was accepted by the worker.
     ChatTurnStarted {
         prompt: String,
+    },
+    /// The worker opened a session and restored its visible Chat messages.
+    SessionLoaded {
+        session_id: String,
+        messages: Vec<SessionMessage>,
     },
     /// A Chat turn completed without entering a terminal task state.
     ChatTurnFinished {
@@ -182,6 +188,8 @@ pub enum UiEvent {
 pub enum Command {
     Submit { objective: String, mode: TaskMode },
     Chat { prompt: String },
+    NewSession,
+    ResumeSession { session_id: Option<String> },
     ResolveApproval { approval_id: String, approved: bool },
     Cancel,
     Quit,

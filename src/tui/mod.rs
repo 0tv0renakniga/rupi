@@ -37,6 +37,7 @@ use crate::orchestrator::{LocalWikiStore, Orchestrator, OrchestratorLimits, Tool
 use crate::runtime;
 use crate::script_runner::ScriptRunner;
 use crate::script_verification::ScriptVerificationEngine;
+use crate::session::{SessionConfig, SessionStore};
 
 const TICK_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -47,6 +48,7 @@ struct PreparedApp {
     orchestrator: Orchestrator,
     approvals: InteractiveApprovalGate,
     chat: Arc<dyn VisibleChatBackend>,
+    session: SessionStore,
 }
 
 /// Launch the single-task TUI. Configuration must already be validated by the
@@ -57,17 +59,19 @@ pub async fn run(config: Config) -> Result<()> {
         orchestrator,
         approvals,
         chat,
+        session,
     } = prepare(&config).await?;
 
     let (mut terminal, guard) = setup_terminal()?;
     let change_available = app.change_available;
-    let mut worker = worker::spawn_with_chat(
+    let mut worker = worker::spawn_with_chat_and_session(
         orchestrator,
         config.root.clone(),
         config.budget.clone(),
         approvals,
         change_available,
         Some(chat),
+        Some(session),
     );
 
     let result = event_loop(&mut terminal, &mut app, &mut worker).await;
@@ -92,8 +96,20 @@ async fn prepare(config: &Config) -> Result<PreparedApp> {
     app.project = config.root.display().to_string();
     app.context_summary =
         crate::tui::app::context_summary(0, config.limits.effective_context_cap_tokens());
-    app.session = "preview".into();
     app.tool_indicator = "read-only".into();
+
+    crate::config::validate_session_data_dir(&config.root, &config.session_data_dir)?;
+    let session_config = SessionConfig::new(
+        config.session_data_dir.clone(),
+        config.model.clone(),
+        config.limits.max_session_event_bytes,
+    );
+    let session = SessionStore::open_latest_or_new(&session_config)?;
+    app.session = session.id().to_owned();
+    app.apply(AgentEvent::SessionLoaded {
+        session_id: session.id().to_owned(),
+        messages: session.messages().to_vec(),
+    });
 
     let runtime = runtime::build(config)?;
     app.change_available = runtime.capabilities.change_ready();
@@ -124,6 +140,7 @@ async fn prepare(config: &Config) -> Result<PreparedApp> {
         orchestrator,
         approvals,
         chat,
+        session,
     })
 }
 
@@ -324,7 +341,7 @@ mod tests {
                 budget: TaskBudget::default(),
                 limits: crate::config::Limits::default(),
                 trusted_config_dir: PathBuf::from("/tmp/local-agent-harness-config"),
-                session_data_dir: PathBuf::from("/tmp/local-agent-harness-sessions"),
+                session_data_dir: base.join("sessions"),
                 approval: ApprovalPolicy::default(),
                 scripts: ScriptConfig {
                     root: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts"),
@@ -381,6 +398,23 @@ mod tests {
             .join("\n");
         assert!(!warnings.contains("run_verifier.py"), "{warnings}");
         assert!(!warnings.contains("write_file.py"), "{warnings}");
+    }
+
+    #[tokio::test]
+    async fn session_data_inside_the_repository_fails_before_terminal_setup() {
+        let mut fixture = Fixture::new("session-inside-root");
+        fixture.config.session_data_dir = fixture.project.join("sessions");
+
+        let error = prepare(&fixture.config)
+            .await
+            .err()
+            .expect("session data inside the repository must fail startup");
+        assert!(
+            error
+                .to_string()
+                .contains("session data directory must be outside the repository root"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

@@ -15,6 +15,7 @@ use crate::llm::{
     estimate_text_tokens,
 };
 use crate::orchestrator::{EventSink, Orchestrator, TaskRequest};
+use crate::session::{SessionMessage, SessionRole, SessionStore};
 use crate::state_machine::{TaskBudget, TaskMode};
 
 /// Bounded command queue. The UI uses `try_send` so a stalled worker can never
@@ -96,6 +97,31 @@ pub fn spawn_with_chat(
     change_available: bool,
     chat: Option<Arc<dyn VisibleChatBackend>>,
 ) -> Worker {
+    spawn_with_chat_and_session(
+        orchestrator,
+        repo_root,
+        budget,
+        approvals,
+        change_available,
+        chat,
+        None,
+    )
+}
+
+/// Start the worker with an optional visible Chat backend and session log.
+///
+/// The caller normally opens the session before terminal setup so recovery
+/// failures remain printable on a normal terminal. Session commands such as
+/// `/new` and `/resume` replace the active log at runtime.
+pub fn spawn_with_chat_and_session(
+    orchestrator: Orchestrator,
+    repo_root: PathBuf,
+    budget: TaskBudget,
+    approvals: InteractiveApprovalGate,
+    change_available: bool,
+    chat: Option<Arc<dyn VisibleChatBackend>>,
+    session: Option<SessionStore>,
+) -> Worker {
     let (commands, command_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (event_tx, events) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let cancel = CancellationToken::new();
@@ -107,6 +133,8 @@ pub fn spawn_with_chat(
         repo_root,
         budget,
         change_available,
+        chat,
+        session,
     };
     let join = tokio::spawn(async move {
         run_worker(
@@ -114,7 +142,6 @@ pub fn spawn_with_chat(
             settings,
             sink,
             approvals,
-            chat,
             command_rx,
             worker_cancel,
         )
@@ -133,6 +160,8 @@ struct WorkerSettings {
     repo_root: PathBuf,
     budget: TaskBudget,
     change_available: bool,
+    chat: Option<Arc<dyn VisibleChatBackend>>,
+    session: Option<SessionStore>,
 }
 
 async fn run_worker(
@@ -140,11 +169,20 @@ async fn run_worker(
     settings: WorkerSettings,
     sink: TuiEventSink,
     approvals: InteractiveApprovalGate,
-    chat: Option<Arc<dyn VisibleChatBackend>>,
     mut commands: mpsc::Receiver<Command>,
     cancel: CancellationToken,
 ) {
-    let mut chat_history = vec![ChatMessage::system(CHAT_SYSTEM_PROMPT)];
+    let WorkerSettings {
+        repo_root,
+        budget,
+        change_available,
+        chat,
+        mut session,
+    } = settings;
+    let mut chat_history = match session.as_ref() {
+        Some(store) => chat_history_from_session(store.messages()),
+        None => vec![ChatMessage::system(CHAT_SYSTEM_PROMPT)],
+    };
 
     loop {
         let command = match commands.recv().await {
@@ -160,7 +198,7 @@ async fn run_worker(
                 if cancel.is_cancelled() {
                     break;
                 }
-                if mode == TaskMode::Change && !settings.change_available {
+                if mode == TaskMode::Change && !change_available {
                     let _ = sink
                         .send_critical(AgentEvent::Failed {
                             reason: "Change mode is gated until the reviewed verifier script is installed"
@@ -181,9 +219,9 @@ async fn run_worker(
                     break;
                 }
 
-                let request = TaskRequest::new(objective, settings.repo_root.clone())
+                let request = TaskRequest::new(objective, repo_root.clone())
                     .with_mode(mode)
-                    .with_budget(settings.budget.clone());
+                    .with_budget(budget.clone());
                 let run = orchestrator.run(request, task_cancel.clone());
                 tokio::pin!(run);
 
@@ -216,6 +254,13 @@ async fn run_worker(
                                 sink.notice(
                                     EventLevel::Warning,
                                     "a task is already running; finish or cancel it before chatting",
+                                );
+                            }
+                            Some(Command::NewSession)
+                            | Some(Command::ResumeSession { .. }) => {
+                                sink.notice(
+                                    EventLevel::Warning,
+                                    "a task is already running; finish or cancel it before changing sessions",
                                 );
                             }
                             None => {
@@ -253,10 +298,11 @@ async fn run_worker(
                         .await;
                     continue;
                 };
-                if !run_chat_turn(
+                if !run_chat_turn_persisted(
                     backend,
                     &sink,
                     &mut chat_history,
+                    session.as_mut(),
                     prompt,
                     &mut commands,
                     &cancel,
@@ -264,6 +310,81 @@ async fn run_worker(
                 .await
                 {
                     break;
+                }
+            }
+            Command::NewSession => {
+                let Some(current) = session.as_ref() else {
+                    sink.notice(EventLevel::Warning, "session persistence is not configured");
+                    continue;
+                };
+                let config = current.config().clone();
+                match SessionStore::create_new(&config) {
+                    Ok(mut new_session) => {
+                        if let Err(error) = new_session.append_command("new") {
+                            sink.notice(
+                                EventLevel::Error,
+                                format!("session command write failed: {error}"),
+                            );
+                        }
+                        chat_history = chat_history_from_session(new_session.messages());
+                        let session_id = new_session.id().to_owned();
+                        let messages = new_session.messages().to_vec();
+                        session = Some(new_session);
+                        if !sink
+                            .send_critical(AgentEvent::SessionLoaded {
+                                session_id,
+                                messages,
+                            })
+                            .await
+                        {
+                            cancel.cancel();
+                            break;
+                        }
+                    }
+                    Err(error) => sink.notice(
+                        EventLevel::Error,
+                        format!("could not create a new session: {error}"),
+                    ),
+                }
+            }
+            Command::ResumeSession { session_id } => {
+                let Some(current) = session.as_ref() else {
+                    sink.notice(EventLevel::Warning, "session persistence is not configured");
+                    continue;
+                };
+                let config = current.config().clone();
+                let loaded = match session_id.as_deref() {
+                    Some(id) => SessionStore::resume(&config, id).map(Some),
+                    None => SessionStore::open_latest(&config),
+                };
+                match loaded {
+                    Ok(Some(mut restored)) => {
+                        if let Err(error) = restored.append_command("resume") {
+                            sink.notice(
+                                EventLevel::Error,
+                                format!("session command write failed: {error}"),
+                            );
+                        }
+                        chat_history = chat_history_from_session(restored.messages());
+                        let session_id = restored.id().to_owned();
+                        let messages = restored.messages().to_vec();
+                        session = Some(restored);
+                        if !sink
+                            .send_critical(AgentEvent::SessionLoaded {
+                                session_id,
+                                messages,
+                            })
+                            .await
+                        {
+                            cancel.cancel();
+                            break;
+                        }
+                    }
+                    Ok(None) => sink.notice(EventLevel::Warning, "no saved session to resume"),
+                    Err(error) => sink.notice(
+                        EventLevel::Error,
+                        format!("could not resume session: {error}"),
+                    ),
                 }
             }
             Command::Cancel => {
@@ -283,10 +404,23 @@ async fn run_worker(
     }
 }
 
+#[cfg(test)]
 async fn run_chat_turn(
     backend: Arc<dyn VisibleChatBackend>,
     sink: &TuiEventSink,
     history: &mut Vec<ChatMessage>,
+    prompt: String,
+    commands: &mut mpsc::Receiver<Command>,
+    cancel: &CancellationToken,
+) -> bool {
+    run_chat_turn_persisted(backend, sink, history, None, prompt, commands, cancel).await
+}
+
+async fn run_chat_turn_persisted(
+    backend: Arc<dyn VisibleChatBackend>,
+    sink: &TuiEventSink,
+    history: &mut Vec<ChatMessage>,
+    mut session: Option<&mut SessionStore>,
     prompt: String,
     commands: &mut mpsc::Receiver<Command>,
     cancel: &CancellationToken,
@@ -299,6 +433,12 @@ async fn run_chat_turn(
     {
         cancel.cancel();
         return false;
+    }
+
+    if let Some(store) = session.as_mut()
+        && let Err(error) = store.append_user_message(&prompt)
+    {
+        sink.notice(EventLevel::Error, format!("session write failed: {error}"));
     }
 
     let mut messages = history.clone();
@@ -317,6 +457,7 @@ async fn run_chat_turn(
                     None,
                     true,
                 );
+                persist_session_telemetry(&mut session, sink, &telemetry);
                 let _ = sink
                     .send_critical(AgentEvent::ChatTelemetry { telemetry })
                     .await;
@@ -358,6 +499,7 @@ async fn run_chat_turn(
                         None,
                         false,
                     );
+                    persist_session_telemetry(&mut session, sink, &telemetry);
                     let _ = sink
                         .send_critical(AgentEvent::ChatTelemetry { telemetry })
                         .await;
@@ -380,6 +522,12 @@ async fn run_chat_turn(
                 }
                 Some(Command::ResolveApproval { .. }) => {
                     sink.notice(EventLevel::Warning, "no approval gate is active");
+                }
+                Some(Command::NewSession) | Some(Command::ResumeSession { .. }) => {
+                    sink.notice(
+                        EventLevel::Warning,
+                        "a chat turn is already running; cancel it before changing sessions",
+                    );
                 }
                 None => {
                     cancel.cancel();
@@ -417,8 +565,14 @@ async fn run_chat_turn(
 
     match result {
         Ok(outcome) => {
-            if !outcome.empty_visible_response && !assistant.trim().is_empty() {
+            let completed = !outcome.empty_visible_response && !assistant.trim().is_empty();
+            if completed {
                 append_chat_history(history, prompt, assistant.clone());
+                if let Some(store) = session.as_mut()
+                    && let Err(error) = store.append_assistant_message(&assistant)
+                {
+                    sink.notice(EventLevel::Error, format!("session write failed: {error}"));
+                }
             }
             let telemetry = build_chat_telemetry(
                 context_plan,
@@ -429,6 +583,7 @@ async fn run_chat_turn(
                 None,
                 false,
             );
+            persist_session_telemetry(&mut session, sink, &telemetry);
             let _ = sink
                 .send_critical(AgentEvent::ChatTelemetry { telemetry })
                 .await;
@@ -449,6 +604,7 @@ async fn run_chat_turn(
                 transport_error_category(&error),
                 false,
             );
+            persist_session_telemetry(&mut session, sink, &telemetry);
             let _ = sink
                 .send_critical(AgentEvent::ChatTelemetry { telemetry })
                 .await;
@@ -575,10 +731,40 @@ async fn handle_visible_event(
     }
 }
 
+fn persist_session_telemetry(
+    session: &mut Option<&mut SessionStore>,
+    sink: &TuiEventSink,
+    telemetry: &ChatTurnTelemetry,
+) {
+    if let Some(store) = session.as_mut()
+        && let Err(error) = store.append_telemetry(telemetry)
+    {
+        sink.notice(
+            EventLevel::Error,
+            format!("session telemetry write failed: {error}"),
+        );
+    }
+}
+
+fn chat_history_from_session(messages: &[SessionMessage]) -> Vec<ChatMessage> {
+    let mut history = vec![ChatMessage::system(CHAT_SYSTEM_PROMPT)];
+    for message in messages {
+        history.push(match message.role {
+            SessionRole::User => ChatMessage::user(message.text.clone()),
+            SessionRole::Assistant => ChatMessage::assistant(message.text.clone()),
+        });
+    }
+    trim_chat_history(&mut history);
+    history
+}
+
 fn append_chat_history(history: &mut Vec<ChatMessage>, prompt: String, assistant: String) {
     history.push(ChatMessage::user(prompt));
     history.push(ChatMessage::assistant(assistant));
+    trim_chat_history(history);
+}
 
+fn trim_chat_history(history: &mut Vec<ChatMessage>) {
     while history.len() > 1 && chat_history_bytes(history) > MAX_CHAT_HISTORY_BYTES {
         remove_oldest_chat_pair(history);
     }
@@ -689,6 +875,7 @@ mod tests {
     use super::*;
     use crate::error::AgentError;
     use crate::llm::VisibleChatOutcome;
+    use crate::session::SessionConfig;
 
     struct FakeChatBackend {
         events: Vec<VisibleChatEvent>,
@@ -904,6 +1091,122 @@ mod tests {
         assert_eq!(history.len(), 3);
         assert_eq!(history[1].content.as_deref(), Some("hi"));
         assert_eq!(history[2].content.as_deref(), Some("Hello"));
+    }
+
+    #[tokio::test]
+    async fn completed_chat_turn_is_persisted_for_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "rupi-worker-session-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let config = SessionConfig::new(dir.clone(), "local-model", 65_536);
+        let mut session = SessionStore::create_new(&config).unwrap();
+        let session_id = session.id().to_owned();
+        let (tx, mut rx) = mpsc::channel(32);
+        let (command_tx, mut command_rx) = mpsc::channel(4);
+        let sink = TuiEventSink::new(tx);
+        let backend = Arc::new(FakeChatBackend::new(
+            vec![
+                VisibleChatEvent::TextDelta("Hello".into()),
+                VisibleChatEvent::Finish {
+                    reason: "stop".into(),
+                    empty_visible_response: false,
+                },
+            ],
+            outcome(false),
+        ));
+        let mut history = vec![ChatMessage::system("system")];
+
+        let keep_running = run_chat_turn_persisted(
+            backend,
+            &sink,
+            &mut history,
+            Some(&mut session),
+            "hi".into(),
+            &mut command_rx,
+            &CancellationToken::new(),
+        )
+        .await;
+        drop(command_tx);
+
+        assert!(keep_running);
+        let events = drain_events(&mut rx);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ChatTurnFinished {
+                empty_visible_response: false,
+                ..
+            }
+        )));
+
+        let restored = SessionStore::resume(&config, &session_id).unwrap();
+        assert_eq!(restored.messages().len(), 2);
+        assert_eq!(restored.messages()[0].role, SessionRole::User);
+        assert_eq!(restored.messages()[0].text, "hi");
+        assert_eq!(restored.messages()[1].role, SessionRole::Assistant);
+        assert_eq!(restored.messages()[1].text, "Hello");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn cancelled_stream_persists_no_assistant_completion() {
+        let dir = std::env::temp_dir().join(format!(
+            "rupi-worker-session-cancel-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let config = SessionConfig::new(dir.clone(), "local-model", 65_536);
+        let mut session = SessionStore::create_new(&config).unwrap();
+        let session_id = session.id().to_owned();
+        let (tx, mut rx) = mpsc::channel(32);
+        let (command_tx, mut command_rx) = mpsc::channel(4);
+        let sink = TuiEventSink::new(tx);
+        let backend = Arc::new(FakeChatBackend {
+            events: Vec::new(),
+            outcome: None,
+            error: None,
+            pending: true,
+            admission: None,
+            calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        let mut history = vec![ChatMessage::system("system")];
+        let cancel = CancellationToken::new();
+        let turn = run_chat_turn_persisted(
+            backend,
+            &sink,
+            &mut history,
+            Some(&mut session),
+            "stream this".into(),
+            &mut command_rx,
+            &cancel,
+        );
+        tokio::pin!(turn);
+
+        tokio::select! {
+            result = &mut turn => panic!("turn should wait for cancellation: {result}"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        command_tx.send(Command::Cancel).await.unwrap();
+        assert!(turn.await);
+        drop(command_tx);
+
+        let events = drain_events(&mut rx);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ChatTurnCancelled { .. }))
+        );
+        let restored = SessionStore::resume(&config, &session_id).unwrap();
+        assert_eq!(restored.messages().len(), 1);
+        assert_eq!(restored.messages()[0].role, SessionRole::User);
+        assert!(
+            restored
+                .messages()
+                .iter()
+                .all(|message| message.role != SessionRole::Assistant)
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

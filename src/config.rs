@@ -1419,6 +1419,41 @@ fn resolve_audit_path(root: &Path, configured: Option<PathBuf>) -> Result<PathBu
     Ok(path)
 }
 
+pub(crate) fn validate_session_data_dir(root: &Path, path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty() {
+        return Err(AgentError::Config(
+            "session data directory must not be empty".into(),
+        ));
+    }
+    let root = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(root)
+    };
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let normalized_root = normalize_lexically(&root);
+    let normalized_path = normalize_lexically(&path);
+    if normalized_path == normalized_root || normalized_path.starts_with(&normalized_root) {
+        return Err(AgentError::Config(
+            "session data directory must be outside the repository root".into(),
+        ));
+    }
+    if path.exists() {
+        let canonical_root = root.canonicalize().unwrap_or(normalized_root);
+        let canonical_path = path.canonicalize()?;
+        if canonical_path == canonical_root || canonical_path.starts_with(&canonical_root) {
+            return Err(AgentError::Config(
+                "session data directory must be outside the repository root".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_audit_path(root: &Path, path: &Path) -> Result<()> {
     let root = if root.is_absolute() {
         root.to_path_buf()
@@ -1931,6 +1966,22 @@ mod tests {
         assert!(resolve_audit_path(root, Some(PathBuf::from(".harness-audit"))).is_err());
         assert!(resolve_audit_path(root, Some(PathBuf::new())).is_err());
         assert!(resolve_audit_path(root, Some(PathBuf::from("."))).is_err());
+    }
+
+    #[test]
+    fn session_data_dir_must_stay_outside_the_repository() {
+        let root = Path::new("/srv/repo");
+        assert!(
+            validate_session_data_dir(root, Path::new("/srv/repo/sessions")).is_err(),
+            "session data inside the repository must be rejected"
+        );
+        assert!(validate_session_data_dir(root, root).is_err());
+        assert!(validate_session_data_dir(root, Path::new("sessions")).is_err());
+        assert!(validate_session_data_dir(root, Path::new("/var/lib/harness/sessions")).is_ok());
+        assert!(
+            validate_session_data_dir(root, Path::new("/srv/repository/sessions")).is_ok(),
+            "path-component prefixes outside the root are allowed"
+        );
     }
 
     #[cfg(unix)]

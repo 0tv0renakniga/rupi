@@ -30,6 +30,9 @@ pub enum AgentError {
     #[error("Wiki error: {0}")]
     Wiki(String),
 
+    #[error("session error: {0}")]
+    Session(String),
+
     #[error("policy denied action: {0}")]
     PolicyDenied(String),
 

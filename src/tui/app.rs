@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crate::events::{AgentEvent, ChatTurnTelemetry, EventLevel};
+use crate::session::{SessionMessage, SessionRole};
 use crate::state_machine::{LoopState, TaskMode};
 use crate::wiki::redact::redact;
 
@@ -256,9 +257,9 @@ impl Default for ShellFixtures {
             ],
             session: vec![
                 "Session metadata (fixture)".into(),
-                "Session: preview".into(),
-                "Persistence: not enabled".into(),
-                "Resume: unavailable".into(),
+                "Persistence: enabled (append-only JSONL)".into(),
+                "New session: /new".into(),
+                "Resume: /resume <session-id>".into(),
             ],
             explorer: vec![
                 "Read-only placeholder".into(),
@@ -787,6 +788,10 @@ impl AppState {
         }
 
         match event {
+            AgentEvent::SessionLoaded {
+                session_id,
+                messages,
+            } => self.restore_session(session_id, messages),
             AgentEvent::TaskStarted { summary } => {
                 self.reset_for_task();
                 self.task_status = TaskStatus::Running;
@@ -1111,6 +1116,47 @@ impl AppState {
                     TranscriptKind::Failed,
                 );
             }
+        }
+    }
+
+    fn restore_session(&mut self, session_id: String, messages: Vec<SessionMessage>) {
+        self.session = bounded_display_text(&session_id, 64);
+        self.transcript.clear();
+        self.transcript_bytes = 0;
+        self.transcript_truncated = false;
+        self.next_sequence = 0;
+        self.task_input.clear();
+        self.chat_active = false;
+        self.chat_visible_received = false;
+        self.task_status = TaskStatus::Idle;
+        self.input_mode = InputMode::TaskEntry;
+        self.phase = LoopState::Boot;
+        self.approval = None;
+        self.verification = None;
+        self.stream_state = StreamState::Idle;
+        self.stream_truncated = false;
+        self.scroll_offset = 0;
+        self.content_scroll = 0;
+        self.task_started_at = None;
+        self.cancel_requested_at = None;
+        self.cancel_grace_elapsed = false;
+        self.elapsed = Duration::ZERO;
+        self.completion_summary = None;
+        self.last_error = None;
+        self.last_chat_telemetry = None;
+        self.detail = format!(
+            "Session {} restored ({} visible message(s)).",
+            self.session,
+            messages.len()
+        );
+
+        for message in messages {
+            let kind = match message.role {
+                SessionRole::User => TranscriptKind::Operator,
+                SessionRole::Assistant => TranscriptKind::Assistant,
+            };
+            let text = bounded_multiline_display_text(&message.text, MAX_DISPLAY_TEXT_BYTES);
+            self.push_entry_raw(kind, text);
         }
     }
 

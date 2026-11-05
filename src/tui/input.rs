@@ -200,7 +200,11 @@ fn handle_quit(app: &mut AppState) -> Option<Command> {
 
 fn handle_task_entry(app: &mut AppState, key: KeyEvent, ctrl: bool, alt: bool) -> Option<Command> {
     match key.code {
-        KeyCode::Enter if app.active_tab == MainTab::Chat => submit_chat(app),
+        KeyCode::Enter
+            if app.active_tab == MainTab::Chat || app.task_input.trim_start().starts_with('/') =>
+        {
+            submit_chat(app)
+        }
         KeyCode::Enter => submit_task(app),
         KeyCode::F(2) => {
             app.selected_mode = match app.selected_mode {
@@ -310,6 +314,9 @@ fn submit_chat(app: &mut AppState) -> Option<Command> {
     if prompt.is_empty() {
         return None;
     }
+    if prompt.starts_with('/') {
+        return handle_session_command(app, &prompt);
+    }
 
     app.task_input.clear();
     app.chat_active = true;
@@ -326,6 +333,43 @@ fn submit_chat(app: &mut AppState) -> Option<Command> {
     app.scroll_offset = 0;
     app.detail = "Submitting chat prompt...".into();
     Some(Command::Chat { prompt })
+}
+
+fn handle_session_command(app: &mut AppState, prompt: &str) -> Option<Command> {
+    let mut parts = prompt.split_whitespace();
+    let command = parts.next()?;
+    match command {
+        "/new" => {
+            if parts.next().is_some() {
+                app.push_notice(TranscriptKind::Warning, "usage: /new");
+                return None;
+            }
+            app.task_input.clear();
+            app.detail = "Opening a new session...".into();
+            Some(Command::NewSession)
+        }
+        "/resume" => {
+            let session_id = parts.next().map(str::to_owned);
+            if parts.next().is_some() {
+                app.push_notice(TranscriptKind::Warning, "usage: /resume <session-id>");
+                return None;
+            }
+            app.task_input.clear();
+            app.detail = match &session_id {
+                Some(id) => format!("Restoring session {id}..."),
+                None => "Restoring the latest session...".into(),
+            };
+            Some(Command::ResumeSession { session_id })
+        }
+        other => {
+            app.task_input.clear();
+            app.push_notice(
+                TranscriptKind::Warning,
+                &format!("unknown slash command: {other}"),
+            );
+            None
+        }
+    }
 }
 
 fn resolve_approval(app: &mut AppState, approved: bool) -> Option<Command> {
