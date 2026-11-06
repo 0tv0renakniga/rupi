@@ -117,8 +117,10 @@ fn denies_sensitive_harness_private_and_credential_paths() {
         ".aws/credentials",
         ".gcp/credentials.json",
         "config/credentials.yaml",
+        "credentials-prod.json",
         "secrets.yaml",
         "secrets/prod.txt",
+        "archive/secrets_backup.txt",
         "nested/.env/config",
         "certs/server.pem",
         "keys/signing.key",
@@ -145,7 +147,7 @@ fn uses_component_matching_not_substring_matching() {
         "src/environment.rs",
         "docs/secret-management.md",
         "tests/keyboard.rs",
-        "src/credentials_policy.rs",
+        "src/credential_policy.rs",
         "src/wiki/compile.rs",
     ] {
         assert!(policy.authorize_path(path).is_ok(), "{path}");
@@ -408,4 +410,74 @@ fn pre_dispatch_policy_rejects_sensitive_paths_with_stable_codes() {
         violation,
         local_agent_harness::policy::PolicyViolation::Path(PathPolicyError::SensitivePath(_))
     ));
+}
+
+#[test]
+fn denies_configured_harness_owned_paths() {
+    let root = TempRoot::new("protected");
+    let audit = root.path.join("private/audit.jsonl");
+    let session = root.path.join("private/sessions");
+    let trusted_config = root.path.join("private/trusted/config.toml");
+    std::fs::create_dir_all(&session).expect("session directory");
+    std::fs::create_dir_all(trusted_config.parent().expect("trusted parent"))
+        .expect("trusted parent");
+    std::fs::write(&audit, "audit\n").expect("audit file");
+    std::fs::write(&trusted_config, "config\n").expect("trusted config");
+
+    let policy = PathPolicy::with_protected_paths(
+        &root.path,
+        [audit.clone(), session.clone(), trusted_config.clone()],
+    )
+    .expect("policy");
+
+    for path in [
+        "private/audit.jsonl",
+        "private/sessions/task.json",
+        "private/trusted/config.toml",
+    ] {
+        assert_eq!(
+            code(policy.authorize_path(path).expect_err("protected path")),
+            "PATH_SENSITIVE",
+            "{path}"
+        );
+    }
+    assert!(
+        policy.authorize_path("private/audit-notes.txt").is_ok(),
+        "sibling paths must remain available"
+    );
+
+    let wrapped = Policy::with_protected_paths(&root.path, [audit]).expect("policy wrapper");
+    let violation = wrapped
+        .authorize(&AgentTool::ReadFile {
+            path: "private/audit.jsonl".into(),
+            line_start: None,
+            line_end: None,
+        })
+        .expect_err("protected read");
+    assert_eq!(
+        violation.to_string(),
+        "[PATH_SENSITIVE] sensitive path is denied: private/audit.jsonl"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn configured_protected_paths_cannot_be_reached_through_aliases() {
+    use std::os::unix::fs::symlink;
+
+    let root = TempRoot::new("protected-alias");
+    let audit = root.path.join("private/audit.jsonl");
+    std::fs::create_dir_all(audit.parent().expect("audit parent")).expect("audit parent");
+    std::fs::write(&audit, "audit\n").expect("audit file");
+    symlink(&audit, root.path.join("audit-link")).expect("audit symlink");
+
+    let policy = PathPolicy::with_protected_paths(&root.path, [audit]).expect("policy");
+    assert_eq!(
+        code(
+            policy
+                .authorize_existing_path("audit-link")
+                .expect_err("aliased protected path")
+        ),
+        "PATH_SENSITIVE"
+    );
 }

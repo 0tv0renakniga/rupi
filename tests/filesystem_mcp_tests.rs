@@ -158,7 +158,7 @@ fn binary_speaks_the_mcp_contract_and_is_read_only() {
         traversal["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("traversal")
+            .contains("PATH_TRAVERSAL")
     );
 
     let write = server.request(json!({
@@ -207,7 +207,7 @@ fn binary_rejects_symlink_escape() {
         response["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("escapes the repository root")
+            .contains("PATH_SYMLINK_ESCAPE")
     );
     server.finish();
 }
@@ -238,7 +238,7 @@ fn binary_rejects_parent_directory_symlink_escape() {
         response["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("escapes the repository root")
+            .contains("PATH_SYMLINK_ESCAPE")
     );
     server.finish();
 }

@@ -7,9 +7,11 @@
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
+
+use crate::path_policy::PathPolicy;
 
 /// MCP revision implemented by this server.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -30,20 +32,17 @@ const INVALID_PARAMS: i64 = -32602;
 #[derive(Debug, Clone)]
 pub struct ReadOnlyFilesystem {
     root: PathBuf,
+    policy: PathPolicy,
 }
 
 impl ReadOnlyFilesystem {
     /// Canonicalize and validate the fixed root. The root is supplied by
     /// configuration, never by a model request.
     pub fn new(root: impl AsRef<Path>) -> io::Result<Self> {
-        let root = root.as_ref().canonicalize()?;
-        if !root.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "filesystem MCP root must be a directory",
-            ));
-        }
-        Ok(Self { root })
+        let policy = PathPolicy::new(root)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        let root = policy.root().to_path_buf();
+        Ok(Self { root, policy })
     }
 
     pub fn root(&self) -> &Path {
@@ -114,41 +113,19 @@ impl ReadOnlyFilesystem {
     }
 
     fn resolve_existing_file(&self, raw: &str) -> Result<PathBuf, String> {
-        if raw.is_empty() {
-            return Err("path must not be empty".into());
-        }
-        if raw.contains('\0') {
-            return Err("path must not contain NUL bytes".into());
-        }
-
-        let path = Path::new(raw);
-        if path.is_absolute() {
-            return Err("absolute paths are not allowed".into());
-        }
-
-        let mut relative = PathBuf::new();
-        for component in path.components() {
-            match component {
-                Component::Normal(part) => relative.push(part),
-                Component::CurDir => {}
-                Component::ParentDir => {
-                    return Err("path traversal (`..`) is not allowed".into());
-                }
-                Component::RootDir | Component::Prefix(_) => {
-                    return Err("absolute paths are not allowed".into());
-                }
-            }
-        }
-        if relative.as_os_str().is_empty() {
-            return Err("path must name a file".into());
-        }
+        let relative = self
+            .policy
+            .authorize_existing_path(raw)
+            .map_err(|error| error.to_string())?;
 
         let candidate = self.root.join(relative);
         let canonical = candidate
             .canonicalize()
             .map_err(|error| format!("cannot resolve path: {error}"))?;
         if !canonical.starts_with(&self.root) {
-            return Err("path escapes the repository root".into());
+            return Err(
+                "[PATH_SYMLINK_ESCAPE] symlink path is not contained by the project root".into(),
+            );
         }
         if !canonical.is_file() {
             return Err("path is not a regular file".into());
@@ -525,6 +502,21 @@ mod tests {
     }
 
     #[test]
+    fn rejects_sensitive_paths_through_the_shared_policy() {
+        let root = TempRoot::new("sensitive");
+        root.write(".env", "SECRET=1\n");
+        root.write(".harness-audit/audit.jsonl", "{}\n");
+        let server = server(&root);
+
+        for path in [".env", ".harness-audit/audit.jsonl"] {
+            let error = server
+                .read_file(&json!({"path": path}))
+                .expect_err("sensitive path must fail");
+            assert!(error.contains("PATH_SENSITIVE"), "{path}: {error}");
+        }
+    }
+
+    #[test]
     fn rejects_unsafe_paths() {
         let root = TempRoot::new("unsafe");
         root.write("ok.txt", "ok\n");
@@ -562,7 +554,7 @@ mod tests {
         let error = server
             .read_file(&json!({"path": "escape.txt"}))
             .expect_err("escaping symlink must fail");
-        assert!(error.contains("escapes the repository root"), "{error}");
+        assert!(error.contains("PATH_SYMLINK_ESCAPE"), "{error}");
 
         let text = server
             .read_file(&json!({"path": "inside-link.txt"}))

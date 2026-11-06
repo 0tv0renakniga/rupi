@@ -72,9 +72,15 @@ pub struct ScriptPreflight {
 /// supported workflow. A missing verifier script leaves Change gated rather
 /// than selecting another backend.
 pub fn build(config: &Config) -> Result<ScriptRuntime> {
-    let policy = Policy::new(config.root.clone()).map_err(|error| {
-        AgentError::Config(format!("repository path policy is invalid: {error}"))
-    })?;
+    let policy = Policy::with_protected_paths(
+        config.root.clone(),
+        [
+            config.audit_path.clone(),
+            config.session_data_dir.clone(),
+            config.trusted_config_dir.clone(),
+        ],
+    )
+    .map_err(|error| AgentError::Config(format!("repository path policy is invalid: {error}")))?;
     let audit = Arc::new(AuditLog::new(config.audit_path.clone()));
     audit.prepare()?;
     let runner = ScriptRunner::new_with_timeout(

@@ -164,8 +164,8 @@ class PathPolicy:
                 name in self.sensitive_directories
                 or name in self.sensitive_names
                 or name.startswith(".env.")
-                or name.startswith("credentials.")
-                or name.startswith("secrets.")
+                or name.startswith("credentials")
+                or name.startswith("secrets")
             ):
                 return True
 

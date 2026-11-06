@@ -3,7 +3,7 @@
 
 **Version:** v1
 **Depends on:** TASK-000
-**Status:** Not started
+**Status:** Done
 
 ## Objective
 Provide one shared filesystem policy used by every filesystem-capable operation so path traversal, symlink escapes, and sensitive-file access are denied consistently before any tool or context read occurs.

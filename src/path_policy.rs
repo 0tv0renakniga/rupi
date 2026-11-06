@@ -111,6 +111,7 @@ pub struct PathPolicy {
     sensitive_names: BTreeSet<String>,
     sensitive_directories: BTreeSet<String>,
     sensitive_extensions: BTreeSet<String>,
+    protected_paths: Vec<PathBuf>,
 }
 
 impl PathPolicy {
@@ -128,6 +129,26 @@ impl PathPolicy {
                 .iter()
                 .map(|name| (*name).to_owned()),
         )
+    }
+
+    /// Build the default policy with explicit harness-owned protected paths.
+    ///
+    /// Configured session, audit, and trusted-configuration paths are denied in
+    /// addition to the default sensitive-name and directory patterns. Paths
+    /// outside the canonical root are already unreachable through this policy.
+    pub fn with_protected_paths<I, P>(
+        root: impl AsRef<Path>,
+        protected_paths: I,
+    ) -> Result<Self, PathPolicyError>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let mut policy = Self::new(root)?;
+        for protected in protected_paths {
+            policy.protect_path(protected.as_ref());
+        }
+        Ok(policy)
     }
 
     /// Build a policy with explicit sensitive patterns.
@@ -155,6 +176,7 @@ impl PathPolicy {
             sensitive_names: lowercase_set(sensitive_names),
             sensitive_directories: lowercase_set(sensitive_directories),
             sensitive_extensions: lowercase_set(sensitive_extensions),
+            protected_paths: Vec::new(),
         })
     }
 
@@ -228,6 +250,14 @@ impl PathPolicy {
 
     /// Return whether a normalized relative path matches a denied pattern.
     pub fn is_sensitive(&self, path: &Path) -> bool {
+        if self
+            .protected_paths
+            .iter()
+            .any(|protected| path == protected || path.starts_with(protected))
+        {
+            return true;
+        }
+
         for component in path.components() {
             let Component::Normal(part) = component else {
                 continue;
@@ -236,8 +266,8 @@ impl PathPolicy {
             if self.sensitive_directories.contains(&part)
                 || self.sensitive_names.contains(&part)
                 || part.starts_with(".env.")
-                || part.starts_with("credentials.")
-                || part.starts_with("secrets.")
+                || part.starts_with("credentials")
+                || part.starts_with("secrets")
             {
                 return true;
             }
@@ -247,6 +277,19 @@ impl PathPolicy {
             .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
             .map(|extension| self.sensitive_extensions.contains(&extension))
             .unwrap_or(false)
+    }
+
+    fn protect_path(&mut self, path: &Path) {
+        let Some(absolute) = absolute_path(path) else {
+            return;
+        };
+        let absolute = lexically_normalize(&absolute);
+        if let Some(relative) = relative_inside(&self.root, &absolute) {
+            self.protected_paths.push(relative);
+        }
+        if let Some(relative) = canonical_relative_inside(&self.root, &absolute) {
+            self.protected_paths.push(relative);
+        }
     }
 
     fn reject_symlink_escape(
@@ -277,6 +320,43 @@ impl PathPolicy {
 
         Ok(())
     }
+}
+
+fn absolute_path(path: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        std::env::current_dir().ok().map(|cwd| cwd.join(path))
+    }
+}
+
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn relative_inside(root: &Path, path: &Path) -> Option<PathBuf> {
+    let relative = path.strip_prefix(root).ok()?;
+    if relative.as_os_str().is_empty() {
+        return None;
+    }
+    Some(relative.to_path_buf())
+}
+
+fn canonical_relative_inside(root: &Path, path: &Path) -> Option<PathBuf> {
+    let existing = deepest_existing_entry(path).ok().flatten()?;
+    let resolved = existing.canonicalize().ok()?;
+    let suffix = path.strip_prefix(existing).ok()?;
+    relative_inside(root, &resolved.join(suffix))
 }
 
 fn deepest_existing_entry(path: &Path) -> std::io::Result<Option<&Path>> {

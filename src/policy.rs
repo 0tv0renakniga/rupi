@@ -77,8 +77,29 @@ impl Policy {
     /// root, or an inaccessible root fails closed before any tool can run.
     pub fn new(repo_root: impl Into<PathBuf>) -> Result<Self, PolicyViolation> {
         let repo_root: PathBuf = repo_root.into();
-        let path_policy = PathPolicy::new(&repo_root)?;
+        Self::from_path_policy(PathPolicy::new(&repo_root)?)
+    }
 
+    /// Build the policy with explicit harness-owned protected paths.
+    ///
+    /// Session, audit, and trusted-configuration paths are denied by the shared
+    /// path policy in addition to the default sensitive patterns.
+    pub fn with_protected_paths<I, P>(
+        repo_root: impl Into<PathBuf>,
+        protected_paths: I,
+    ) -> Result<Self, PolicyViolation>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let repo_root: PathBuf = repo_root.into();
+        Self::from_path_policy(PathPolicy::with_protected_paths(
+            &repo_root,
+            protected_paths,
+        )?)
+    }
+
+    fn from_path_policy(path_policy: PathPolicy) -> Result<Self, PolicyViolation> {
         Ok(Self {
             repo_root: path_policy.root().to_path_buf(),
             allowed_programs: DEFAULT_ALLOWED_PROGRAMS
@@ -258,6 +279,7 @@ mod tests {
             ".ssh/id_rsa",
             "home/user/.ssh/authorized_keys",
             "credentials.json",
+            "credentials-prod.json",
             "config/credentials",
             ".aws/credentials",
             "certs/server.pem",
@@ -311,7 +333,7 @@ mod tests {
             "src/environment.rs",
             "docs/secret-management.md",
             "tests/keyboard.rs",
-            "src/credentials_policy.rs",
+            "src/credential_policy.rs",
         ] {
             assert!(
                 policy.authorize_path(path).is_ok(),

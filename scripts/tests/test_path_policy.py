@@ -56,8 +56,10 @@ class PathPolicyTests(unittest.TestCase):
             ".aws/credentials",
             ".gcp/credentials.json",
             "config/credentials.yaml",
+            "credentials-prod.json",
             "secrets.yaml",
             "secrets/prod.txt",
+            "archive/secrets_backup.txt",
             "nested/.env/config",
             "certs/server.pem",
             "keys/signing.key",
@@ -71,7 +73,7 @@ class PathPolicyTests(unittest.TestCase):
             "src/environment.rs",
             "docs/secret-management.md",
             "tests/keyboard.rs",
-            "src/credentials_policy.rs",
+            "src/credential_policy.rs",
         ):
             self.assertIsInstance(self.policy.authorize_path(path), Path)
 
