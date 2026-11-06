@@ -24,6 +24,7 @@ file_preview_bytes = 2048
 max_search_results = 25
 max_tool_output_bytes = 4096
 max_session_event_bytes = 32768
+max_global_context_bytes = 16384
 "#,
     );
 
@@ -65,6 +66,7 @@ max_session_event_bytes = 32768
     assert_eq!(config.limits.reserved_output_tokens, 1_024);
     assert_eq!(config.limits.file_preview_bytes, 2_048);
     assert_eq!(config.limits.max_search_results, 25);
+    assert_eq!(config.limits.max_global_context_bytes, 16_384);
     assert_eq!(config.trusted_config_dir, layout.config_dir);
     assert_eq!(
         config.session_data_dir,

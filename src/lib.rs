@@ -9,6 +9,7 @@ pub mod agent;
 pub mod approval;
 pub mod audit;
 pub mod config;
+pub mod context;
 pub mod error;
 pub mod events;
 pub mod jev;

@@ -3,7 +3,7 @@
 
 **Version:** v1
 **Depends on:** TASK-000, TASK-001
-**Status:** Not started
+**Status:** Done
 
 ## Objective
 Load operator-owned global context only from the trusted configuration directory and show its provenance in the Context tab so trusted instructions are distinguishable from repository content.

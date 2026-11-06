@@ -84,6 +84,10 @@ pub async fn run(config: Config) -> Result<()> {
 
 async fn prepare(config: &Config) -> Result<PreparedApp> {
     let mut app = AppState::new();
+    app.set_global_context(crate::context::GlobalContext::load(
+        &config.trusted_config_dir,
+        &config.limits,
+    ));
     app.budget_summary = format!(
         "acts {}/tools {}/verify {}/wall {}s",
         config.budget.max_act_turns,
@@ -320,6 +324,7 @@ mod tests {
         base: PathBuf,
         project: PathBuf,
         scripts: PathBuf,
+        config_dir: PathBuf,
         config: Config,
     }
 
@@ -328,8 +333,10 @@ mod tests {
             let base = std::env::temp_dir().join(format!("rupi-tui-{label}-{}", Uuid::new_v4()));
             let project = base.join("project");
             let scripts = base.join("scripts");
+            let config_dir = base.join("config");
             std::fs::create_dir_all(&project).expect("create project");
             std::fs::create_dir_all(&scripts).expect("create scripts");
+            std::fs::create_dir_all(&config_dir).expect("create config");
             let config = Config {
                 root: project.clone(),
                 audit_path: project.join(".harness-audit/audit.jsonl"),
@@ -340,7 +347,7 @@ mod tests {
                 min_route_conf: 0.85,
                 budget: TaskBudget::default(),
                 limits: crate::config::Limits::default(),
-                trusted_config_dir: PathBuf::from("/tmp/local-agent-harness-config"),
+                trusted_config_dir: config_dir.clone(),
                 session_data_dir: base.join("sessions"),
                 approval: ApprovalPolicy::default(),
                 scripts: ScriptConfig {
@@ -353,6 +360,7 @@ mod tests {
                 base,
                 project,
                 scripts,
+                config_dir,
                 config,
             }
         }
@@ -445,5 +453,36 @@ mod tests {
             "{error}"
         );
         assert!(error.to_string().contains("read_file.py"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn prepare_loads_global_context_only_from_the_trusted_directory() {
+        let fixture = Fixture::new("global-context");
+        std::fs::write(fixture.project.join("AGENTS.md"), "repository instructions")
+            .expect("write project context");
+        std::fs::write(fixture.config_dir.join("AGENTS.md"), "trusted instructions")
+            .expect("write trusted context");
+        std::fs::create_dir_all(fixture.config_dir.join("prompts")).expect("create prompts");
+        std::fs::write(
+            fixture.config_dir.join("prompts/review.md"),
+            "trusted prompt template",
+        )
+        .expect("write trusted prompt");
+
+        let prepared = prepare(&fixture.config)
+            .await
+            .expect("prepare with global context");
+
+        let sources = &prepared.app.global_context.sources;
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].relative_path, "AGENTS.md");
+        assert_eq!(sources[0].content, "trusted instructions");
+        assert_eq!(sources[1].relative_path, "prompts/review.md");
+        assert_eq!(sources[1].content, "trusted prompt template");
+        let context = prepared.app.fixtures.context.join("\n");
+        assert!(context.contains("AGENTS.md [trusted]"), "{context}");
+        assert!(context.contains("prompts/review.md [trusted]"), "{context}");
+        assert!(context.contains("trusted instructions"), "{context}");
+        assert!(!context.contains("repository instructions"), "{context}");
     }
 }

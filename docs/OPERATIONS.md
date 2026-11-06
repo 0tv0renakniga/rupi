@@ -58,12 +58,20 @@ file_preview_bytes = 8192
 max_search_results = 100
 max_tool_output_bytes = 4000
 max_session_event_bytes = 65536
+max_global_context_bytes = 32768
 ```
 
 Configuration precedence is built-in defaults, then `config.toml`, then
 environment variables. For example, `HARNESS_MODEL` overrides the file's `model`.
 The prompt budget is derived as `context_cap_tokens - reserved_output_tokens -
 512`; the cap must leave a positive budget.
+
+Global trusted context is loaded only from `AGENTS.md`, `CLAUDE.md`, and
+top-level `prompts/*.md` in that same trusted directory. The target repository
+is never scanned for it. Each source is limited by `file_preview_bytes`, the
+aggregate is limited by `max_global_context_bytes`, and the Context tab shows
+the loaded source paths with `[trusted]` provenance. Content is captured at
+startup, so model output, tools, and repository changes cannot modify it.
 
 The harness-owned session data directory is resolved as
 `$XDG_DATA_HOME/local-agent-harness/sessions`, falling back to
@@ -114,6 +122,7 @@ export HARNESS_FILE_PREVIEW_BYTES=8192
 export HARNESS_MAX_SEARCH_RESULTS=100
 export HARNESS_MAX_TOOL_OUTPUT_BYTES=4000
 export HARNESS_MAX_SESSION_EVENT_BYTES=65536
+export HARNESS_MAX_GLOBAL_CONTEXT_BYTES=32768
 export HARNESS_APPROVAL_MUTATIONS=true
 export HARNESS_APPROVAL_TIMEOUT_SECS=120
 ```

@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use crate::context::GlobalContext;
 use crate::events::{AgentEvent, ChatTurnTelemetry, EventLevel};
 use crate::session::{SessionMessage, SessionRole};
 use crate::state_machine::{LoopState, TaskMode};
@@ -528,6 +529,7 @@ pub struct AppState {
     pub explorer_selected: usize,
     pub content_scroll: usize,
     pub fixtures: ShellFixtures,
+    pub global_context: GlobalContext,
     pub project: String,
     pub context_summary: String,
     pub last_chat_telemetry: Option<ChatTurnTelemetry>,
@@ -576,6 +578,7 @@ impl Default for AppState {
             explorer_selected: 0,
             content_scroll: 0,
             fixtures: ShellFixtures::default(),
+            global_context: GlobalContext::empty(""),
             project: "workspace".into(),
             context_summary: "0% / 16k".into(),
             last_chat_telemetry: None,
@@ -614,6 +617,15 @@ impl AppState {
 
     pub fn active_tab_lines(&self) -> &[String] {
         self.fixtures.lines_for(self.active_tab)
+    }
+
+    /// Install the startup snapshot of global trusted context.
+    ///
+    /// This is the only path that populates Context-tab provenance. It is not
+    /// reachable from model output, tool results, or repository content.
+    pub fn set_global_context(&mut self, global_context: GlobalContext) {
+        self.fixtures.context = global_context.display_lines();
+        self.global_context = global_context;
     }
 
     /// Replace presentation-only transcript state with a deterministic fixture.
