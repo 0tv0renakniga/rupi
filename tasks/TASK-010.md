@@ -3,7 +3,7 @@
 
 **Version:** v1
 **Depends on:** TASK-001, TASK-008, TASK-009
-**Status:** Not started
+**Status:** Done
 
 ## Objective
 Load bounded project context as untrusted data, wrap it before model injection, and resist hostile content so repository files cannot override harness policy or authority.

@@ -189,6 +189,26 @@ impl PathPolicy {
     ///
     /// The returned path is lexically normalized and relative to [`Self::root`].
     pub fn authorize_path(&self, raw: &str) -> Result<PathBuf, PathPolicyError> {
+        self.authorize_path_with_exception(raw, |_| false)
+    }
+
+    /// Validate one harness-owned project-context source path.
+    ///
+    /// The candidate list is fixed by the harness, and the only default-denied
+    /// source is `.ai-wiki/state-of-the-world.md`, which is an explicitly
+    /// untrusted project-context input rather than a model-selected path. All
+    /// other root, traversal, symlink, and sensitive-path rules still apply.
+    pub fn authorize_project_context_path(&self, raw: &str) -> Result<PathBuf, PathPolicyError> {
+        self.authorize_path_with_exception(raw, |path| {
+            path == Path::new(".ai-wiki/state-of-the-world.md")
+        })
+    }
+
+    fn authorize_path_with_exception(
+        &self,
+        raw: &str,
+        allow_sensitive: impl Fn(&Path) -> bool,
+    ) -> Result<PathBuf, PathPolicyError> {
         if raw.trim().is_empty() {
             return Err(PathPolicyError::EmptyPath);
         }
@@ -221,11 +241,11 @@ impl PathPolicy {
         if normalized.as_os_str().is_empty() {
             return Err(PathPolicyError::EmptyPath);
         }
-        if self.is_sensitive(&normalized) {
+        if self.is_sensitive(&normalized) && !allow_sensitive(&normalized) {
             return Err(PathPolicyError::SensitivePath(requested));
         }
 
-        self.reject_symlink_escape(&normalized, &requested)?;
+        self.reject_symlink_escape(&normalized, &requested, &allow_sensitive)?;
         Ok(normalized)
     }
 
@@ -296,6 +316,7 @@ impl PathPolicy {
         &self,
         relative: &Path,
         requested: &str,
+        allow_sensitive: &impl Fn(&Path) -> bool,
     ) -> Result<(), PathPolicyError> {
         let candidate = self.root.join(relative);
         let Some(existing) = deepest_existing_entry(&candidate)
@@ -314,7 +335,10 @@ impl PathPolicy {
         let resolved_relative = resolved
             .strip_prefix(&self.root)
             .map_err(|_| PathPolicyError::SymlinkEscape(requested.to_owned()))?;
-        if !resolved_relative.as_os_str().is_empty() && self.is_sensitive(resolved_relative) {
+        if !resolved_relative.as_os_str().is_empty()
+            && self.is_sensitive(resolved_relative)
+            && !allow_sensitive(resolved_relative)
+        {
             return Err(PathPolicyError::SensitivePath(requested.to_owned()));
         }
 

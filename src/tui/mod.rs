@@ -116,6 +116,9 @@ async fn prepare(config: &Config) -> Result<PreparedApp> {
     });
 
     let runtime = runtime::build(config)?;
+    let project_context =
+        crate::context::ProjectContext::load(&config.root, &runtime.policy, &config.limits);
+    app.set_project_context(project_context.clone());
     app.change_available = runtime.capabilities.change_ready();
     if !app.change_available {
         app.selected_mode = crate::state_machine::TaskMode::Investigate;
@@ -136,6 +139,7 @@ async fn prepare(config: &Config) -> Result<PreparedApp> {
         runtime.audit.clone(),
         runtime.runner.clone(),
         approvals.clone(),
+        project_context,
     )?;
     let chat: Arc<dyn VisibleChatBackend> = Arc::new(build_llm(config)?);
 
@@ -164,6 +168,7 @@ fn build_orchestrator(
     audit: Arc<AuditLog>,
     runner: ScriptRunner,
     approvals: InteractiveApprovalGate,
+    project_context: crate::context::ProjectContext,
 ) -> Result<Orchestrator> {
     let llm = Arc::new(build_llm(config)?);
     let jev = Arc::new(JevClient::new(config.jev_base.clone()));
@@ -183,6 +188,7 @@ fn build_orchestrator(
     .with_limits(limits)
     .with_approval_policy(config.approval.clone())
     .with_approval_gate(Arc::new(approvals))
+    .with_project_context(project_context)
     .with_audit(audit))
 }
 
@@ -456,8 +462,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_loads_global_context_only_from_the_trusted_directory() {
-        let fixture = Fixture::new("global-context");
+    async fn prepare_loads_global_and_project_context_with_distinct_trust() {
+        let fixture = Fixture::new("context-sources");
         std::fs::write(fixture.project.join("AGENTS.md"), "repository instructions")
             .expect("write project context");
         std::fs::write(fixture.config_dir.join("AGENTS.md"), "trusted instructions")
@@ -471,7 +477,7 @@ mod tests {
 
         let prepared = prepare(&fixture.config)
             .await
-            .expect("prepare with global context");
+            .expect("prepare with global and project context");
 
         let sources = &prepared.app.global_context.sources;
         assert_eq!(sources.len(), 2);
@@ -479,10 +485,19 @@ mod tests {
         assert_eq!(sources[0].content, "trusted instructions");
         assert_eq!(sources[1].relative_path, "prompts/review.md");
         assert_eq!(sources[1].content, "trusted prompt template");
+
+        let project_sources = &prepared.app.project_context.sources;
+        assert_eq!(project_sources.len(), 1);
+        assert_eq!(project_sources[0].relative_path, "AGENTS.md");
+        assert_eq!(project_sources[0].content, "repository instructions");
+
         let context = prepared.app.fixtures.context.join("\n");
+        assert!(context.contains("Global trusted context"), "{context}");
+        assert!(context.contains("Project context"), "{context}");
         assert!(context.contains("AGENTS.md [trusted]"), "{context}");
+        assert!(context.contains("AGENTS.md [untrusted]"), "{context}");
         assert!(context.contains("prompts/review.md [trusted]"), "{context}");
         assert!(context.contains("trusted instructions"), "{context}");
-        assert!(!context.contains("repository instructions"), "{context}");
+        assert!(context.contains("repository instructions"), "{context}");
     }
 }

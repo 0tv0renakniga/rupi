@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use crate::context::GlobalContext;
+use crate::context::{GlobalContext, ProjectContext};
 use crate::events::{AgentEvent, ChatTurnTelemetry, EventLevel};
 use crate::session::{SessionMessage, SessionRole};
 use crate::state_machine::{LoopState, TaskMode};
@@ -530,6 +530,7 @@ pub struct AppState {
     pub content_scroll: usize,
     pub fixtures: ShellFixtures,
     pub global_context: GlobalContext,
+    pub project_context: ProjectContext,
     pub project: String,
     pub context_summary: String,
     pub last_chat_telemetry: Option<ChatTurnTelemetry>,
@@ -579,6 +580,7 @@ impl Default for AppState {
             content_scroll: 0,
             fixtures: ShellFixtures::default(),
             global_context: GlobalContext::empty(""),
+            project_context: ProjectContext::empty(""),
             project: "workspace".into(),
             context_summary: "0% / 16k".into(),
             last_chat_telemetry: None,
@@ -621,11 +623,27 @@ impl AppState {
 
     /// Install the startup snapshot of global trusted context.
     ///
-    /// This is the only path that populates Context-tab provenance. It is not
-    /// reachable from model output, tool results, or repository content.
+    /// This is not reachable from model output, tool results, or repository
+    /// content. Context-tab provenance is refreshed with explicit trust labels.
     pub fn set_global_context(&mut self, global_context: GlobalContext) {
-        self.fixtures.context = global_context.display_lines();
         self.global_context = global_context;
+        self.refresh_context_fixture();
+    }
+
+    /// Install the startup snapshot of repository-owned untrusted context.
+    ///
+    /// Repository content cannot modify this snapshot after startup, and the
+    /// Context tab labels every source as `[untrusted]`.
+    pub fn set_project_context(&mut self, project_context: ProjectContext) {
+        self.project_context = project_context;
+        self.refresh_context_fixture();
+    }
+
+    fn refresh_context_fixture(&mut self) {
+        let mut lines = self.global_context.display_lines();
+        lines.push(String::new());
+        lines.extend(self.project_context.display_lines());
+        self.fixtures.context = lines;
     }
 
     /// Replace presentation-only transcript state with a deterministic fixture.

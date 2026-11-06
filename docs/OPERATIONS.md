@@ -59,6 +59,7 @@ max_search_results = 100
 max_tool_output_bytes = 4000
 max_session_event_bytes = 65536
 max_global_context_bytes = 32768
+max_project_context_bytes = 32768
 ```
 
 Configuration precedence is built-in defaults, then `config.toml`, then
@@ -72,6 +73,17 @@ is never scanned for it. Each source is limited by `file_preview_bytes`, the
 aggregate is limited by `max_global_context_bytes`, and the Context tab shows
 the loaded source paths with `[trusted]` provenance. Content is captured at
 startup, so model output, tools, and repository changes cannot modify it.
+
+Project context is loaded from the fixed candidate list `AGENTS.md`,
+`CLAUDE.md`, `CONTRIBUTING.md`, `README.md`, and
+`.ai-wiki/state-of-the-world.md` through the shared project policy. Every
+source is always untrusted. Each source is limited by `file_preview_bytes`, the
+aggregate is limited by `max_project_context_bytes`, and the Context tab labels
+the loaded source paths with `[untrusted]`. Before model injection, content is
+encoded and wrapped in `<ProjectInstructions untrusted="true"
+source="project/...">`; repository text cannot close that wrapper or grant
+itself authority over harness policy, approvals, verification, tools,
+endpoints, or completion.
 
 The harness-owned session data directory is resolved as
 `$XDG_DATA_HOME/local-agent-harness/sessions`, falling back to

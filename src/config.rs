@@ -94,6 +94,7 @@ pub struct Limits {
     pub max_tool_output_bytes: usize,
     pub max_session_event_bytes: usize,
     pub max_global_context_bytes: usize,
+    pub max_project_context_bytes: usize,
 }
 
 impl Default for Limits {
@@ -106,6 +107,7 @@ impl Default for Limits {
             max_tool_output_bytes: 4_000,
             max_session_event_bytes: 65_536,
             max_global_context_bytes: 32_768,
+            max_project_context_bytes: 32_768,
         }
     }
 }
@@ -150,6 +152,10 @@ impl Limits {
             (
                 self.max_global_context_bytes == 0,
                 "max_global_context_bytes must be greater than zero",
+            ),
+            (
+                self.max_project_context_bytes == 0,
+                "max_project_context_bytes must be greater than zero",
             ),
         ];
         for (is_invalid, message) in invalid {
@@ -321,6 +327,7 @@ pub struct ConfigSummary {
     pub max_tool_output_bytes: usize,
     pub max_session_event_bytes: usize,
     pub max_global_context_bytes: usize,
+    pub max_project_context_bytes: usize,
     pub trusted_config_dir: PathBuf,
     pub session_data_dir: PathBuf,
 }
@@ -329,7 +336,7 @@ impl std::fmt::Display for ConfigSummary {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "root={} audit_path={} endpoint_profile={} llm_base={} jev_base={} model={} max_act_turns={} max_verify_retries={} context_cap_tokens={} reserved_output_tokens={} prompt_budget_tokens={} file_preview_bytes={} max_search_results={} max_tool_output_bytes={} max_session_event_bytes={} max_global_context_bytes={} trusted_config_dir={} session_data_dir={}",
+            "root={} audit_path={} endpoint_profile={} llm_base={} jev_base={} model={} max_act_turns={} max_verify_retries={} context_cap_tokens={} reserved_output_tokens={} prompt_budget_tokens={} file_preview_bytes={} max_search_results={} max_tool_output_bytes={} max_session_event_bytes={} max_global_context_bytes={} max_project_context_bytes={} trusted_config_dir={} session_data_dir={}",
             self.root.display(),
             self.audit_path.display(),
             self.endpoint_profile,
@@ -346,6 +353,7 @@ impl std::fmt::Display for ConfigSummary {
             self.max_tool_output_bytes,
             self.max_session_event_bytes,
             self.max_global_context_bytes,
+            self.max_project_context_bytes,
             self.trusted_config_dir.display(),
             self.session_data_dir.display(),
         )
@@ -453,6 +461,10 @@ impl Config {
                 "HARNESS_MAX_GLOBAL_CONTEXT_BYTES",
                 file_limits.max_global_context_bytes,
             )?,
+            max_project_context_bytes: parse_env(
+                "HARNESS_MAX_PROJECT_CONTEXT_BYTES",
+                file_limits.max_project_context_bytes,
+            )?,
         };
 
         let scripts = ScriptConfig::from_env()?;
@@ -524,6 +536,7 @@ impl Config {
             max_tool_output_bytes: self.limits.max_tool_output_bytes,
             max_session_event_bytes: self.limits.max_session_event_bytes,
             max_global_context_bytes: self.limits.max_global_context_bytes,
+            max_project_context_bytes: self.limits.max_project_context_bytes,
             trusted_config_dir: self.trusted_config_dir.clone(),
             session_data_dir: self.session_data_dir.clone(),
         }
@@ -2312,6 +2325,10 @@ mod tests {
         assert!(limits.validate().is_err());
 
         limits = Limits::default();
+        limits.max_project_context_bytes = 0;
+        assert!(limits.validate().is_err());
+
+        limits = Limits::default();
         limits.reserved_output_tokens = limits.context_cap_tokens;
         assert!(limits.validate().is_err());
 
@@ -2369,6 +2386,7 @@ max_search_results = 25
 max_tool_output_bytes = 4096
 max_session_event_bytes = 32768
 max_global_context_bytes = 16384
+max_project_context_bytes = 12288
 "#,
         )
         .expect("write config.toml");
@@ -2384,6 +2402,7 @@ max_global_context_bytes = 16384
         assert_eq!(limits.context_cap_tokens, 8_192);
         assert_eq!(limits.max_search_results, 25);
         assert_eq!(limits.max_global_context_bytes, 16_384);
+        assert_eq!(limits.max_project_context_bytes, 12_288);
 
         let _ = std::fs::remove_dir_all(dir);
     }
