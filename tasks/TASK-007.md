@@ -3,7 +3,7 @@
 
 **Version:** v1
 **Depends on:** TASK-004, TASK-005, TASK-006
-**Status:** Not started
+**Status:** Done
 
 ## Objective
 Provide a manually run local-model smoke suite that records compatibility and stability observations without making a live model a requirement for ordinary automated tests.
